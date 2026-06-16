@@ -60,26 +60,65 @@ __global__ void mxint8_gemv_combine_kernel(
     y[o] = __float2bfloat16(acc);
 }
 
-// ---- W-only prefill GEMM ----------------------------------------------------
+// ---- W-only prefill GEMM — SHARED-MEMORY TILED, matched to wa_gemm.cu --------
+//   Same tiling as the MSAQ kernel; only the B-tile load differs (direct int8 vs
+//   unpack), keeping the comparison matched.
+constexpr int TBM = 64, TBN = 64, TBK = BLOCK, RTM = 4, RTN = 4;   // 256 threads
 __global__ void mxint8_gemm_kernel(
         const __nv_bfloat16* __restrict__ X,
         const int8_t* __restrict__ scale_exp,
         const int8_t* __restrict__ qweight,
         __nv_bfloat16* __restrict__ Y,
         int M, int OUT, int K, int NB) {
-    const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (o >= OUT || m >= M) return;
-    float acc = 0.0f;
-    for (int blk = 0; blk < NB; ++blk) {
-        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+    __shared__ float As[TBK][TBM];
+    __shared__ float Bs[TBK][TBN];
+    const int m0 = blockIdx.y * TBM, o0 = blockIdx.x * TBN;
+    const int tid = threadIdx.x, tRow = tid / 16, tCol = tid % 16;
+    float acc[RTM][RTN];
+    #pragma unroll
+    for (int i = 0; i < RTM; ++i)
         #pragma unroll
-        for (int k = 0; k < BLOCK; ++k) {
-            const int w = qweight[(blk * BLOCK + k) * OUT + o];
-            acc += (static_cast<float>(w) * scale) * __bfloat162float(X[m * K + blk * BLOCK + k]);
+        for (int j = 0; j < RTN; ++j) acc[i][j] = 0.0f;
+
+    for (int blk = 0; blk < NB; ++blk) {
+        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+            const int m = idx / TBK, k = idx % TBK;
+            As[k][m] = (m0 + m < M)
+                     ? __bfloat162float(X[(long)(m0 + m) * K + blk * TBK + k]) : 0.0f;
+        }
+        for (int idx = tid; idx < TBN * TBK; idx += 256) {
+            const int oc = idx / TBK, k = idx % TBK, o = o0 + oc;
+            float v = 0.0f;
+            if (o < OUT)
+                v = (float)qweight[(blk * BLOCK + k) * OUT + o]
+                  * ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            Bs[k][oc] = v;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < TBK; ++k) {
+            float a[RTM], b[RTN];
+            #pragma unroll
+            for (int i = 0; i < RTM; ++i) a[i] = As[k][tRow * RTM + i];
+            #pragma unroll
+            for (int j = 0; j < RTN; ++j) b[j] = Bs[k][tCol * RTN + j];
+            #pragma unroll
+            for (int i = 0; i < RTM; ++i)
+                #pragma unroll
+                for (int j = 0; j < RTN; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < RTM; ++i) {
+        const int m = m0 + tRow * RTM + i;
+        if (m >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < RTN; ++j) {
+            const int o = o0 + tCol * RTN + j;
+            if (o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(acc[i][j]);
         }
     }
-    Y[m * OUT + o] = __float2bfloat16(acc);
 }
 
 // ---- W+A GEMM (int8 weight direct + on-the-fly MXINT8 activation, int dot) ---
@@ -244,7 +283,7 @@ torch::Tensor mxint8_gemm_cuda(
         torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight,
         int64_t M, int64_t OUT, int64_t K, int64_t NB) {
     auto Y = torch::empty({M, OUT}, X.options());
-    const dim3 block(32, 8), grid((OUT + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    const dim3 block(256), grid((OUT + TBN - 1) / TBN, (M + TBM - 1) / TBM);
     mxint8_gemm_kernel<<<grid, block>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
