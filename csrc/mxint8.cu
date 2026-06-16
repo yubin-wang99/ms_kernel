@@ -1,0 +1,297 @@
+// csrc/mxint8.cu  —  plain-MXINT8 baseline kernels.
+//
+// The matched-optimization baseline for the MSAQ kernels: identical structure
+// (thread mapping, FP32 accumulate, on-the-fly activation quant, online
+// softmax), differing ONLY in the weight/KV read. MSAQ does the sub-byte unpack
+// (ms::unpack_ms_weight_elem); MXINT8 reads the int8 mantissa directly. So the
+// MSAQ-vs-MXINT8 latency delta isolates exactly the unpack overhead vs the
+// fewer-bytes-read benefit — the decode-memory-bound question.
+//
+// Layout (out-innermost SoA, from ms_lib.pack.pack_weight_mxint8):
+//   scale_exp [nb, OUT] int8           flat: blk*OUT + o
+//   qweight   [nb, 32, OUT] int8       flat: (blk*32 + k)*OUT + o
+// KV (pack_kv_mxint8): scale_exp [H,nb,L], qweight [H,nb,32,L].
+//
+// STATUS: GPU-UNVALIDATED until built; logic verified on CPU
+// (tests/test_emulation.py MXINT8 cases). Same correctness-first level as the
+// MSAQ kernels (no tensor cores / split-K yet) so the comparison is fair.
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <math.h>
+#include "core/ms_utils.cuh"
+
+namespace {
+constexpr int BLOCK = 32;
+
+// ---- W-only decode GEMV (direct int8) — SPLIT-K, matched to w_gemv.cu --------
+__global__ void mxint8_gemv_splitk_kernel(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t* __restrict__ scale_exp,    // [NB, OUT]
+        const int8_t* __restrict__ qweight,      // [NB, 32, OUT]
+        float* __restrict__ partial,             // [splitK, OUT]
+        int OUT, int NB, int splitK) {
+    const int o  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y;
+    if (o >= OUT) return;
+    const int per = (NB + splitK - 1) / splitK;
+    const int b0 = sp * per, b1 = min(b0 + per, NB);
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            const int w = qweight[(blk * BLOCK + k) * OUT + o];   // direct int8
+            const float xv = __bfloat162float(x[blk * BLOCK + k]);
+            acc += (static_cast<float>(w) * scale) * xv;
+        }
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
+__global__ void mxint8_gemv_combine_kernel(
+        const float* __restrict__ partial, __nv_bfloat16* __restrict__ y,
+        int OUT, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    float acc = 0.0f;
+    for (int sp = 0; sp < splitK; ++sp) acc += partial[(long)sp * OUT + o];
+    y[o] = __float2bfloat16(acc);
+}
+
+// ---- W-only prefill GEMM ----------------------------------------------------
+__global__ void mxint8_gemm_kernel(
+        const __nv_bfloat16* __restrict__ X,
+        const int8_t* __restrict__ scale_exp,
+        const int8_t* __restrict__ qweight,
+        __nv_bfloat16* __restrict__ Y,
+        int M, int OUT, int K, int NB) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (o >= OUT || m >= M) return;
+    float acc = 0.0f;
+    for (int blk = 0; blk < NB; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            const int w = qweight[(blk * BLOCK + k) * OUT + o];
+            acc += (static_cast<float>(w) * scale) * __bfloat162float(X[m * K + blk * BLOCK + k]);
+        }
+    }
+    Y[m * OUT + o] = __float2bfloat16(acc);
+}
+
+// ---- W+A GEMM (int8 weight direct + on-the-fly MXINT8 activation, int dot) ---
+__global__ void mxint8_wa_gemm_kernel(
+        const __nv_bfloat16* __restrict__ X,
+        const int8_t* __restrict__ scale_exp,
+        const int8_t* __restrict__ qweight,
+        __nv_bfloat16* __restrict__ Y,
+        int M, int OUT, int K, int NB) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (o >= OUT || m >= M) return;
+    float acc = 0.0f;
+    for (int blk = 0; blk < NB; ++blk) {
+        float amax = 1e-30f;
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k)
+            amax = fmaxf(amax, fabsf(__bfloat162float(X[m * K + blk * BLOCK + k])));
+        float ea = floorf(log2f(amax)) - (float)ms::E_MAX;
+        ea = fmaxf(fminf(ea, 127.0f), -127.0f);
+        const float sa = exp2f(ea);
+        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        int idot = 0;
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            int qx = (int)rintf(__bfloat162float(X[m * K + blk * BLOCK + k]) / sa);
+            qx = max(-127, min(127, qx));
+            idot += qx * (int)qweight[(blk * BLOCK + k) * OUT + o];
+        }
+        acc += (float)idot * sa * sw;
+    }
+    Y[m * OUT + o] = __float2bfloat16(acc);
+}
+
+// ---- KV-cache flash-decode (direct int8 K/V read) ---------------------------
+// SPLIT-KV / FLASH-DECODING, identical structure to csrc/kv_attention.cu so the
+// MSAQ-vs-MXINT8 comparison stays matched-optimization (only the K/V read
+// differs: direct int8 here vs the sub-byte unpack in MSAQ). grid = (H, S), with
+// S/key_tile chosen from the live SM count (ms::kv_split_count).
+
+constexpr int KV_CHUNK = 128;   // keys per chunk (must match kv_attention.cu)
+
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// Two-pass barrier-light flash-decode (방안 3), identical structure to
+// csrc/kv_attention.cu::kv_decode_split_kernel; only the K/V read differs
+// (direct int8 vs sub-byte unpack), keeping the comparison matched.
+__global__ void mxint8_kv_split_kernel(
+        const __nv_bfloat16* __restrict__ q,
+        const int8_t* __restrict__ ks, const int8_t* __restrict__ kq,  // K: scale[H,nb,L], q[H,nb,L,32]
+        const int8_t* __restrict__ vs, const int8_t* __restrict__ vq,  // V
+        float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
+        int H, int Lk, int D, int NB, int key_tile, int S, float sm_scale) {
+    const int h = blockIdx.x;
+    const int s = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, warpId = tid >> 5, nWarps = blockDim.x >> 5;
+    const bool active = tid < D;
+
+    extern __shared__ float smem[];
+    float* q_sh = smem;                         // [D]
+    float* sc   = smem + D;                      // [KV_CHUNK]
+    if (active) q_sh[tid] = __bfloat162float(q[h * D + tid]);
+    __syncthreads();
+
+    const int j0 = s * key_tile;
+    const int j1 = min(j0 + key_tile, Lk);
+    float m_i = -INFINITY, l_i = 0.0f, acc = 0.0f;
+
+    for (int cs = j0; cs < j1; cs += KV_CHUNK) {
+        const int nC = min(KV_CHUNK, j1 - cs);
+
+        // ---- Pass 1: scores (warp per key, __shfl reduction) ----
+        for (int kk = warpId; kk < nC; kk += nWarps) {
+            const int j = cs + kk;
+            float part = 0.0f;
+            for (int d = lane; d < D; d += 32) {
+                const int blk = d / BLOCK, kd = d % BLOCK;
+                const long qbase = (long)(h * NB + blk) * BLOCK * Lk;   // [H,nb,L,32]
+                const long sbase = (long)(h * NB + blk) * Lk;
+                part += q_sh[d] * (float)kq[qbase + (long)j * BLOCK + kd]
+                                * ms::e8m0_to_scale(ks[sbase + j]);
+            }
+            part = warp_reduce_sum(part);
+            if (lane == 0) sc[kk] = part * sm_scale;
+        }
+        __syncthreads();
+
+        float m_chunk = -INFINITY;
+        for (int kk = 0; kk < nC; ++kk) m_chunk = fmaxf(m_chunk, sc[kk]);
+        const float m_new = fmaxf(m_i, m_chunk);
+        const float alpha = expf(m_i - m_new);
+
+        // ---- Pass 2: out[d] += Σ_kk p_kk·V[d,kk] ----
+        const int blk = tid / BLOCK, kd = tid % BLOCK;
+        const long qbase = (long)(h * NB + blk) * BLOCK * Lk;
+        const long sbase = (long)(h * NB + blk) * Lk;
+        float lsum = 0.0f, a = 0.0f;
+        for (int kk = 0; kk < nC; ++kk) {
+            const float p = expf(sc[kk] - m_new);
+            lsum += p;
+            if (active) {
+                const int j = cs + kk;
+                a += p * (float)vq[qbase + (long)j * BLOCK + kd]
+                       * ms::e8m0_to_scale(vs[sbase + j]);
+            }
+        }
+        l_i = l_i * alpha + lsum;
+        acc = acc * alpha + a;
+        m_i = m_new;
+        __syncthreads();
+    }
+    if (active) part_o[((long)h * S + s) * D + tid] = acc;
+    if (tid == 0) { part_m[h * S + s] = m_i; part_l[h * S + s] = l_i; }
+}
+
+__global__ void mxint8_kv_combine_kernel(
+        const float* __restrict__ part_o, const float* __restrict__ part_m,
+        const float* __restrict__ part_l, __nv_bfloat16* __restrict__ out,
+        int H, int D, int S) {
+    const int h = blockIdx.x;
+    const int e = threadIdx.x;
+    if (e >= D) return;
+    float m_g = -INFINITY;
+    for (int s = 0; s < S; ++s) m_g = fmaxf(m_g, part_m[h * S + s]);
+    float l = 0.0f, acc = 0.0f;
+    for (int s = 0; s < S; ++s) {
+        const float w = expf(part_m[h * S + s] - m_g);
+        l   += part_l[h * S + s] * w;
+        acc += part_o[((long)h * S + s) * D + e] * w;
+    }
+    out[h * D + e] = __float2bfloat16(acc / l);
+}
+
+inline int next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
+} // namespace
+
+// ---- host launchers ---------------------------------------------------------
+torch::Tensor mxint8_gemv_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight,
+        int64_t OUT, int64_t NB) {
+    auto y = torch::empty({OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB);
+    auto partial = torch::empty({(int64_t)splitK, OUT},
+                                x.options().dtype(torch::kFloat32));
+    mxint8_gemv_splitk_kernel<<<dim3(blocks, splitK), threads>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
+        partial.data_ptr<float>(), (int)OUT, (int)NB, splitK);
+    mxint8_gemv_combine_kernel<<<blocks, threads>>>(
+        partial.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+
+torch::Tensor mxint8_gemm_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB) {
+    auto Y = torch::empty({M, OUT}, X.options());
+    const dim3 block(32, 8), grid((OUT + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    mxint8_gemm_kernel<<<grid, block>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, (int)K, (int)NB);
+    return Y;
+}
+
+torch::Tensor mxint8_wa_gemm_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB) {
+    auto Y = torch::empty({M, OUT}, X.options());
+    const dim3 block(32, 8), grid((OUT + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    mxint8_wa_gemm_kernel<<<grid, block>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, (int)K, (int)NB);
+    return Y;
+}
+
+torch::Tensor mxint8_kv_decode_cuda(
+        torch::Tensor q, torch::Tensor ks, torch::Tensor kq,
+        torch::Tensor vs, torch::Tensor vq,
+        int64_t H, int64_t Lk, int64_t D, int64_t NB) {
+    auto out = torch::empty({H, D}, q.options());
+    const int threads = next_pow2((int)D);
+    const size_t smem = (size_t)((int)D + KV_CHUNK) * sizeof(float);  // q_sh[D] + sc[CHUNK]
+    const float sm = 1.0f / sqrtf((float)D);
+
+    const int S = ms::kv_split_count((long)Lk, (int)H);
+    const int key_tile = (int)((Lk + S - 1) / S);
+    auto fopt = q.options().dtype(torch::kFloat32);
+    auto part_o = torch::empty({H, (int64_t)S, D}, fopt);
+    auto part_m = torch::empty({H, (int64_t)S}, fopt);
+    auto part_l = torch::empty({H, (int64_t)S}, fopt);
+
+    mxint8_kv_split_kernel<<<dim3((int)H, S), threads, smem>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+        ks.data_ptr<int8_t>(), kq.data_ptr<int8_t>(),
+        vs.data_ptr<int8_t>(), vq.data_ptr<int8_t>(),
+        part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+        (int)H, (int)Lk, (int)D, (int)NB, key_tile, S, sm);
+
+    mxint8_kv_combine_kernel<<<(int)H, threads>>>(
+        part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        (int)H, (int)D, S);
+    return out;
+}
