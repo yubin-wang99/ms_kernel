@@ -40,20 +40,26 @@ constexpr int BLOCK = 32;
 //   the K-loop streams TBK(=one MSAQ block) at a time into shared: As[k][m] from
 //   X, Bs[k][o] = dequant(W) (the only place unpack happens). Each thread holds a
 //   RTM x RTN register tile. Amortizes unpack by TBM(=64); large M -> FMA-bound.
-constexpr int TBM = 64, TBN = 64, TBK = BLOCK;   // block tile (TBK = MSAQ block)
-constexpr int RTM = 4,  RTN = 4;                 // per-thread register tile
-// blockDim = (TBM/RTM)*(TBN/RTN) = 16*16 = 256 threads
-__global__ void wonly_gemm_kernel(
-        const __nv_bfloat16* __restrict__ X,     // [M, K]
-        const int8_t*  __restrict__ scale_exp,   // [NB, OUT]
-        const uint8_t* __restrict__ upper,       // [NB, UB, OUT]
-        const uint8_t* __restrict__ shared,      // [NB, SB, OUT]
-        __nv_bfloat16* __restrict__ Y,           // [M, OUT]
+constexpr int TBK = BLOCK;   // K-tile = one MSAQ block (fixed)
+
+// Templated shared-memory tiled W-only GEMM. <TBM,TBN> output tile, <RTM,RTN>
+// per-thread register tile; blockDim = (TBM/RTM)*(TBN/RTN). Weight unpacked ONCE
+// per tile (Bs stage) and reused by all TBM rows. Tile config swept via
+// MS_TILE_CFG (host dispatch below) to find the optimum.
+template<int TBM, int TBN, int RTM, int RTN>
+__global__ void wonly_gemm_tiled(
+        const __nv_bfloat16* __restrict__ X,
+        const int8_t*  __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper,
+        const uint8_t* __restrict__ shared,
+        __nv_bfloat16* __restrict__ Y,
         int M, int OUT, int K, int NB, int u, int gs, int UB, int SB) {
-    __shared__ float As[TBK][TBM];               // X tile (transposed: [k][m])
-    __shared__ float Bs[TBK][TBN];               // dequant(W) tile [k][o]
+    constexpr int TNT = TBN / RTN;               // threads along N
+    constexpr int NT  = (TBM / RTM) * TNT;       // total threads
+    __shared__ float As[TBK][TBM];
+    __shared__ float Bs[TBK][TBN];
     const int m0 = blockIdx.y * TBM, o0 = blockIdx.x * TBN;
-    const int tid = threadIdx.x, tRow = tid / 16, tCol = tid % 16;
+    const int tid = threadIdx.x, tRow = tid / TNT, tCol = tid % TNT;
 
     float acc[RTM][RTN];
     #pragma unroll
@@ -62,14 +68,12 @@ __global__ void wonly_gemm_kernel(
         for (int j = 0; j < RTN; ++j) acc[i][j] = 0.0f;
 
     for (int blk = 0; blk < NB; ++blk) {
-        // --- stage X tile: As[k][m] ---
-        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+        for (int idx = tid; idx < TBM * TBK; idx += NT) {
             const int m = idx / TBK, k = idx % TBK;
             As[k][m] = (m0 + m < M)
                      ? __bfloat162float(X[(long)(m0 + m) * K + blk * TBK + k]) : 0.0f;
         }
-        // --- stage dequant(W) tile: Bs[k][o] (the ONE unpack, reused by TBM rows) ---
-        for (int idx = tid; idx < TBN * TBK; idx += 256) {
+        for (int idx = tid; idx < TBN * TBK; idx += NT) {
             const int oc = idx / TBK, k = idx % TBK, o = o0 + oc;
             float v = 0.0f;
             if (o < OUT) {
@@ -80,7 +84,6 @@ __global__ void wonly_gemm_kernel(
             Bs[k][oc] = v;
         }
         __syncthreads();
-        // --- register-tiled FMA ---
         #pragma unroll
         for (int k = 0; k < TBK; ++k) {
             float a[RTM], b[RTN];
@@ -107,26 +110,24 @@ __global__ void wonly_gemm_kernel(
     }
 }
 
-// ---- W+A GEMM — SHARED-MEMORY TILED. Like wonly_gemm but the activation is
-//   MXINT8-quantized per (row, 32-block) on the fly. Since sa (act scale) and sw
-//   (weight scale) are both powers of two, qx*qw*sa*sw is exact, so folding
-//   As[k][m] = qx*sa and Bs[k][o] = qw*sw reduces W+A to the SAME accumulate as
-//   wonly_gemm (= the oracle's per-block int-dot * sa*sw, bit-for-bit). Activation
-//   quant mirrors reference.quant_act (share=False): sa = 2^(floor(log2 max|x|)-6),
-//   qx = clip(rint(x/sa), -127, 127). The weight unpack (Bs) is staged once per
-//   tile and reused by all TBM rows.
-__global__ void wa_gemm_kernel(
-        const __nv_bfloat16* __restrict__ X,     // [M, K]
-        const int8_t*  __restrict__ scale_exp,   // [NB, OUT]
-        const uint8_t* __restrict__ upper,       // [NB, UB, OUT]
-        const uint8_t* __restrict__ shared,      // [NB, SB, OUT]
-        __nv_bfloat16* __restrict__ Y,           // [M, OUT]
+// Templated W+A GEMM — same tiling, plus per-(row,block) MXINT8 activation quant.
+// sa, sw are powers of two so folding As=qx*sa, Bs=qw*sw is bit-exact to the
+// per-block int-dot * sa*sw. Activation quant mirrors reference.quant_act.
+template<int TBM, int TBN, int RTM, int RTN>
+__global__ void wa_gemm_tiled(
+        const __nv_bfloat16* __restrict__ X,
+        const int8_t*  __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper,
+        const uint8_t* __restrict__ shared,
+        __nv_bfloat16* __restrict__ Y,
         int M, int OUT, int K, int NB, int u, int gs, int UB, int SB) {
-    __shared__ float As[TBK][TBM];               // quant+dequant activation [k][m]
-    __shared__ float Bs[TBK][TBN];               // dequant(W) [k][o]
-    __shared__ float sa_s[TBM];                  // per-row activation scale (this block)
+    constexpr int TNT = TBN / RTN;
+    constexpr int NT  = (TBM / RTM) * TNT;
+    __shared__ float As[TBK][TBM];
+    __shared__ float Bs[TBK][TBN];
+    __shared__ float sa_s[TBM];
     const int m0 = blockIdx.y * TBM, o0 = blockIdx.x * TBN;
-    const int tid = threadIdx.x, tRow = tid / 16, tCol = tid % 16;
+    const int tid = threadIdx.x, tRow = tid / TNT, tCol = tid % TNT;
 
     float acc[RTM][RTN];
     #pragma unroll
@@ -135,14 +136,12 @@ __global__ void wa_gemm_kernel(
         for (int j = 0; j < RTN; ++j) acc[i][j] = 0.0f;
 
     for (int blk = 0; blk < NB; ++blk) {
-        // stage raw X tile
-        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+        for (int idx = tid; idx < TBM * TBK; idx += NT) {
             const int m = idx / TBK, k = idx % TBK;
             As[k][m] = (m0 + m < M)
                      ? __bfloat162float(X[(long)(m0 + m) * K + blk * TBK + k]) : 0.0f;
         }
-        // stage dequant(W) tile (the ONE unpack, reused by TBM rows)
-        for (int idx = tid; idx < TBN * TBK; idx += 256) {
+        for (int idx = tid; idx < TBN * TBK; idx += NT) {
             const int oc = idx / TBK, k = idx % TBK, o = o0 + oc;
             float v = 0.0f;
             if (o < OUT) {
@@ -153,18 +152,16 @@ __global__ void wa_gemm_kernel(
             Bs[k][oc] = v;
         }
         __syncthreads();
-        // per-row activation scale: amax over the row's 32 values -> sa
-        if (tid < TBM) {
+        for (int m = tid; m < TBM; m += NT) {
             float amax = 1e-30f;
             #pragma unroll
-            for (int k = 0; k < TBK; ++k) amax = fmaxf(amax, fabsf(As[k][tid]));
+            for (int k = 0; k < TBK; ++k) amax = fmaxf(amax, fabsf(As[k][m]));
             float ea = floorf(log2f(amax)) - (float)ms::E_MAX;
             ea = fmaxf(fminf(ea, 127.0f), -127.0f);
-            sa_s[tid] = exp2f(ea);
+            sa_s[m] = exp2f(ea);
         }
         __syncthreads();
-        // quant+dequant activation in place: As = clip(rint(x/sa),±127) * sa
-        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+        for (int idx = tid; idx < TBM * TBK; idx += NT) {
             const int m = idx / TBK, k = idx % TBK;
             const float sa = sa_s[m];
             int qx = (int)rintf(As[k][m] / sa);
@@ -172,7 +169,6 @@ __global__ void wa_gemm_kernel(
             As[k][m] = (float)qx * sa;
         }
         __syncthreads();
-        // register-tiled accumulate (As folds sa, Bs folds sw -> exact int-dot*sa*sw)
         #pragma unroll
         for (int k = 0; k < TBK; ++k) {
             float a[RTM], b[RTN];
@@ -197,6 +193,16 @@ __global__ void wa_gemm_kernel(
             if (o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(acc[i][j]);
         }
     }
+}
+
+// Tile-config dispatch. Swept optimum (RTX 3090, OUT=4096) is M-ADAPTIVE: a
+// 128x128 tile reuses best but yields too few blocks (OUT/128=32 < 82 SMs) until
+// M fills the second grid dim, so small M prefers 64x64 (more blocks). Crossover
+// ~M=256. MS_TILE_CFG (env) forces a specific config (for sweeps).
+//   cfg 1 = 64x64 r4x4 ;  cfg 5 = 128x128 r8x8
+static inline int tile_cfg(int M) {
+    if (const char* e = getenv("MS_TILE_CFG")) { int c = atoi(e); if (c >= 0) return c; }
+    return (M >= 256) ? 5 : 1;
 }
 
 } // namespace
@@ -208,6 +214,24 @@ static inline void gemm_dims(int64_t u, int64_t gs, int& UB, int& SB) {
     SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
 }
 
+// launch KERN<TBM,TBN,RTM,RTN> for the given tile; ARGS must be defined.
+#define LAUNCH_TILE(KERN, BM, BN, RM, RN)                                        \
+    KERN<BM, BN, RM, RN>                                                         \
+        <<<dim3(((int)OUT + (BN) - 1) / (BN), ((int)M + (BM) - 1) / (BM)),       \
+           dim3(((BM) / (RM)) * ((BN) / (RN)))>>>(ARGS)
+#define DISPATCH_TILE(KERN) do {                                                 \
+    switch (tile_cfg((int)M)) {                                                  \
+        case 0: LAUNCH_TILE(KERN,  32,  32, 2, 2); break;                        \
+        case 1: LAUNCH_TILE(KERN,  64,  64, 4, 4); break;                        \
+        case 2: LAUNCH_TILE(KERN,  64,  64, 8, 8); break;                        \
+        case 3: LAUNCH_TILE(KERN, 128,  64, 8, 4); break;                        \
+        case 4: LAUNCH_TILE(KERN,  64, 128, 4, 8); break;                        \
+        case 5: LAUNCH_TILE(KERN, 128, 128, 8, 8); break;                        \
+        case 6: LAUNCH_TILE(KERN, 128, 128, 4, 4); break;                        \
+        case 7: LAUNCH_TILE(KERN, 128, 128, 8, 4); break;                        \
+        default: LAUNCH_TILE(KERN, 64, 64, 4, 4);                                \
+    } } while (0)
+
 torch::Tensor wonly_gemm_cuda(
         torch::Tensor X, torch::Tensor scale_exp,
         torch::Tensor upper, torch::Tensor shared,
@@ -215,13 +239,13 @@ torch::Tensor wonly_gemm_cuda(
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
     int UB, SB; gemm_dims(u, gs, UB, SB);
     auto Y = torch::empty({M, OUT}, X.options());
-    const dim3 block(256);
-    const dim3 grid((OUT + TBN - 1) / TBN, (M + TBM - 1) / TBM);
-    wonly_gemm_kernel<<<grid, block>>>(
-        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
-        scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
-        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
-        (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
+#define ARGS \
+    reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), \
+    scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(), \
+    reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
+    (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
+    DISPATCH_TILE(wonly_gemm_tiled);
+#undef ARGS
     return Y;
 }
 
@@ -232,12 +256,12 @@ torch::Tensor wa_gemm_cuda(
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
     int UB, SB; gemm_dims(u, gs, UB, SB);
     auto Y = torch::empty({M, OUT}, X.options());
-    const dim3 block(256);
-    const dim3 grid((OUT + TBN - 1) / TBN, (M + TBM - 1) / TBM);
-    wa_gemm_kernel<<<grid, block>>>(
-        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
-        scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
-        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
-        (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
+#define ARGS \
+    reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), \
+    scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(), \
+    reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
+    (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
+    DISPATCH_TILE(wa_gemm_tiled);
+#undef ARGS
     return Y;
 }

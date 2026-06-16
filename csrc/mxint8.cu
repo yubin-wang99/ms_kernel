@@ -63,17 +63,20 @@ __global__ void mxint8_gemv_combine_kernel(
 // ---- W-only prefill GEMM — SHARED-MEMORY TILED, matched to wa_gemm.cu --------
 //   Same tiling as the MSAQ kernel; only the B-tile load differs (direct int8 vs
 //   unpack), keeping the comparison matched.
-constexpr int TBM = 64, TBN = 64, TBK = BLOCK, RTM = 4, RTN = 4;   // 256 threads
-__global__ void mxint8_gemm_kernel(
+constexpr int TBK = BLOCK;   // K-tile = one MSAQ block
+template<int TBM, int TBN, int RTM, int RTN>
+__global__ void mxint8_gemm_tiled(
         const __nv_bfloat16* __restrict__ X,
         const int8_t* __restrict__ scale_exp,
         const int8_t* __restrict__ qweight,
         __nv_bfloat16* __restrict__ Y,
         int M, int OUT, int K, int NB) {
+    constexpr int TNT = TBN / RTN;
+    constexpr int NT  = (TBM / RTM) * TNT;
     __shared__ float As[TBK][TBM];
     __shared__ float Bs[TBK][TBN];
     const int m0 = blockIdx.y * TBM, o0 = blockIdx.x * TBN;
-    const int tid = threadIdx.x, tRow = tid / 16, tCol = tid % 16;
+    const int tid = threadIdx.x, tRow = tid / TNT, tCol = tid % TNT;
     float acc[RTM][RTN];
     #pragma unroll
     for (int i = 0; i < RTM; ++i)
@@ -81,12 +84,12 @@ __global__ void mxint8_gemm_kernel(
         for (int j = 0; j < RTN; ++j) acc[i][j] = 0.0f;
 
     for (int blk = 0; blk < NB; ++blk) {
-        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+        for (int idx = tid; idx < TBM * TBK; idx += NT) {
             const int m = idx / TBK, k = idx % TBK;
             As[k][m] = (m0 + m < M)
                      ? __bfloat162float(X[(long)(m0 + m) * K + blk * TBK + k]) : 0.0f;
         }
-        for (int idx = tid; idx < TBN * TBK; idx += 256) {
+        for (int idx = tid; idx < TBN * TBK; idx += NT) {
             const int oc = idx / TBK, k = idx % TBK, o = o0 + oc;
             float v = 0.0f;
             if (o < OUT)
@@ -124,17 +127,20 @@ __global__ void mxint8_gemm_kernel(
 // ---- W+A GEMM (int8 weight direct + on-the-fly MXINT8 activation, int dot) ---
 // SHARED-MEMORY TILED W+A, matched to wa_gemm.cu (only the B-tile differs:
 // direct int8 vs unpack). As folds sa (activation), Bs folds sw (weight).
-__global__ void mxint8_wa_gemm_kernel(
+template<int TBM, int TBN, int RTM, int RTN>
+__global__ void mxint8_wa_gemm_tiled(
         const __nv_bfloat16* __restrict__ X,
         const int8_t* __restrict__ scale_exp,
         const int8_t* __restrict__ qweight,
         __nv_bfloat16* __restrict__ Y,
         int M, int OUT, int K, int NB) {
+    constexpr int TNT = TBN / RTN;
+    constexpr int NT  = (TBM / RTM) * TNT;
     __shared__ float As[TBK][TBM];
     __shared__ float Bs[TBK][TBN];
     __shared__ float sa_s[TBM];
     const int m0 = blockIdx.y * TBM, o0 = blockIdx.x * TBN;
-    const int tid = threadIdx.x, tRow = tid / 16, tCol = tid % 16;
+    const int tid = threadIdx.x, tRow = tid / TNT, tCol = tid % TNT;
     float acc[RTM][RTN];
     #pragma unroll
     for (int i = 0; i < RTM; ++i)
@@ -142,12 +148,12 @@ __global__ void mxint8_wa_gemm_kernel(
         for (int j = 0; j < RTN; ++j) acc[i][j] = 0.0f;
 
     for (int blk = 0; blk < NB; ++blk) {
-        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+        for (int idx = tid; idx < TBM * TBK; idx += NT) {
             const int m = idx / TBK, k = idx % TBK;
             As[k][m] = (m0 + m < M)
                      ? __bfloat162float(X[(long)(m0 + m) * K + blk * TBK + k]) : 0.0f;
         }
-        for (int idx = tid; idx < TBN * TBK; idx += 256) {
+        for (int idx = tid; idx < TBN * TBK; idx += NT) {
             const int oc = idx / TBK, k = idx % TBK, o = o0 + oc;
             float v = 0.0f;
             if (o < OUT)
@@ -156,16 +162,16 @@ __global__ void mxint8_wa_gemm_kernel(
             Bs[k][oc] = v;
         }
         __syncthreads();
-        if (tid < TBM) {
+        for (int m = tid; m < TBM; m += NT) {
             float amax = 1e-30f;
             #pragma unroll
-            for (int k = 0; k < TBK; ++k) amax = fmaxf(amax, fabsf(As[k][tid]));
+            for (int k = 0; k < TBK; ++k) amax = fmaxf(amax, fabsf(As[k][m]));
             float ea = floorf(log2f(amax)) - (float)ms::E_MAX;
             ea = fmaxf(fminf(ea, 127.0f), -127.0f);
-            sa_s[tid] = exp2f(ea);
+            sa_s[m] = exp2f(ea);
         }
         __syncthreads();
-        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+        for (int idx = tid; idx < TBM * TBK; idx += NT) {
             const int m = idx / TBK, k = idx % TBK;
             const float sa = sa_s[m];
             int qx = (int)rintf(As[k][m] / sa);
@@ -198,6 +204,28 @@ __global__ void mxint8_wa_gemm_kernel(
         }
     }
 }
+
+// Tile dispatch — same M-adaptive optimum as wa_gemm.cu (matched).
+static inline int tile_cfg(int M) {
+    if (const char* e = getenv("MS_TILE_CFG")) { int c = atoi(e); if (c >= 0) return c; }
+    return (M >= 256) ? 5 : 1;
+}
+#define LAUNCH_TILE(KERN, BM, BN, RM, RN)                                        \
+    KERN<BM, BN, RM, RN>                                                         \
+        <<<dim3(((int)OUT + (BN) - 1) / (BN), ((int)M + (BM) - 1) / (BM)),       \
+           dim3(((BM) / (RM)) * ((BN) / (RN)))>>>(ARGS)
+#define DISPATCH_TILE(KERN) do {                                                 \
+    switch (tile_cfg((int)M)) {                                                  \
+        case 0: LAUNCH_TILE(KERN,  32,  32, 2, 2); break;                        \
+        case 1: LAUNCH_TILE(KERN,  64,  64, 4, 4); break;                        \
+        case 2: LAUNCH_TILE(KERN,  64,  64, 8, 8); break;                        \
+        case 3: LAUNCH_TILE(KERN, 128,  64, 8, 4); break;                        \
+        case 4: LAUNCH_TILE(KERN,  64, 128, 4, 8); break;                        \
+        case 5: LAUNCH_TILE(KERN, 128, 128, 8, 8); break;                        \
+        case 6: LAUNCH_TILE(KERN, 128, 128, 4, 4); break;                        \
+        case 7: LAUNCH_TILE(KERN, 128, 128, 8, 4); break;                        \
+        default: LAUNCH_TILE(KERN, 64, 64, 4, 4);                                \
+    } } while (0)
 
 // ---- KV-cache flash-decode (direct int8 K/V read) ---------------------------
 // SPLIT-KV / FLASH-DECODING, identical structure to csrc/kv_attention.cu so the
@@ -329,12 +357,13 @@ torch::Tensor mxint8_gemm_cuda(
         torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight,
         int64_t M, int64_t OUT, int64_t K, int64_t NB) {
     auto Y = torch::empty({M, OUT}, X.options());
-    const dim3 block(256), grid((OUT + TBN - 1) / TBN, (M + TBM - 1) / TBM);
-    mxint8_gemm_kernel<<<grid, block>>>(
-        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
-        scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
-        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
-        (int)M, (int)OUT, (int)K, (int)NB);
+#define ARGS \
+    reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), \
+    scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), \
+    reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
+    (int)M, (int)OUT, (int)K, (int)NB
+    DISPATCH_TILE(mxint8_gemm_tiled);
+#undef ARGS
     return Y;
 }
 
@@ -342,12 +371,13 @@ torch::Tensor mxint8_wa_gemm_cuda(
         torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight,
         int64_t M, int64_t OUT, int64_t K, int64_t NB) {
     auto Y = torch::empty({M, OUT}, X.options());
-    const dim3 block(256), grid((OUT + TBN - 1) / TBN, (M + TBM - 1) / TBM);
-    mxint8_wa_gemm_kernel<<<grid, block>>>(
-        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
-        scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
-        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
-        (int)M, (int)OUT, (int)K, (int)NB);
+#define ARGS \
+    reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), \
+    scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), \
+    reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
+    (int)M, (int)OUT, (int)K, (int)NB
+    DISPATCH_TILE(mxint8_wa_gemm_tiled);
+#undef ARGS
     return Y;
 }
 
