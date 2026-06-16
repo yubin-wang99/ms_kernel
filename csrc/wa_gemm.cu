@@ -107,10 +107,14 @@ __global__ void wonly_gemm_kernel(
     }
 }
 
-// ---- W+A GEMM: weight -> int8, activation -> MXINT8 on the fly, per-block
-//   (scale_a*scale_w) * int8-dot. one thread per (m, o). Correctness baseline
-//   for the INT8 IMMA path. Activation quant mirrors reference.quant_act
-//   (share=False): s = 2^(floor(log2(max|x|))-6), q = clip(rint(x/s),-127,127).
+// ---- W+A GEMM — SHARED-MEMORY TILED. Like wonly_gemm but the activation is
+//   MXINT8-quantized per (row, 32-block) on the fly. Since sa (act scale) and sw
+//   (weight scale) are both powers of two, qx*qw*sa*sw is exact, so folding
+//   As[k][m] = qx*sa and Bs[k][o] = qw*sw reduces W+A to the SAME accumulate as
+//   wonly_gemm (= the oracle's per-block int-dot * sa*sw, bit-for-bit). Activation
+//   quant mirrors reference.quant_act (share=False): sa = 2^(floor(log2 max|x|)-6),
+//   qx = clip(rint(x/sa), -127, 127). The weight unpack (Bs) is staged once per
+//   tile and reused by all TBM rows.
 __global__ void wa_gemm_kernel(
         const __nv_bfloat16* __restrict__ X,     // [M, K]
         const int8_t*  __restrict__ scale_exp,   // [NB, OUT]
@@ -118,35 +122,81 @@ __global__ void wa_gemm_kernel(
         const uint8_t* __restrict__ shared,      // [NB, SB, OUT]
         __nv_bfloat16* __restrict__ Y,           // [M, OUT]
         int M, int OUT, int K, int NB, int u, int gs, int UB, int SB) {
-    const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (o >= OUT || m >= M) return;
+    __shared__ float As[TBK][TBM];               // quant+dequant activation [k][m]
+    __shared__ float Bs[TBK][TBN];               // dequant(W) [k][o]
+    __shared__ float sa_s[TBM];                  // per-row activation scale (this block)
+    const int m0 = blockIdx.y * TBM, o0 = blockIdx.x * TBN;
+    const int tid = threadIdx.x, tRow = tid / 16, tCol = tid % 16;
 
-    float acc = 0.0f;
+    float acc[RTM][RTN];
+    #pragma unroll
+    for (int i = 0; i < RTM; ++i)
+        #pragma unroll
+        for (int j = 0; j < RTN; ++j) acc[i][j] = 0.0f;
+
     for (int blk = 0; blk < NB; ++blk) {
-        // on-the-fly MXINT8 activation quant for this row's 32-block
-        float amax = 1e-30f;
-        #pragma unroll
-        for (int k = 0; k < BLOCK; ++k)
-            amax = fmaxf(amax, fabsf(__bfloat162float(X[m * K + blk * BLOCK + k])));
-        float ea = floorf(log2f(amax)) - (float)ms::E_MAX;        // E_MAX = 6
-        ea = fmaxf(fminf(ea, 127.0f), -127.0f);
-        const float sa = exp2f(ea);
-
-        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
-        int idot = 0;
-        #pragma unroll
-        for (int k = 0; k < BLOCK; ++k) {
-            const float xv = __bfloat162float(X[m * K + blk * BLOCK + k]);
-            int qx = (int)rintf(xv / sa);
-            qx = max(-127, min(127, qx));
-            const int qw = ms::unpack_ms_weight_elem(upper, shared, blk, o, k,
-                                                     OUT, u, gs, UB, SB);
-            idot += qx * qw;
+        // stage raw X tile
+        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+            const int m = idx / TBK, k = idx % TBK;
+            As[k][m] = (m0 + m < M)
+                     ? __bfloat162float(X[(long)(m0 + m) * K + blk * TBK + k]) : 0.0f;
         }
-        acc += (float)idot * sa * sw;
+        // stage dequant(W) tile (the ONE unpack, reused by TBM rows)
+        for (int idx = tid; idx < TBN * TBK; idx += 256) {
+            const int oc = idx / TBK, k = idx % TBK, o = o0 + oc;
+            float v = 0.0f;
+            if (o < OUT) {
+                const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+                v = (float)ms::unpack_ms_weight_elem(upper, shared, blk, o, k,
+                                                     OUT, u, gs, UB, SB) * sw;
+            }
+            Bs[k][oc] = v;
+        }
+        __syncthreads();
+        // per-row activation scale: amax over the row's 32 values -> sa
+        if (tid < TBM) {
+            float amax = 1e-30f;
+            #pragma unroll
+            for (int k = 0; k < TBK; ++k) amax = fmaxf(amax, fabsf(As[k][tid]));
+            float ea = floorf(log2f(amax)) - (float)ms::E_MAX;
+            ea = fmaxf(fminf(ea, 127.0f), -127.0f);
+            sa_s[tid] = exp2f(ea);
+        }
+        __syncthreads();
+        // quant+dequant activation in place: As = clip(rint(x/sa),±127) * sa
+        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+            const int m = idx / TBK, k = idx % TBK;
+            const float sa = sa_s[m];
+            int qx = (int)rintf(As[k][m] / sa);
+            qx = max(-127, min(127, qx));
+            As[k][m] = (float)qx * sa;
+        }
+        __syncthreads();
+        // register-tiled accumulate (As folds sa, Bs folds sw -> exact int-dot*sa*sw)
+        #pragma unroll
+        for (int k = 0; k < TBK; ++k) {
+            float a[RTM], b[RTN];
+            #pragma unroll
+            for (int i = 0; i < RTM; ++i) a[i] = As[k][tRow * RTM + i];
+            #pragma unroll
+            for (int j = 0; j < RTN; ++j) b[j] = Bs[k][tCol * RTN + j];
+            #pragma unroll
+            for (int i = 0; i < RTM; ++i)
+                #pragma unroll
+                for (int j = 0; j < RTN; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
     }
-    Y[m * OUT + o] = __float2bfloat16(acc);
+    #pragma unroll
+    for (int i = 0; i < RTM; ++i) {
+        const int m = m0 + tRow * RTM + i;
+        if (m >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < RTN; ++j) {
+            const int o = o0 + tCol * RTN + j;
+            if (o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(acc[i][j]);
+        }
+    }
 }
 
 } // namespace
@@ -182,8 +232,8 @@ torch::Tensor wa_gemm_cuda(
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
     int UB, SB; gemm_dims(u, gs, UB, SB);
     auto Y = torch::empty({M, OUT}, X.options());
-    const dim3 block(32, 8);
-    const dim3 grid((OUT + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    const dim3 block(256);
+    const dim3 grid((OUT + TBN - 1) / TBN, (M + TBM - 1) / TBM);
     wa_gemm_kernel<<<grid, block>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),

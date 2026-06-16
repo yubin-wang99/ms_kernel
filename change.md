@@ -338,11 +338,18 @@ naive GEMM은 thread 1개가 (m,o) 출력 1개 → **배치 행마다 weight를 
 - 원리: unpack이 타일당 1회로 분할상환되자 커널이 memory-bound로 넘어가고, MSAQ가
   weight를 적게 읽어(u4: 4.75 vs 8.25 b/elem = 0.58×) 그만큼 빨라짐.
 
+## W+A GEMM도 동일 타일링 적용 (`wa_gemm.cu` wa_gemm, `mxint8.cu` mxint8_wa)
+W+A는 activation도 (row,block)별 MXINT8 양자화 후 정수 dot. **sa·sw가 둘 다 2의
+거듭제곱**이라 `As=qx·sa`, `Bs=qw·sw`로 fold하면 정수 dot과 bit-exact → W-only 타일에
+activation 양자화 staging만 추가(amax→sa→quant)하면 끝. 재인증 통과.
+- 결과(u=4): MSAQ가 모든 배치에서 MXINT8 추월(**0.94~0.98×**), M=256 3.07 vs 3.26 ms.
+- canonical M=512 u2gs8: 39.6 → **6.11 ms (~6.5×)**, ratio 1.08×(u=2라 근소 열위).
+
 ## u 의존성 (중요)
 - canonical M=512: **u3gs8 = 1.08×**(MSAQ 근소 열위), **u4 = 0.90×**(MSAQ 우위).
 - 이유: u=4는 바이트가 더 적고(0.58×) unpack도 nibble(straddle 없음)이라 둘 다 유리.
-  u=3은 바이트 0.68× + straddle unpack이라 거의 parity. → **저-u(많은 바이트 절약+nibble)
-  일수록 MSAQ 우위.** 단 절대 속도는 둘 다 ~27× 향상(naive 107.8 → 3.99 ms, M=512 u3).
+  u=3은 바이트 0.68× + straddle unpack이라 거의 parity. → **고-u(작은 upper폭=적은 바이트
+  +nibble)일수록 MSAQ 우위**(W-only·W+A 공통). 단 절대 속도는 둘 다 큰 폭 향상.
 
 ## 의의 / 다음
 - Phase 5·7·8의 micro-opt(bfe·ILP)는 다 무효였는데, **구조(tiled로 unpack 분할상환)** 가

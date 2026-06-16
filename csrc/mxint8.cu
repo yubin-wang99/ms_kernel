@@ -122,35 +122,81 @@ __global__ void mxint8_gemm_kernel(
 }
 
 // ---- W+A GEMM (int8 weight direct + on-the-fly MXINT8 activation, int dot) ---
+// SHARED-MEMORY TILED W+A, matched to wa_gemm.cu (only the B-tile differs:
+// direct int8 vs unpack). As folds sa (activation), Bs folds sw (weight).
 __global__ void mxint8_wa_gemm_kernel(
         const __nv_bfloat16* __restrict__ X,
         const int8_t* __restrict__ scale_exp,
         const int8_t* __restrict__ qweight,
         __nv_bfloat16* __restrict__ Y,
         int M, int OUT, int K, int NB) {
-    const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m = blockIdx.y * blockDim.y + threadIdx.y;
-    if (o >= OUT || m >= M) return;
-    float acc = 0.0f;
+    __shared__ float As[TBK][TBM];
+    __shared__ float Bs[TBK][TBN];
+    __shared__ float sa_s[TBM];
+    const int m0 = blockIdx.y * TBM, o0 = blockIdx.x * TBN;
+    const int tid = threadIdx.x, tRow = tid / 16, tCol = tid % 16;
+    float acc[RTM][RTN];
+    #pragma unroll
+    for (int i = 0; i < RTM; ++i)
+        #pragma unroll
+        for (int j = 0; j < RTN; ++j) acc[i][j] = 0.0f;
+
     for (int blk = 0; blk < NB; ++blk) {
-        float amax = 1e-30f;
-        #pragma unroll
-        for (int k = 0; k < BLOCK; ++k)
-            amax = fmaxf(amax, fabsf(__bfloat162float(X[m * K + blk * BLOCK + k])));
-        float ea = floorf(log2f(amax)) - (float)ms::E_MAX;
-        ea = fmaxf(fminf(ea, 127.0f), -127.0f);
-        const float sa = exp2f(ea);
-        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
-        int idot = 0;
-        #pragma unroll
-        for (int k = 0; k < BLOCK; ++k) {
-            int qx = (int)rintf(__bfloat162float(X[m * K + blk * BLOCK + k]) / sa);
-            qx = max(-127, min(127, qx));
-            idot += qx * (int)qweight[(blk * BLOCK + k) * OUT + o];
+        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+            const int m = idx / TBK, k = idx % TBK;
+            As[k][m] = (m0 + m < M)
+                     ? __bfloat162float(X[(long)(m0 + m) * K + blk * TBK + k]) : 0.0f;
         }
-        acc += (float)idot * sa * sw;
+        for (int idx = tid; idx < TBN * TBK; idx += 256) {
+            const int oc = idx / TBK, k = idx % TBK, o = o0 + oc;
+            float v = 0.0f;
+            if (o < OUT)
+                v = (float)qweight[(blk * BLOCK + k) * OUT + o]
+                  * ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            Bs[k][oc] = v;
+        }
+        __syncthreads();
+        if (tid < TBM) {
+            float amax = 1e-30f;
+            #pragma unroll
+            for (int k = 0; k < TBK; ++k) amax = fmaxf(amax, fabsf(As[k][tid]));
+            float ea = floorf(log2f(amax)) - (float)ms::E_MAX;
+            ea = fmaxf(fminf(ea, 127.0f), -127.0f);
+            sa_s[tid] = exp2f(ea);
+        }
+        __syncthreads();
+        for (int idx = tid; idx < TBM * TBK; idx += 256) {
+            const int m = idx / TBK, k = idx % TBK;
+            const float sa = sa_s[m];
+            int qx = (int)rintf(As[k][m] / sa);
+            qx = max(-127, min(127, qx));
+            As[k][m] = (float)qx * sa;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < TBK; ++k) {
+            float a[RTM], b[RTN];
+            #pragma unroll
+            for (int i = 0; i < RTM; ++i) a[i] = As[k][tRow * RTM + i];
+            #pragma unroll
+            for (int j = 0; j < RTN; ++j) b[j] = Bs[k][tCol * RTN + j];
+            #pragma unroll
+            for (int i = 0; i < RTM; ++i)
+                #pragma unroll
+                for (int j = 0; j < RTN; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
     }
-    Y[m * OUT + o] = __float2bfloat16(acc);
+    #pragma unroll
+    for (int i = 0; i < RTM; ++i) {
+        const int m = m0 + tRow * RTM + i;
+        if (m >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < RTN; ++j) {
+            const int o = o0 + tCol * RTN + j;
+            if (o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(acc[i][j]);
+        }
+    }
 }
 
 // ---- KV-cache flash-decode (direct int8 K/V read) ---------------------------
@@ -296,7 +342,7 @@ torch::Tensor mxint8_wa_gemm_cuda(
         torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight,
         int64_t M, int64_t OUT, int64_t K, int64_t NB) {
     auto Y = torch::empty({M, OUT}, X.options());
-    const dim3 block(32, 8), grid((OUT + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    const dim3 block(256), grid((OUT + TBN - 1) / TBN, (M + TBM - 1) / TBM);
     mxint8_wa_gemm_kernel<<<grid, block>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
