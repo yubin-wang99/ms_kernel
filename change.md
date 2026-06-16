@@ -393,6 +393,36 @@ W+A=INT8 IMMA가 자연스러운 매핑.
 
 ---
 
+# Phase 11 — tensor-core (BF16 WMMA) W-only prefill ✅ (opt-in)
+
+## 구현 (`wa_gemm.cu` wonly_gemm_wmma)
+FP32 타일과 동일 staging(Bs=dequant(W) bf16, As=X bf16)이되 inner product를
+`nvcuda::wmma` 16×16×16 fragment(tensor core)로. 블록 64×64, 4 warp(2×2)가 각
+32×32(2×2 frag) 담당. 레이아웃: C[m,o]=Σ_k X[m,k]·Wdq[o,k] → A=As[m][k] row_major,
+B=Bs[o][k]를 col_major K×O로 읽어 Wdq와 일치. `MS_TILE_CFG=10`으로 선택(opt-in).
+
+## 결과 (GPU1, u=4) — 정확(rel_fro 0.0017)
+| M | cuBLAS | FP32 tile | WMMA | WMMA/cuBLAS | WMMA/FP32 |
+|---|--------|-----------|------|-------------|-----------|
+| 128 | 0.073 | 0.984 | **0.657** | 9.0× | 0.67× |
+| 256 | 0.149 | 1.21 | **0.91** | 6.1× | 0.75× |
+| 512 | 0.276 | 2.18 | **1.62** | 5.9× | 0.75× |
+| 1024 | 0.550 | 4.37 | **2.80** | 5.1× | 0.64× |
+
+- WMMA가 M≥128에서 FP32 타일보다 **25~36% 빠름**, cuBLAS 대비 8~12× → **5~6×**로 단축.
+- 단 이득이 "modest"인 이유: 커널이 **staging/unpack-bound**(64×64 소형 타일, 4 warp,
+  async 파이프라인 없음)라 tensor core가 부분적으로 굶음. M=64에선 오히려 약간 느림
+  (block/occupancy 부족).
+
+## 현재 상태 / 남은 일
+- WMMA는 **opt-in**(default 미변경) — matched 비교(MSAQ vs MXINT8) 보존을 위해 default는
+  FP32 타일 유지. WMMA를 default로 올리려면 **MXINT8도 WMMA**(matched)가 선행돼야 함.
+- cuBLAS의 ~5×까지 더 좁히려면: **(1) 큰 타일(128×128)+8 warp, (2) `cp.async` double-buffer
+  로 staging↔compute overlap, (3) W+A는 INT8 IMMA(`s8` frag, int32 accum, sa·sw epilogue)**.
+  이게 CUTLASS-급 작업의 핵심 요소들.
+
+---
+
 # 한글 요약 — 방안 1~5 정리 (효과 / 구현 / 남은 과제)
 
 (아래 표는 Phase 1~5를 모두 반영한 최종 상태. 상세는 위 각 Phase 참조.)

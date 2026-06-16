@@ -26,6 +26,7 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 #include <math.h>
 #include "core/ms_utils.cuh"
 
@@ -195,6 +196,81 @@ __global__ void wa_gemm_tiled(
     }
 }
 
+// ---- W-only prefill via BF16 TENSOR CORES (WMMA 16x16x16) -------------------
+//   Same staging as wonly_gemm_tiled (Bs = dequant(W) bf16, As = X bf16) but the
+//   inner product runs on tensor cores. Block tile 64x64, 4 warps (2x2) each
+//   owning a 32x32 region (2x2 frags). Layout: C[m,o]=Sum_k X[m,k]*Wdq[o,k] ->
+//   A=As[m][k] row_major, B=Bs[o][k] read as col_major K×O (== Wdq). 128 threads.
+using namespace nvcuda;
+constexpr int WSK = BLOCK + 8;          // shared K width (+pad to dodge bank conflicts)
+__global__ void wonly_gemm_wmma(
+        const __nv_bfloat16* __restrict__ X,
+        const int8_t*  __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper,
+        const uint8_t* __restrict__ shared,
+        __nv_bfloat16* __restrict__ Y,
+        int M, int OUT, int K, int NB, int u, int gs, int UB, int SB) {
+    __shared__ __nv_bfloat16 As[64][WSK];   // X         [m][k]
+    __shared__ __nv_bfloat16 Bs[64][WSK];   // dequant(W) [o][k]
+    __shared__ float tmp[4][16][16];        // per-warp store scratch (float -> bf16)
+    const int m0 = blockIdx.y * 64, o0 = blockIdx.x * 64;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wM = warp >> 1, wN = warp & 1;          // 2x2 warp grid
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    for (int blk = 0; blk < NB; ++blk) {
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (m0 + m < M) ? X[(long)(m0 + m) * K + blk * BLOCK + k]
+                                    : __float2bfloat16(0.0f);
+        }
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int oc = idx / BLOCK, k = idx % BLOCK, o = o0 + oc;
+            float v = 0.0f;
+            if (o < OUT) {
+                const float sc = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+                v = (float)ms::unpack_ms_weight_elem(upper, shared, blk, o, k,
+                                                     OUT, u, gs, UB, SB) * sc;
+            }
+            Bs[oc][k] = __float2bfloat16(v);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[wM*32 + i*16][wk*16], WSK);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[wN*32 + j*16][wk*16], WSK);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            wmma::store_matrix_sync(wt, acc[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int mb = m0 + wM*32 + i*16, ob = o0 + wN*32 + j*16;
+            for (int e = lane; e < 256; e += 32) {
+                const int m = mb + e / 16, o = ob + e % 16;
+                if (m < M && o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(wt[e]);
+            }
+            __syncwarp();
+        }
+}
+
 // Tile-config dispatch. Swept optimum (RTX 3090, OUT=4096) is M-ADAPTIVE: a
 // 128x128 tile reuses best but yields too few blocks (OUT/128=32 < 82 SMs) until
 // M fills the second grid dim, so small M prefers 64x64 (more blocks). Crossover
@@ -244,7 +320,10 @@ torch::Tensor wonly_gemm_cuda(
     scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(), \
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
-    DISPATCH_TILE(wonly_gemm_tiled);
+    if (tile_cfg((int)M) == 10)     // BF16 tensor-core (WMMA) path
+        wonly_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(ARGS);
+    else
+        DISPATCH_TILE(wonly_gemm_tiled);
 #undef ARGS
     return Y;
 }
