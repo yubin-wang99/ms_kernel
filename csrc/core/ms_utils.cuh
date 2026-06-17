@@ -176,6 +176,25 @@ __device__ __forceinline__ int unpack_ms_kv_elem(
     return up_code * (1 << u) + sh_code;
 }
 
+// --- KV variant, u==4 FAST PATH: upper(4b) and shared(4b) are both nibble-
+//   aligned, so NO straddle ever happens. Replaces the general path's
+//   conditional 2-byte load + variable mask + xor-sign-extend with a single
+//   byte load + one bfe.s32 per plane (sign-extended in HW). u4 is the
+//   fewest-bytes config (16B upper/block) and the KV benchmark default; the
+//   general unpack_ms_kv_elem stays for u in {2,3}. Bit-exact: up*16+sh with
+//   both codes 4-bit two's-complement == the general reconstruction at u=4. ----
+__device__ __forceinline__ int unpack_ms_kv_elem_u4(
+        const uint8_t* upper, const uint8_t* shared,
+        long base_u, long base_h, int key, int k,
+        int gs, int UB, int SB) {
+    const long ku = base_u + (long)key * UB;
+    const long kh = base_h + (long)key * SB;
+    const int up_code = bfe_s32((int)upper[ku + (k >> 1)], (k & 1) * 4, 4);
+    const int g       = k >> (__ffs(gs) - 1);
+    const int sh_code = bfe_s32((int)shared[kh + (g >> 1)], (g & 1) * 4, 4);
+    return up_code * 16 + sh_code;
+}
+
 }  // namespace ms
 
 // =============================================================================

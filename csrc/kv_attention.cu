@@ -37,6 +37,7 @@
 #include <cuda_pipeline.h>
 #include <cstdlib>
 #include <math.h>
+#include <type_traits>
 #include "core/ms_utils.cuh"
 
 namespace {
@@ -49,8 +50,21 @@ constexpr int CP_CHUNK = 64;    // keys per cp.async double-buffer chunk (smalle
 // the offsets 4-aligned); a <4-byte tail (small shared planes) is copied directly.
 __device__ __forceinline__ void cpa(unsigned char* dst, const unsigned char* src,
                                      int n, int tid, int nt) {
-    for (int off = tid * 4; off < n; off += nt * 4)   // n is a multiple of 4 (UB*nC)
-        __pipeline_memcpy_async(dst + off, src + off, 4);
+    // Pick the WIDEST aligned cp.async width: 16B (LDGSTS.128) is ~4x fewer
+    // transactions than 4B and is what makes the upper-plane staging hit full
+    // bandwidth. u4 (UB=16) is 16B-aligned end-to-end; u3/u2 (UB=20/24) fall to
+    // 8/4B. The (dst|src|n) test is uniform across the warp -> branch is free.
+    const unsigned amask = (unsigned)(((uintptr_t)src | (uintptr_t)dst) | (unsigned)n);
+    if ((amask & 15) == 0) {
+        for (int off = tid * 16; off < n; off += nt * 16)
+            __pipeline_memcpy_async(dst + off, src + off, 16);
+    } else if ((amask & 7) == 0) {
+        for (int off = tid * 8; off < n; off += nt * 8)
+            __pipeline_memcpy_async(dst + off, src + off, 8);
+    } else {
+        for (int off = tid * 4; off < n; off += nt * 4)   // n is a multiple of 4 (UB*nC)
+            __pipeline_memcpy_async(dst + off, src + off, 4);
+    }
 }
 // synchronous byte copy (for the tiny shared-code planes whose SB=2 key stride can
 // leave the source 2-mod-4 -> cp.async would misalign; they're small, no need to hide).
@@ -173,10 +187,11 @@ __global__ void kv_decode_cpasync_kernel(
         const uint8_t* __restrict__ vh,
         float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
         int H, int Lk, int D, int NB, int u, int gs, int UB, int SB,
-        int key_tile, int S, float sm_scale) {
+        int key_tile, int S, float sm_scale, int diag) {
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x;
     const int lane = tid & 31, warpId = tid >> 5, nWarps = blockDim.x >> 5, NT = blockDim.x;
     const bool active = tid < D;
+    const int wbits = 8 - u;                       // diag: raw-byte index for memory ceiling
 
     extern __shared__ unsigned char smem_cp[];
     float* q_sh = (float*)smem_cp;
@@ -194,8 +209,10 @@ __global__ void kv_decode_cpasync_kernel(
             const long bh = (long)(h * NB + blk) * Lk * SB + (long)cs * SB;
             cpa(pKu + blk*CP_CHUNK*UB, ku + bu, nC*UB, tid, NT);       // big: async
             cpa(pVu + blk*CP_CHUNK*UB, vu + bu, nC*UB, tid, NT);
-            sync_copy(pKh + blk*CP_CHUNK*SB, kh + bh, nC*SB, tid, NT); // tiny: sync
-            sync_copy(pVh + blk*CP_CHUNK*SB, vh + bh, nC*SB, tid, NT);
+            if (diag != 3) {  // diag3: skip shared-plane sync_copy to isolate its cost
+                sync_copy(pKh + blk*CP_CHUNK*SB, kh + bh, nC*SB, tid, NT); // tiny: sync
+                sync_copy(pVh + blk*CP_CHUNK*SB, vh + bh, nC*SB, tid, NT);
+            }
         }
     };
 
@@ -226,9 +243,18 @@ __global__ void kv_decode_cpasync_kernel(
             for (int d = lane; d < D; d += 32) {
                 const int blk = d / BLOCK, kd = d % BLOCK;
                 const float ksc = ms::e8m0_to_scale(ks[(h * NB + blk) * Lk + j]);
-                part += q_sh[d] * (float)ms::unpack_ms_kv_elem(pKu, pKh,
+                // diag==1: memory ceiling -> read 1 staged upper byte, skip unpack
+                float kv;
+                if (diag == 1 || diag == 3)  // memory ceiling: 1 staged upper byte, no unpack
+                    kv = (float)pKu[(long)blk*CP_CHUNK*UB + (long)kk*UB + ((kd*wbits)>>3)];
+                else if (u == 4)      // fast path: nibble-aligned bfe, no straddle
+                    kv = (float)ms::unpack_ms_kv_elem_u4(pKu, pKh,
+                            (long)blk*CP_CHUNK*UB, (long)blk*CP_CHUNK*SB, kk, kd, gs, UB, SB);
+                else
+                    kv = (float)ms::unpack_ms_kv_elem(pKu, pKh,
                             (long)blk*CP_CHUNK*UB, (long)blk*CP_CHUNK*SB, 0, kk, kd,
-                            u, gs, UB, SB) * ksc;
+                            u, gs, UB, SB);
+                part += q_sh[d] * kv * ksc;
             }
             part = warp_reduce_sum(part);
             if (lane == 0) sc[kk] = part * sm_scale;
@@ -243,20 +269,184 @@ __global__ void kv_decode_cpasync_kernel(
         const int blk = tid / BLOCK, kd = tid % BLOCK;
         float lsum = 0.0f, a = 0.0f;
         for (int kk = 0; kk < nC; ++kk) {
-            const float p = expf(sc[kk] - m_new);
+            // diag!=0: skip exp (linear weight) to isolate softmax-exp cost
+            const float p = (diag == 0) ? expf(sc[kk] - m_new) : (sc[kk] - m_new);
             lsum += p;
             if (active) {
                 const int j = cs + kk;
                 const float vsc = ms::e8m0_to_scale(vs[(h * NB + blk) * Lk + j]);
-                a += p * (float)ms::unpack_ms_kv_elem(pVu, pVh,
+                float vv;
+                if (diag == 1)
+                    vv = (float)pVu[(long)blk*CP_CHUNK*UB + (long)kk*UB + ((kd*wbits)>>3)];
+                else if (u == 4)
+                    vv = (float)ms::unpack_ms_kv_elem_u4(pVu, pVh,
+                            (long)blk*CP_CHUNK*UB, (long)blk*CP_CHUNK*SB, kk, kd, gs, UB, SB);
+                else
+                    vv = (float)ms::unpack_ms_kv_elem(pVu, pVh,
                             (long)blk*CP_CHUNK*UB, (long)blk*CP_CHUNK*SB, 0, kk, kd,
-                            u, gs, UB, SB) * vsc;
+                            u, gs, UB, SB);
+                a += p * vv * vsc;
             }
         }
         l_i = l_i * alpha + lsum;
         acc = acc * alpha + a;
         m_i = m_new;
         __syncthreads();
+    }
+    if (active) part_o[((long)h * S + s) * D + tid] = acc;
+    if (tid == 0) { part_m[h * S + s] = m_i; part_l[h * S + s] = l_i; }
+}
+
+// ---- u==4 KEY-PER-THREAD WIDE-READ kernel (change.md Phase 18, fix plan A) ---
+//   DIAGNOSIS (Phase 17): the warp-per-key (Pass1) / thread-per-d (Pass2) mapping
+//   reads only HALF a memory sector of USEFUL bytes — a warp's 32 lanes want 32
+//   u4 codes = 16 bytes, but a DRAM/L2 sector is 32 bytes, so MSAQ's effective BW
+//   is ~38% of MXINT8 (which packs 1 byte/elem -> a warp's 32 int8 fill a full
+//   sector). That, not unpack or exp, is why MSAQ KV stays ~1.5x slower despite
+//   reading 0.56x the bytes. This is the GEMV-wide win (change.md Phase 14/16)
+//   ported to KV: assign one THREAD per key. The token-major plane [H,NB,Lk,UB]
+//   already stores a key's UB=16 bytes contiguously with consecutive keys 16 B
+//   apart, so consecutive threads -> consecutive keys -> a warp reads 512 B
+//   fully-contiguous, fully-useful (100% sector util) in ONE uint4 load/block.
+//   No repack (identical bytes) -> bit-exact at u=4.
+//     Pass 1 (scores): thread t owns key cs+t. It uint4-loads K[key,block] for
+//       each of NB blocks, bfe-extracts all 32 codes from registers (GEMV style),
+//       and accumulates the FULL q·K dot in-thread (no warp reduction) -> sc[t].
+//     Pass 2 (output): V can't be thread-per-key (the output is reduced OVER
+//       keys, so a key-owning thread would have to scatter into all D outputs).
+//       Instead STAGE this chunk's V coalesced into shared (a contiguous copy is
+//       already 100%-util) then run the easy thread-per-d accumulate from shared
+//       -> the global V read is wide/coalesced, the narrow part is on-chip. (The
+//       cp.async kernel staged the same way but its double-buffer barriers cost
+//       more than they saved in this BW-bound regime — here it's one sync copy.)
+//   All u: u4 uses one uint4 load + bfe (UB=16); u2/u3 (UB=20/24, not int4-
+//   aligned) load the key's UB bytes as 4-aligned uint32 words into registers
+//   and extract with the general straddle path — the coalescing win comes from
+//   the thread-per-key mapping, not the vector width, so no repack is needed.
+//   Templated on U4 with `if constexpr` so each instantiation drops the other
+//   path's registers (a merged runtime branch bloated u4 regs -> killed its
+//   occupancy). -----------------------------------------------------------------
+template<bool U4>
+__global__ void kv_decode_wide_kernel(
+        const __nv_bfloat16* __restrict__ q,
+        const int8_t*  __restrict__ ks, const uint8_t* __restrict__ ku,
+        const uint8_t* __restrict__ kh,
+        const int8_t*  __restrict__ vs, const uint8_t* __restrict__ vu,
+        const uint8_t* __restrict__ vh,
+        float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
+        int H, int Lk, int D, int NB, int u, int gs, int UB, int SB,
+        int key_tile, int S, int chunk, float sm_scale) {
+    const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
+    const int gs_shift = __ffs(gs) - 1;            // gs is pow2: k/gs == k>>shift
+    const bool active = tid < D;                   // pass-2 owns head_dim d=tid
+
+    extern __shared__ unsigned char smem_w[];
+    float* q_sh = (float*)smem_w;                  // [D]
+    float* sc   = q_sh + D;                        // [chunk] scores
+    unsigned char* pVu = (unsigned char*)(sc + chunk);  // [NB*chunk*UB] staged V upper
+    unsigned char* pVh = pVu + (long)NB * chunk * UB;   // [NB*chunk*SB] staged V shared
+    if (active) q_sh[tid] = __bfloat162float(q[h * D + tid]);
+    __syncthreads();
+
+    const int j0 = s * key_tile, j1 = min(j0 + key_tile, Lk);
+    float m_i = -INFINITY, l_i = 0.0f, acc = 0.0f;
+
+    for (int cs = j0; cs < j1; cs += chunk) {
+        const int nC = min(chunk, j1 - cs);
+
+        // ---- Pass 1: thread t == key cs+t; wide K load; in-thread dot ----
+        //   UB==16 (u4): one uint4 + bfe. u2/u3 (UB=20/24, not int4-aligned): load
+        //   the key's UB bytes as 4-aligned uint32 words into registers, extract
+        //   with the general straddle path (bit-exact). Coalescing comes from the
+        //   thread-per-key mapping (consecutive keys are UB-contiguous), NOT from
+        //   the vector width, so it does not need int4 alignment / a repack.
+        if (tid < nC) {
+            const int key = cs + tid;
+            float dot = 0.0f;
+            for (int blk = 0; blk < NB; ++blk) {
+                const float ksc = ms::e8m0_to_scale(ks[(h * NB + blk) * Lk + key]);
+                const long kbase = (long)(h * NB + blk) * Lk + key;
+                uint8_t sb[8];                              // SB <= 8 shared-code bytes
+                const long sbase = kbase * SB;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = kh[sbase + i];
+                if constexpr (U4) {                         // u4 fast path: uint4 + bfe
+                    const uint4 up4 = *reinterpret_cast<const uint4*>(ku + kbase * UB);
+                    const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+                    #pragma unroll
+                    for (int kd = 0; kd < BLOCK; ++kd) {
+                        const int up_code = ms::bfe_s32((int)uw[kd >> 3], (kd & 7) * 4, 4);
+                        const int g       = kd >> gs_shift;
+                        const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                        dot += q_sh[blk * BLOCK + kd] * ((up_code * 16 + sh_code) * ksc);
+                    }
+                } else {                                    // u2/u3: word-load + general
+                    uint32_t ureg[6];                       // UB/4 <= 6 words (u2: 24B)
+                    const uint32_t* src = reinterpret_cast<const uint32_t*>(ku + kbase * UB);
+                    #pragma unroll
+                    for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+                    const uint8_t* ublk = reinterpret_cast<const uint8_t*>(ureg);
+                    for (int kd = 0; kd < BLOCK; ++kd) {
+                        const int w = ms::unpack_ms_kv_elem(ublk, sb, 0, 0, 0, 0, kd,
+                                                            u, gs, UB, SB);
+                        dot += q_sh[blk * BLOCK + kd] * (w * ksc);
+                    }
+                }
+            }
+            sc[tid] = dot * sm_scale;
+        }
+
+        // ---- stage this chunk's V into shared, coalesced (100%-util global read) ----
+        //   u4: 1 uint4 == 1 key. u2/u3: copy the contiguous nC*UB bytes as uint32
+        //   words (UB is a multiple of 4) -> still fully coalesced.
+        for (int blk = 0; blk < NB; ++blk) {
+            if constexpr (U4) {
+                const uint4* src4 = reinterpret_cast<const uint4*>(
+                        vu + ((long)(h * NB + blk) * Lk + cs) * UB);
+                uint4* dst4 = reinterpret_cast<uint4*>(pVu + (long)blk * chunk * UB);
+                for (int i = tid; i < nC; i += NT) dst4[i] = src4[i];
+            } else {
+                const uint32_t* s32 = reinterpret_cast<const uint32_t*>(
+                        vu + ((long)(h * NB + blk) * Lk + cs) * UB);
+                uint32_t* d32 = reinterpret_cast<uint32_t*>(pVu + (long)blk * chunk * UB);
+                const int nw = (nC * UB) >> 2;
+                for (int i = tid; i < nw; i += NT) d32[i] = s32[i];
+            }
+            const unsigned char* srch = vh + ((long)(h * NB + blk) * Lk + cs) * SB;
+            unsigned char* dsth = pVh + (long)blk * chunk * SB;
+            for (int i = tid; i < nC * SB; i += NT) dsth[i] = srch[i];  // tiny shared plane
+        }
+        __syncthreads();   // Pass-1 sc + staged V visible before Pass 2
+
+        // ---- chunk max (per thread from shared) ----
+        float m_chunk = -INFINITY;
+        for (int kk = 0; kk < nC; ++kk) m_chunk = fmaxf(m_chunk, sc[kk]);
+        const float m_new = fmaxf(m_i, m_chunk);
+        const float alpha = expf(m_i - m_new);
+
+        // ---- Pass 2: out[d] += Σ_kk p_kk·V[d,kk]  (thread d, V from staged shared) ----
+        const int blk = tid / BLOCK, kd = tid % BLOCK;
+        float lsum = 0.0f, a = 0.0f;
+        for (int kk = 0; kk < nC; ++kk) {
+            const float p = expf(sc[kk] - m_new);
+            lsum += p;
+            if (active) {
+                const int j = cs + kk;
+                const float vsc = ms::e8m0_to_scale(vs[(h * NB + blk) * Lk + j]);
+                float vv;
+                if constexpr (U4)
+                    vv = (float)ms::unpack_ms_kv_elem_u4(pVu, pVh,
+                        (long)blk * chunk * UB, (long)blk * chunk * SB, kk, kd, gs, UB, SB);
+                else
+                    vv = (float)ms::unpack_ms_kv_elem(pVu, pVh,
+                        (long)blk * chunk * UB, (long)blk * chunk * SB, 0, kk, kd, u, gs, UB, SB);
+                a += p * vv * vsc;
+            }
+        }
+        l_i = l_i * alpha + lsum;
+        acc = acc * alpha + a;
+        m_i = m_new;
+        __syncthreads();   // protect sc[] + staged V before next chunk
     }
     if (active) part_o[((long)h * S + s) * D + tid] = acc;
     if (tid == 0) { part_m[h * S + s] = m_i; part_l[h * S + s] = l_i; }
@@ -321,7 +511,29 @@ torch::Tensor kv_decode_attention_cuda(
 
     const char* e = getenv("MS_KV_CPASYNC");
     const bool cpasync = !(e && atoi(e) == 0);
-    if (cpasync) {                  // hide K/V unpack behind cp.async prefetch
+    int diag = 0;                   // MS_KV_DIAG: 1=mem ceiling, 2=+unpack(no exp), 0=full
+    if (const char* d = getenv("MS_KV_DIAG")) diag = atoi(d);
+    // key-per-thread WIDE read (fix plan A): default on for all u (the KV bench
+    // default), bit-exact (same bytes — coalescing comes from thread-per-key, not
+    // from int4 alignment, so u2/u3 need no repack). Disabled when diag!=0 so the
+    // cp.async diagnostic path stays measurable. MS_KV_WIDE=0 falls back for A/B.
+    const char* wenv = getenv("MS_KV_WIDE");
+    const bool wide = (diag == 0) && !(wenv && atoi(wenv) == 0);
+    if (wide) {
+        const int chunk = threads;  // pass1: thread/key, pass2: thread/head_dim
+        const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
+                            + (size_t)NB * chunk * (UB + SB);   // q_sh + sc + staged V(up,sh)
+        auto launch = [&](auto U4tag) {
+            kv_decode_wide_kernel<decltype(U4tag)::value><<<dim3((int)H, S), threads, smem_w>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+                ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
+                vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
+                part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+                (int)H, (int)Lk, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale);
+        };
+        if ((int)u == 4) launch(std::true_type{});
+        else             launch(std::false_type{});
+    } else if (cpasync) {           // hide K/V unpack behind cp.async prefetch
         const size_t smem_cp = (size_t)((int)D + CP_CHUNK) * sizeof(float)
                              + (size_t)2 * 2 * (NB * CP_CHUNK * (UB + SB));   // 2 buf x (K+V)(up+sh)
         kv_decode_cpasync_kernel<<<dim3((int)H, S), threads, smem_cp>>>(
@@ -329,7 +541,7 @@ torch::Tensor kv_decode_attention_cuda(
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
             part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            (int)H, (int)Lk, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, sm_scale);
+            (int)H, (int)Lk, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, sm_scale, diag);
     } else {
         kv_decode_split_kernel<<<dim3((int)H, S), threads, smem>>>(
             reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
