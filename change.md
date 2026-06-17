@@ -576,9 +576,15 @@ broadcast** load + bfe.
   (memceil 0.0195ms = 0.41× MXINT8 → 이론 상한; 현재 추출 잔여 비용으로 0.69×.)
 - "17× vs BF16"은 정정: 그건 우리 naive 원본 대비였음. 이제 BF16 대비 **실측 0.69×(빠름)**.
 
-## 메모 (follow-up 후보)
-- runtime divide(`k/gs`) 제거는 일반 unpack(scalar/cp.async/GEMM/KV)에도 적용 가능 — 공짜 이득.
+## 추출 잔여 (follow-up 후보)
 - 추출 잔여 14us를 vectorized int4 dequant(Marlin식 lop3/prmt)로 더 줄이면 0.41×까지 여지.
+
+## divide→shift를 일반 unpack에도 확장 (`ms_utils.cuh`)
+`unpack_ms_weight_elem`/`unpack_ms_kv_elem`의 `g = k/gs`도 `k >> (__ffs(gs)-1)`로 교체
+(scalar/cp.async GEMV·GEMM·W+A·KV가 전부 사용). 결과: **GEMM·KV는 neutral**(GEMM은 tiled로
+unpack이 분할상환돼 FMA-bound, KV cp.async는 staging/memory-bound라 divide가 병목이 아님).
+즉 divide가 병목이었던 건 **wide GEMV뿐**. 그래도 strict simplification(divide→shift, 절대
+안 느림)이라 정확성·neutral 확인 후 유지. 전 117 테스트 통과.
 
 ---
 

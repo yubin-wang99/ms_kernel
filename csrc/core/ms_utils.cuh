@@ -136,7 +136,7 @@ __device__ __forceinline__ int unpack_ms_weight_elem(
     return 0;
 #else
     const int up_code = extract_code(upper, blk * UB, OUT, o, k * wbits, wbits, UB);
-    const int g       = k / gs;
+    const int g       = k >> (__ffs(gs) - 1);   // gs is a power of 2: avoid runtime divide
     const int sh_code = extract_code(shared, blk * SB, OUT, o, g * u, u, SB);
     return up_code * (1 << u) + sh_code;
 #endif
@@ -156,7 +156,7 @@ __device__ __forceinline__ int unpack_ms_kv_elem(
         long base_u, long base_h, int L, int key, int k,
         int u, int gs, int UB, int SB) {
     const int wbits = 8 - u;
-    const int g = k / gs;
+    const int g = k >> (__ffs(gs) - 1);          // gs is a power of 2: avoid runtime divide
     const long ku = base_u + (long)key * UB;     // this key's contiguous upper bytes
     const long kh = base_h + (long)key * SB;     // this key's contiguous shared bytes
     // upper
