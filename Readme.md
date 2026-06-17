@@ -7,27 +7,43 @@ verification. This tree is the CUDA pivot of the old single-file
 hardware instructions, so the kernels move to CUDA (`bfe`/`prmt`, `__hfma2`,
 warp reductions) and CUTLASS (tensor cores).
 
-## Results — KV-cache decode now beats the matched MXINT8 baseline (Phase 18)
+## Results — both decode kernels now beat the matched MXINT8 baseline at every `u`
 
 The campaign goal — *fewer bytes (MSAQ-signed) → faster wall-clock* than a
-matched 1-byte MXINT8 kernel — is met for KV decode at **every** `u`. The lever
-was the memory **access pattern**, not the unpack: a `key-per-thread` wide
-coalesced read (each thread owns one key and reads its contiguous bytes, so a
-warp reads a full 512 B sector at 100 % utilisation instead of the old
-warp-per-key 50 %). No repack, bit-exact vs the oracle.
+matched 1-byte MXINT8 kernel — is met for **KV decode and W-only GEMV at every
+`u`** (and they beat cuBLAS/SDPA BF16 too). Both wins are bit-exact (no repack,
+no padding) and came from finding the *real* bottleneck by measurement, not by
+the layout fix the design notes assumed.
 
-| `u` (bytes/blk) | MSAQ wide / MXINT8 | vs prior cp.async |
+**KV decode** (Phase 18) — `H=8 Lk=16384 D=128`, pure-HBM. Lever: a
+`key-per-thread` wide coalesced read (each thread owns one key's contiguous
+bytes → a warp reads a full 512 B sector at 100 % utilisation vs the old
+warp-per-key 50 %).
+
+| `u` | MSAQ / MXINT8 | MSAQ / SDPA |
 |---|---|---|
-| u2 (26 B) | **0.89×** | 0.46× |
-| u3 (22 B) | **0.86×** | 0.65× |
-| u4 (18 B) | **0.47×** (2.1× faster) | 0.40× |
+| u2 | **0.88×** | 0.32× |
+| u3 | **0.87×** | 0.32× |
+| u4 | **0.49×** | 0.18× |
 
-RTX 3090 (sm_86), `H=8 Lk=16384 D=128`, pure-HBM regime, warm cross-measured
-(clock-/order-verified — `tests/kv_clock_verify.py`). Bit-exact vs the certified
-path (`max|diff|` u3 0.0, u4 2e-6); all 54 KV + emulation tests pass. The W-only
-decode GEMV reaches the same crossover (`u4` 0.69× MXINT8, Phase 16). Full
-phase-by-phase history (occupancy split-K → coalescing → two-pass → cp.async →
-wide-load) is in `change.md`.
+**W-only GEMV** (Phase 14/16/20) — decode `M=1`, `OUT=K=4096`. u4 uses a single
+int4 load + nibble `bfe`; u2/u3 were *extraction*-bound (the byte-straddle unpack,
+not the load — a perfectly-coalesced plane-split gave zero speedup), fixed by a
+**streaming bit-buffer unpack** (one shift+mask per code, shared advanced per
+group). No repack — only the kernel's inner loop changed.
+
+| `u` | MSAQ / MXINT8 | MSAQ / cuBLAS |
+|---|---|---|
+| u2 | **0.84×** (was 1.50) | 0.88× |
+| u3 | **0.82×** (was 1.43) | 0.86× |
+| u4 | **0.56×** | 0.59× |
+
+RTX 3090 (sm_86), warm cross-measured (clock-/order-verified —
+`tests/kv_clock_verify.py`); bit-exact vs the certified path; all GPU +
+emulation tests pass. The prefill GEMM / W+A kernels beat MXINT8 at u4 (0.92–0.93×)
+and lag slightly at u2/u3 (1.02–1.07×, tiled → compute-bound; needs tensor cores).
+Full phase-by-phase history (split-K → coalescing → two-pass → cp.async →
+wide-load → streaming unpack) and the 4-kernel scoreboard are in `change.md`.
 
 ## Layout
 
@@ -72,8 +88,8 @@ ms/
 
 > **Note:** the table below is the *original correctness-first baseline* status.
 > The decode paths have since been optimized and GPU-certified — see **Results**
-> above and `change.md` (Phase 1–18). `kv_attention.cu` and `w_gemv.cu` now beat
-> the matched MXINT8 baseline.
+> above and `change.md` (Phase 1–20). `kv_attention.cu` and `w_gemv.cu` now beat
+> the matched MXINT8 baseline at every `u`.
 
 All four kernels' **logic is verified on CPU** by `tests/test_emulation.py`
 (`rel_fro < 1e-9` vs the oracle, mirroring each kernel's exact byte-addressing
@@ -83,7 +99,7 @@ and arithmetic). What remains is CUDA *execution* — compile + the GPU
 | file | status |
 |---|---|
 | `ms_utils.cuh` | unpack primitive **complete & matches the oracle's bit-math** |
-| `w_gemv.cu` | correctness-first draft, **logic-verified**; x via L2 broadcast (no shared-mem K ceiling) |
+| `w_gemv.cu` | **optimized & GPU-certified** — split-K + wide-load + streaming bit-buffer unpack; beats matched MXINT8 at all `u` (Phase 14/16/20) |
 | `wonly_gemm` / `wa_gemm` (`wa_gemm.cu`) | correctness-first baselines, **logic-verified** (no tensor cores yet) |
 | `kv_attention.cu` | **optimized & GPU-certified** — split-K flash-decode + key-per-thread wide-read; beats matched MXINT8 at all `u` (Phase 18). No tensor-core QKᵀ/PV yet |
 
