@@ -172,6 +172,7 @@ __global__ void wonly_gemv_wide_kernel(
     const int per = (NB + splitK - 1) / splitK;
     const int b0  = sp * per, b1 = min(b0 + per, NB);
 
+    const int gs_shift = __ffs(gs) - 1;                  // gs is a power of 2: k/gs == k>>shift
     float acc = 0.0f;
     for (int blk = b0; blk < b1; ++blk) {
         const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
@@ -185,7 +186,7 @@ __global__ void wonly_gemv_wide_kernel(
         #pragma unroll
         for (int k = 0; k < BLOCK; ++k) {
             const int up_code = ms::bfe_s32((int)uw[k >> 3], (k & 7) * 4, 4);
-            const int g = k / gs;
+            const int g = k >> gs_shift;                 // (was k/gs: a runtime divide ~15us)
             const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
             const int w = up_code * 16 + sh_code;
             acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
@@ -253,7 +254,9 @@ torch::Tensor wonly_gemv_wide_cuda(
     auto y = torch::empty({OUT}, x.options());
     const int threads = 128;
     const int blocks = (int)((OUT + threads - 1) / threads);
-    const int splitK = ms::gemv_splitk_count(blocks, (int)NB);
+    // wide kernel does only 1 int4 load/block -> needs MORE splits for MLP (the
+    // narrow-load kernels saturate at mult~3; wide wants ~16). See change.md Phase 16.
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
     auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
 
     wonly_gemv_wide_kernel<<<dim3(blocks, splitK), threads>>>(

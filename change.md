@@ -545,6 +545,43 @@ broadcast** load + bfe.
 
 ---
 
+# Phase 16 — 세분화 측정으로 병목 규명 → **MSAQ GEMV가 MXINT8/BF16 능가** ✅✅
+
+총 latency만 보지 말고 쪼개서 측정하자는 지적에 따라, wide u4 GEMV(Phase 14)를
+단계별로 분해 측정해 병목 두 개를 잡았다.
+
+## 진단 (MS_WIDE_MEMCEIL diagnostic 경로 + splitK sweep)
+1. **splitK sweep**: 기본 mult=3에선 0.10ms, mult를 키우니 0.045ms (2.2×) → wide는
+   블록당 int4 load가 **1개뿐**이라 MLP가 부족했음(narrow 커널은 32 load/block라 mult~3로
+   충분). → **MLP-bound (낮은 split에서).**
+2. **memory-ceiling 분해**(read만, no bfe/fma/x): weight READ 자체는 **0.0195ms, 54.5%
+   peak** — MXINT8(43%)보다도 빠름! 즉 memory/access는 전혀 병목이 아니고 **compute-bound**.
+3. **compute 분해**(memceil=2: bfe는 하되 x/fma 생략): bfe+추출이 +29us로 dominant.
+   그 안에서 **`g = k/gs`가 runtime divide**(gs가 컴파일타임 상수 아님 → HW 정수 divide
+   ~20cyc)였고, 원소당 1회 = 블록당 32 divide. **이게 추출 비용의 절반(~15us).**
+
+## 두 줄 수정
+1. wide 커널 splitK default **mult 3 → 16** (`gemv_splitk_count(..., 16)`): MLP 확보.
+2. `g = k / gs` → **`g = k >> (__ffs(gs)-1)`** (gs는 2의 거듭제곱): divide 제거.
+
+## 결과 (GPU1, OUT=K=4096, u4) — 전 117 테스트 통과
+| 단계 | time | BW | vs MXINT8 |
+|------|------|-----|-----------|
+| Phase 14 wide (mult=3) | 0.066 ms | 16% | 1.40× |
+| + mult=16 (MLP) | 0.051 ms | 21% | 1.10× |
+| + divide→shift (compute) | **0.0328 ms** | **32.5%** | **0.69×** |
+
+- **MSAQ GEMV가 MXINT8을 1.45× 추월**(0.69×). cuBLAS BF16(0.0475ms)도 1.45× 추월.
+- 캠페인 전체의 목표였던 **"적은 바이트 → 더 빠른 시간"** 을 GEMV에서 결정적으로 달성.
+  (memceil 0.0195ms = 0.41× MXINT8 → 이론 상한; 현재 추출 잔여 비용으로 0.69×.)
+- "17× vs BF16"은 정정: 그건 우리 naive 원본 대비였음. 이제 BF16 대비 **실측 0.69×(빠름)**.
+
+## 메모 (follow-up 후보)
+- runtime divide(`k/gs`) 제거는 일반 unpack(scalar/cp.async/GEMM/KV)에도 적용 가능 — 공짜 이득.
+- 추출 잔여 14us를 vectorized int4 dequant(Marlin식 lop3/prmt)로 더 줄이면 0.41×까지 여지.
+
+---
+
 # 한글 요약 — 방안 1~5 정리 (효과 / 구현 / 남은 과제)
 
 (아래 표는 Phase 1~5를 모두 반영한 최종 상태. 상세는 위 각 Phase 참조.)

@@ -72,10 +72,10 @@ inline int kv_split_count(long Lk, int H) {
 //   grid becomes base_blocks*splitK ~ mult*#SM and fills the machine; a cheap 2nd
 //   kernel sums the partials (no atomics). Capped at NB (each split needs >=1
 //   32-block). MS_GEMV_SPLITK_MULT (env, default 3) sweeps the multiplier.
-inline int gemv_splitk_count(int base_blocks, int NB) {
+inline int gemv_splitk_count(int base_blocks, int NB, int default_mult = 3) {
     static int sm = -1;
     if (sm < 0) cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, 0);
-    int mult = 3;
+    int mult = default_mult;
     if (const char* e = getenv("MS_GEMV_SPLITK_MULT")) { int m = atoi(e); if (m > 0) mult = m; }
     int sp = (int)(((long)mult * sm + base_blocks - 1) / base_blocks);
     if (sp > NB) sp = NB;
