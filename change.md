@@ -810,3 +810,45 @@ BW가 ~0.5× — **열당 stride(20/24)가 어떤 벡터폭과도 안 맞아 DRA
 필요하지만, 이는 Phase 5(KV 4b)에서 **padding +26%로 더 느려진** 전례가 있어 별도 연구·측정이 선행돼야 함.
 현 단계는 dense 레이아웃에서의 최선(2.1→1.4×)으로 수렴. (KV가 u2/u3에서도 이긴 건 token-major라
 바이트 정렬이 더 유리했기 때문 — 레이아웃 차이.)
+
+## 종합 스코어보드 (RTX 3090, OUT=K=4096, warm, µs) — 4커널 × u, MSAQ/MXINT8/BF16
+절대 시간(µs)과 적용된 SOTA 기법, crossover 판정. (KV는 Lk=16384 순수 HBM; Lk=4096은 L2 잔류로 눌림.)
+
+**1. W-only GEMV (decode M=1)** — SOTA: split-K(P6)+key-per-thread wide-load(P14)+mult16·divide→shift(P16)+u2/3 word-load(P19)
+| u | MSAQ | MXINT8 | cuBLAS | MSAQ/MX |
+|---|------|--------|--------|---------|
+| u2 | 72.3 | 48.2 | 44.9 | 1.50 ❌ |
+| u3 | 68.8 | 48.2 | 44.8 | 1.43 ❌ |
+| u4 | 27.8 | 49.1 | 45.0 | **0.57 ✅** (BF16도 추월) |
+
+**2. W-only GEMM (prefill M=512)** — SOTA: shared-mem tiled GEMM(P9)+M-adaptive tile 64²/128²(P10)
+| u | MSAQ | MXINT8 | cuBLAS | MSAQ/MX |
+|---|------|--------|--------|---------|
+| u2 | 2560 | 2401 | 284 | 1.07 ❌ |
+| u3 | 2542 | 2408 | 287 | 1.06 ❌ |
+| u4 | 2227 | 2427 | 287 | **0.92 ✅** |
+
+**3. W+A GEMM (prefill M=512)** — SOTA: tiled GEMM + on-the-fly MXINT8 activation quant fold(P9)
+| u | MSAQ | MXINT8 | cuBLAS | MSAQ/MX |
+|---|------|--------|--------|---------|
+| u2 | 3685 | 3574 | 286 | 1.03 ❌ |
+| u3 | 3632 | 3574 | 286 | 1.02 ❌ |
+| u4 | 3335 | 3574 | 287 | **0.93 ✅** |
+
+**4. KV decode (H=8 Lk=16384 D=128, HBM)** — SOTA: split-K flash-decode(P1)+token-major coalescing(4a)+two-pass barrier-light(방안3)+key-per-thread wide-read(P18)
+| u | MSAQ | MXINT8 | SDPA | MSAQ/MX |
+|---|------|--------|------|---------|
+| u2 | 194 | 221 | 608 | **0.88 ✅** |
+| u3 | 193 | 223 | 609 | **0.87 ✅** |
+| u4 | 109 | 223 | 609 | **0.49 ✅** |
+
+## 못 넘는 원인 분석 (u4만 특별 = nibble-aligned: int4폭 정렬 + 최소 unpack)
+- **GEMV u2/u3 (1.43–1.50) = memory-access-pattern bound**: UB=20/24가 벡터폭과 안 맞아 strided
+  word 로드가 DRAM 32B sector를 덜 채움 → 실효 BW가 MXINT8의 ~0.5×. 바이트 절약(0.69/0.78×)이
+  BW 손실을 못 이김. (staging은 GEMV엔 오히려 손해 — revert.)
+- **GEMM/W+A u2/u3 (1.02–1.07) = compute(FMA) bound**: tiled가 unpack을 타일당 1회로 분할상환해
+  memory-bound를 벗어남 → 바이트 절약이 안 보이고, u2/u3의 무거운 straddle unpack만 근소 열위로 남음.
+- **KV가 u2/u3도 넘는 이유(대조)**: token-major라 key가 contiguous → key-per-thread가 u2/u3도
+  coalesced. GEMV out-innermost와 달리 레이아웃이 정렬에 유리.
+- **완전 crossover 레버**: GEMV u2/u3 → register-aligned repack(P5 padding 역효과 전례, 측정 선행 필요);
+  GEMM/W+A → tensor-core(IMMA/WMMA, P11 WMMA는 현재 opt-in).
