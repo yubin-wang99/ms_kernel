@@ -576,8 +576,16 @@ broadcast** load + bfe.
   (memceil 0.0195ms = 0.41× MXINT8 → 이론 상한; 현재 추출 잔여 비용으로 0.69×.)
 - "17× vs BF16"은 정정: 그건 우리 naive 원본 대비였음. 이제 BF16 대비 **실측 0.69×(빠름)**.
 
-## 추출 잔여 (follow-up 후보)
-- 추출 잔여 14us를 vectorized int4 dequant(Marlin식 lop3/prmt)로 더 줄이면 0.41×까지 여지.
+## 추출 잔여 — vectorized int4 dequant 시도 ❌ (0.41×는 도달 불가, revert)
+0.41×(memceil)는 "추출 0"의 **이상적 하한**이라 실제로는 도달 불가. bf16x2 Marlin식
+bit-trick(`(nibble & 0x000F000F)|0x43004300` → hsub2)을 시도했으나:
+1. **부정확**(rel 3.48): offset-binary 가정이라 우리 **two's-complement** code에 안 맞음
+   (`u-8` ≠ signed; u≥8엔 `u-16` 필요). 고치려면 offset-binary **repack**(또 포맷 변경) 필요.
+2. 깨진 채로도 **3%만 빠름**(32.2 vs 33.4us): gathered-x + hsub2/reinterpret 오버헤드가
+   bfe 절감을 상쇄.
+→ divide 제거(Phase 16)가 추출의 *진짜* 비용을 이미 걷어냈고, 남은 bfe는 scalar로 거의
+최적. dense two's-complement에서 vectorize는 이득 없음. revert. (실제 한계 ~0.5×는
+Marlin식 offset-binary repack 필요 = 별도 큰 작업, 이미 0.70×라 ROI 낮음.)
 
 ## divide→shift를 일반 unpack에도 확장 (`ms_utils.cuh`)
 `unpack_ms_weight_elem`/`unpack_ms_kv_elem`의 `g = k/gs`도 `k >> (__ffs(gs)-1)`로 교체
