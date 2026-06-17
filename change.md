@@ -457,6 +457,34 @@ OUT%128==0에서 default(아니면 scalar fallback). `MS_GEMV_CPASYNC=0`으로 A
 
 ---
 
+# Phase 13 — cp.async KV decode ✅ (u3/u4 이득, u2 break-even)
+
+## 구현 (`kv_attention.cu` kv_decode_cpasync_kernel)
+two-pass 구조 유지, 단 `CP_CHUNK=64` key씩 K/V의 packed upper 평면(전 NB block)을
+`cp.async`로 **다음 chunk prefetch ↔ 현재 chunk unpack(pass1 K + pass2 V)** double-buffer.
+token-major라 block당 key-major 연속 → `UB` mult-4로 4-byte cp.async 정렬됨. 작은 shared-code
+평면(SB)은 odd-key offset에서 2-mod-4라 cp.async 정렬 불가 → 동기 복사(작아서 무방). scale은
+global에서 직접. unpack은 staged shared를 base_u=blk*CP_CHUNK*UB로 재사용.
+
+## 결과 (GPU1, H=8 Lk=4096 D=128) — 재인증 통과
+| u | two-pass | cp.async | speedup | vs MXINT8 |
+|---|----------|----------|---------|-----------|
+| u4 | 0.0873 ms | **0.0738 ms** | 1.18× | 1.29× → **1.09×** |
+| u3 | 0.0954 ms | **0.0772 ms** | 1.24× | → 1.14× |
+| u2 | 0.1002 ms | 0.1000 ms | 1.00× | 1.47× |
+
+- u3/u4에서 18~24% 단축, MSAQ KV가 MXINT8의 **1.09×(u4)** 까지 근접(near-parity).
+- u2는 break-even: UB=24로 staging shared가 커져(~26KB) occupancy가 깎이면서 cp.async 이득 상쇄.
+  (regression은 없어 default-on 안전.)
+- GEMV(1.8~2.3×)보다 이득이 작은 이유: KV는 애초에 덜 unpack-bound(6~7% vs 4.7%) + sync-copy/
+  복잡한 two-pass 오버헤드. 그래도 default로 채택(`MS_KV_CPASYNC=0`로 A/B).
+
+## 위치
+- 이제 decode 양쪽(GEMV·KV)에 cp.async 적용 완료. MSAQ가 memory-bound 쪽으로 더 이동.
+- 남은 격차: load 폭(1~2 byte). 다음은 **wide-load packing 재설계(int4 vectorized)**.
+
+---
+
 # 한글 요약 — 방안 1~5 정리 (효과 / 구현 / 남은 과제)
 
 (아래 표는 Phase 1~5를 모두 반영한 최종 상태. 상세는 위 각 Phase 참조.)
