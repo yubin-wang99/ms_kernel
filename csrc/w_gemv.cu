@@ -23,6 +23,8 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
+#include <cstdlib>
 #include "core/ms_utils.cuh"
 
 namespace {
@@ -82,6 +84,73 @@ __global__ void gemv_combine_kernel(
     y[o] = __float2bfloat16(acc);
 }
 
+// ---- cp.async double-buffered split-K GEMV (hide unpack behind memory) ------
+//   Same split-K, but each block's packed bytes (upper/shared/scale for its 128
+//   columns) are PREFETCHED to shared via cp.async while the previous block is
+//   being unpacked+accumulated -> the global loads overlap the unpack ALU, so the
+//   unpack hides under memory (the "memory-bound regime" where MSAQ's fewer bytes
+//   pay off). The block's tile is staged as-is ([BYTES][128]); unpack reads it
+//   with OUT=128, blk=0 (reusing unpack_ms_weight_elem). Requires OUT % 128 == 0
+//   and blockDim == 128. Writes partial[sp,o]; combine sums over sp (unchanged).
+__global__ void wonly_gemv_cpasync_kernel(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper,
+        const uint8_t* __restrict__ shared,
+        float* __restrict__ partial,
+        int OUT, int NB, int u, int gs, int UB, int SB, int splitK) {
+    const int o0  = blockIdx.x * 128;
+    const int lane = threadIdx.x;                 // 0..127  -> column o = o0+lane
+    const int o   = o0 + lane;
+    const int sp  = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK;
+    const int b0  = sp * per, b1 = min(b0 + per, NB);
+    if (b0 >= b1) { if (o < OUT) partial[(long)sp * OUT + o] = 0.0f; return; }
+
+    extern __shared__ uint8_t smem[];
+    const int bufBytes = (UB + SB) * 128 + 128;   // upper | shared | scale
+    uint8_t* buf[2] = { smem, smem + bufBytes };
+
+    // stage block `blk`'s tile into buffer `b` via cp.async (128 threads)
+    auto stage = [&](int blk, uint8_t* b) {
+        uint8_t* up_s = b;
+        uint8_t* sh_s = b + UB * 128;
+        int8_t*  sc_s = (int8_t*)(b + (UB + SB) * 128);
+        const uint8_t* gup = upper     + (long)blk * UB * OUT + o0;
+        const uint8_t* gsh = shared    + (long)blk * SB * OUT + o0;
+        const int8_t*  gsc = scale_exp + (long)blk * OUT      + o0;
+        for (int c = lane; c < UB * 8; c += 128) { int r = c >> 3, ch = c & 7;
+            __pipeline_memcpy_async(up_s + r*128 + ch*16, gup + (long)r*OUT + ch*16, 16); }
+        for (int c = lane; c < SB * 8; c += 128) { int r = c >> 3, ch = c & 7;
+            __pipeline_memcpy_async(sh_s + r*128 + ch*16, gsh + (long)r*OUT + ch*16, 16); }
+        for (int ch = lane; ch < 8; ch += 128)
+            __pipeline_memcpy_async(sc_s + ch*16, gsc + ch*16, 16);
+    };
+
+    stage(b0, buf[0]);
+    __pipeline_commit();
+
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const int cur = (blk - b0) & 1;
+        const bool more = (blk + 1) < b1;
+        if (more) { stage(blk + 1, buf[(blk - b0 + 1) & 1]); __pipeline_commit(); }
+        __pipeline_wait_prior(more ? 1 : 0);
+        __syncthreads();
+        const uint8_t* up_s = buf[cur];
+        const uint8_t* sh_s = buf[cur] + UB * 128;
+        const int8_t*  sc_s = (const int8_t*)(buf[cur] + (UB + SB) * 128);
+        const float scale = ms::e8m0_to_scale(sc_s[lane]);
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            const int w = ms::unpack_ms_weight_elem(up_s, sh_s, 0, lane, k, 128, u, gs, UB, SB);
+            acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
+        }
+        __syncthreads();
+    }
+    if (o < OUT) partial[(long)sp * OUT + o] = acc;
+}
+
 } // namespace
 
 // Host launcher. Signature matches ms_lib.ops.wonly_gemv / the pybind schema.
@@ -106,13 +175,23 @@ torch::Tensor wonly_gemv_cuda(
     auto partial = torch::empty({(int64_t)splitK, OUT},
                                 x.options().dtype(torch::kFloat32));
 
-    wonly_gemv_splitk_kernel<<<dim3(blocks, splitK), threads>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-        scale_exp.data_ptr<int8_t>(),
-        upper.data_ptr<uint8_t>(),
-        shared.data_ptr<uint8_t>(),
-        partial.data_ptr<float>(),
-        (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
+    const char* e = getenv("MS_GEMV_CPASYNC");
+    const bool cpasync = (OUT % 128 == 0) && !(e && atoi(e) == 0);
+    if (cpasync) {                  // hide the unpack behind cp.async prefetch
+        const size_t smem = (size_t)2 * ((UB + SB) * 128 + 128);
+        wonly_gemv_cpasync_kernel<<<dim3(blocks, splitK), threads, smem>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
+    } else {
+        wonly_gemv_splitk_kernel<<<dim3(blocks, splitK), threads>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(),
+            upper.data_ptr<uint8_t>(),
+            shared.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(),
+            (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
+    }
 
     gemv_combine_kernel<<<blocks, threads>>>(
         partial.data_ptr<float>(),

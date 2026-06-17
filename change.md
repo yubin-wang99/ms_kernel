@@ -423,6 +423,40 @@ B=Bs[o][k]를 col_major K×O로 읽어 Wdq와 일치. `MS_TILE_CFG=10`으로 선
 
 ---
 
+# Phase 12 — cp.async로 unpack을 메모리 뒤에 숨김 (W GEMV) ✅ — **드디어 통한 레버**
+
+## 동기 (KVQuant 개념 + "unpack을 메모리 뒤에 숨기기")
+KVQuant: KV/weight 로딩이 memory-bound면 dequant가 load 그늘에 숨어 공짜. 단 **전제는
+진짜 memory-bound일 때**. 측정상 MXINT8 GEMV=39% peak(그 regime), MSAQ=4.7%(아님 — unpack이
+critical path). → MSAQ를 memory-bound로 밀어넣어야 함. bfe/register-blocking/unroll은 다 실패
+(각각 ALU-bound 아님 / occupancy 붕괴). **cp.async**는 load를 register 없이 백그라운드로
+빼서 둘의 실패 원인을 모두 피함.
+
+## 구현 (`w_gemv.cu` wonly_gemv_cpasync_kernel)
+split-K 구조 동일, 단 블록의 packed 바이트(upper/shared/scale, 128열분)를 `cp.async`로
+**다음 블록 prefetch ↔ 현재 블록 unpack+accumulate**가 겹치게 double-buffer. 타일을
+`[BYTES][128]`로 그대로 staging → unpack은 OUT=128,blk=0으로 `unpack_ms_weight_elem` 재사용.
+OUT%128==0에서 default(아니면 scalar fallback). `MS_GEMV_CPASYNC=0`으로 A/B.
+
+## 결과 (GPU1, OUT=K=4096) — 재인증 통과
+| u | scalar | cp.async | speedup | BW |
+|---|--------|----------|---------|-----|
+| u4 | 0.228 ms | **0.128 ms** | **1.78×** | 4.7% → 8.3% |
+| u3 | 0.274 ms | **0.129 ms** | **2.12×** | 4.7% → 10.0% |
+| u2 | 0.292 ms | **0.130 ms** | **2.26×** | 5.0% → 11.2% |
+
+- **GEMV에서 처음으로 통한 micro-arch 레버.** unpack을 async load 그늘에 숨겨 BW를
+  ~2배로(memory-bound 쪽으로). 저-u일수록 숨길 unpack이 많아 이득 큼(2.26× vs 1.78×).
+- MSAQ/MXINT8 GEMV 격차 5.2× → **~2.7×**. (MXINT8은 이미 39% memory-bound라 cp.async 불필요.)
+- 아직 MXINT8(39%)엔 못 미침 — 남은 격차는 staging overhead + load 폭(1~2 byte)이라,
+  다음은 **wide-load packing 재설계**가 BW를 더 끌어올릴 후보.
+
+## 다음
+- **KV decode에도 동일 cp.async** 적용(같은 메커니즘, two-pass 커널).
+- 그 뒤 wide-load packing(int4 vectorized)로 8~11% → 더 높이기.
+
+---
+
 # 한글 요약 — 방안 1~5 정리 (효과 / 구현 / 남은 과제)
 
 (아래 표는 Phase 1~5를 모두 반영한 최종 상태. 상세는 위 각 Phase 참조.)
