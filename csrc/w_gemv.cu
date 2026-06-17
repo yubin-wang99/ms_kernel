@@ -167,7 +167,7 @@ template<bool U4>
 __global__ void wonly_gemv_wide_kernel(
         const __nv_bfloat16* __restrict__ x,
         const int8_t*  __restrict__ scale_exp,   // [NB, OUT]
-        const uint8_t* __restrict__ upper_cm,    // [NB, OUT, UB]
+        const uint8_t* __restrict__ upper_cm,    // [NB, OUT, UB]   column-major
         const uint8_t* __restrict__ shared_cm,   // [NB, OUT, SB]
         float* __restrict__ partial,             // [splitK, OUT]
         int OUT, int NB, int u, int gs, int UB, int SB, int splitK) {
@@ -180,8 +180,8 @@ __global__ void wonly_gemv_wide_kernel(
     float acc = 0.0f;
 
     if constexpr (U4) {
-        // u4: column's 16 B == one int4. Per-column stride 16 == load width, so the
-        // direct per-thread load is already fully sector-coalesced -> no staging.
+        // u4: column's 16 B == one int4 (stride 16 == width -> sector-coalesced).
+        // Cheap nibble bfe, no straddle.
         if (o >= OUT) return;
         for (int blk = b0; blk < b1; ++blk) {
             const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
@@ -202,27 +202,51 @@ __global__ void wonly_gemv_wide_kernel(
             }
         }
     } else {
-        // u2/u3: column's UB=20/24 B aren't an int4, so load them as 4-aligned
-        // uint32 words into registers and extract with the general straddle path.
-        // (Staging the tile to shared was tried and is SLOWER here — unlike KV's
-        // output reduction, GEMV reduces within-thread and the cm layout already
-        // makes consecutive columns contiguous, so the shared round-trip + barriers
-        // cost more than they save. See change.md Phase 19.)
+        // u2/u3 GEMV crossover (Phase 20). The limiter was EXTRACTION, not the load:
+        // the byte-level straddle unpack (per-code shift/or + a conditional 2nd-byte
+        // branch) was ~55% of the time, and u2 (25 B) and u3 (22 B) ran at the SAME
+        // ~40 us -> byte-independent -> compute-bound, not memory-bound. (A plane-
+        // split that perfectly coalesced the load was tried and gave ZERO speedup,
+        // confirming load wasn't the limit.) Fix = a STREAMING bit-buffer unpack:
+        // load the column's UB bytes as uint32 words, then a rolling 64-bit buffer
+        // yields each code with ONE shift+mask (refill a word only when low) and the
+        // shared code advances once per group -> ~64 random funnel-shifts collapse
+        // to ~6 ORs + 32 shifts. That alone takes u2/u3 from ~1.45x to ~0.85x.
         if (o >= OUT) return;
+        const int wbits = 8 - u;
+        const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+        const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
         for (int blk = b0; blk < b1; ++blk) {
             const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
-            uint8_t sb[8];
             const long sbase = ((long)blk * OUT + o) * SB;
+            uint32_t sreg[3] = {0u,0u,0u};               // shared codes as a bit stream (SB<=8 B)
             #pragma unroll
-            for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = shared_cm[sbase + i];
-            uint32_t ureg[6];                            // UB/4 <= 6 words (u2: 24B)
+            for (int i = 0; i < 8; ++i)
+                if (i < SB) sreg[i >> 2] |= (uint32_t)shared_cm[sbase + i] << (8 * (i & 3));
+            uint32_t ureg[6] = {0u,0u,0u,0u,0u,0u};      // UB/4 <= 6 words (u2: 24 B)
             const uint32_t* src = reinterpret_cast<const uint32_t*>(
                                       upper_cm + ((long)blk * OUT + o) * UB);
             #pragma unroll
             for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
-            const uint8_t* ublk = reinterpret_cast<const uint8_t*>(ureg);
-            for (int k = 0; k < BLOCK; ++k) {            // contiguous extract (KV-style)
-                const int w = ms::unpack_ms_kv_elem(ublk, sb, 0, 0, 0, 0, k, u, gs, UB, SB);
+            // STREAMING unpack: a rolling 64-bit bit-buffer yields each code with
+            // ONE shift+mask (refill a 32-bit word only when it runs low) instead
+            // of a random-access funnel-shift PER code -> ~32 funnelshifts collapse
+            // to ~6 ORs. The shared code only changes once per group (gs elems), so
+            // advance its own buffer on group boundaries, not every element.
+            const int gsmask = gs - 1;
+            uint64_t ubuf = 0; int unb = 0, uwi = 0;
+            uint64_t sbuf = 0; int snb = 0, swi = 0;
+            int sh_code = 0;
+            for (int k = 0; k < BLOCK; ++k) {
+                if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+                const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+                ubuf >>= wbits; unb -= wbits;
+                if ((k & gsmask) == 0) {                  // new shared group
+                    if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+                    sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+                    sbuf >>= u; snb -= u;
+                }
+                const int w = up_code * (1 << u) + sh_code;
                 acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
             }
         }
@@ -279,7 +303,7 @@ torch::Tensor wonly_gemv_cuda(
     return y;
 }
 
-// wide-load GEMV (column-major planes), all u. Same split-K + combine.
+// wide-load GEMV (column-major + streaming unpack), all u. split-K + combine.
 torch::Tensor wonly_gemv_wide_cuda(
         torch::Tensor x, torch::Tensor scale_exp,
         torch::Tensor upper_cm, torch::Tensor shared_cm,

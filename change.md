@@ -852,3 +852,53 @@ BW가 ~0.5× — **열당 stride(20/24)가 어떤 벡터폭과도 안 맞아 DRA
   coalesced. GEMV out-innermost와 달리 레이아웃이 정렬에 유리.
 - **완전 crossover 레버**: GEMV u2/u3 → register-aligned repack(P5 padding 역효과 전례, 측정 선행 필요);
   GEMM/W+A → tensor-core(IMMA/WMMA, P11 WMMA는 현재 opt-in).
+
+---
+
+# Phase 20 — W-only GEMV u2/u3 CROSSOVER via streaming bit-buffer unpack ✅✅
+
+목표: Phase 19에서 1.43~1.50×로 남은 GEMV u2/u3를 MXINT8 아래로 (register-aligned repack 시도).
+
+## 진단 — load가 아니라 EXTRACTION이 병목
+"register-aligned repack(=정렬된 wide load)"을 먼저 의심했으나 측정으로 반증:
+- **plane-split**(upper를 16B int4-plane + tail-plane으로 쪼개 stride==width 완전 coalesced,
+  padding 0) 구현 → **0 speedup**(1.58→1.10는 funnel-shift 덕, plane-split 자체는 무효).
+- 결정적 증거: **u2(25B)와 u3(22B)가 똑같이 ~40µs** → 시간이 바이트와 무관 = **compute-bound**.
+  u4(nibble bfe, 18B)=27µs인데 memory-bound면 u3는 ~34µs여야 하나 실제 75µs → ~55%가 추출 ALU.
+- 원인: u2/u3 코드(5/6-bit)가 byte 경계를 안 맞아 `unpack_ms_kv_elem`이 **원소당 shift/or +
+  조건분기(2nd-byte straddle)**를 함. u4의 nibble bfe(1 op)보다 훨씬 무거움.
+
+## 해법 — streaming bit-buffer unpack (extraction ALU 격감)
+dense 바이트를 레지스터(uint32 word)로 적재한 뒤, **rolling 64-bit 비트버퍼**로 스트리밍 추출:
+- 원소당 **shift+mask 1회**, 워드가 부족할 때만 32-bit refill(블록당 ~6회). 조건분기 없음.
+- shared 코드는 **그룹당 1회**만 advance(gs 원소마다, 매 원소 X). → 원소당 funnel-shift 2회
+  (= random 64회/블록)가 **OR ~6회 + shift 32회**로 붕괴.
+- 단일 `upper_cm` plane 유지(재패킹·op 시그니처·padding 전부 불필요). `csrc/w_gemv.cu` 한 파일만 변경.
+
+## 결과 (GPU1, OUT=K=4096, warm) — 전 117 test 통과, bit-exact
+| u | Phase19 | funnel-shift | **streaming(최종)** | MSAQ/MX | MSAQ/BF16 |
+|---|---------|--------------|---------------------|---------|-----------|
+| u2 | 1.50 (73µs) | 1.09 (53µs) | **0.84 (40µs)** | **0.84 ✅** | 0.88 |
+| u3 | 1.43 (68µs) | 1.10 (53µs) | **0.82 (40µs)** | **0.82 ✅** | 0.86 |
+| u4 | 0.56 | — | 0.56 (불변) | 0.56 | 0.59 |
+
+- **GEMV u2/u3가 드디어 MXINT8·cuBLAS BF16를 모두 추월**(0.82~0.84×). u3 40µs는 memory floor
+  (~34µs)에 근접 = 거의 최적. bit-exact(max|diff| u3 0.0, u2 4e-3=bf16, u4 0.0).
+- 추출 단계별 기여: byte-straddle→funnel-shift가 75→53µs(extraction이 병목임을 확정),
+  funnel-shift→streaming이 53→40µs(funnel-shift도 원소당 2회라 여전히 무거웠음).
+
+## 부정 결과 (기록)
+- **plane-split load**: 완전 coalesced인데 0 speedup → load는 병목 아님(compute-bound). 채택 안 함.
+- 즉 "register-aligned repack(정렬 wide load)"이라는 처음 가설은 **틀렸고**, 진짜 레버는
+  **extraction 알고리즘**(streaming)이었다. (Phase 5/16의 "ALU/bfe 미세최적 무효" 교훈과 일관:
+  단, 거긴 memory/latency-bound라 무효였고, 여기 GEMV u2/u3는 진짜 compute-bound라 유효.)
+
+## 스코어보드 갱신 (GEMV 행)
+| u | MSAQ | MXINT8 | cuBLAS | MSAQ/MX |
+|---|------|--------|--------|---------|
+| u2 | 40.3µs | 48.2 | 46.0 | **0.84 ✅** |
+| u3 | 39.5µs | 48.2 | 46.0 | **0.82 ✅** |
+| u4 | 27.4µs | 48.5 | 46.3 | **0.56 ✅** |
+
+→ **이제 W-only GEMV·KV decode는 전 u에서 MXINT8 추월.** 남은 근소 열위는 GEMM/W+A의 u2/u3
+(1.02~1.07, tiled라 compute-bound → tensor-core 필요)뿐.
