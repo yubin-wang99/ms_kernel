@@ -7,6 +7,28 @@ verification. This tree is the CUDA pivot of the old single-file
 hardware instructions, so the kernels move to CUDA (`bfe`/`prmt`, `__hfma2`,
 warp reductions) and CUTLASS (tensor cores).
 
+## Results — KV-cache decode now beats the matched MXINT8 baseline (Phase 18)
+
+The campaign goal — *fewer bytes (MSAQ-signed) → faster wall-clock* than a
+matched 1-byte MXINT8 kernel — is met for KV decode at **every** `u`. The lever
+was the memory **access pattern**, not the unpack: a `key-per-thread` wide
+coalesced read (each thread owns one key and reads its contiguous bytes, so a
+warp reads a full 512 B sector at 100 % utilisation instead of the old
+warp-per-key 50 %). No repack, bit-exact vs the oracle.
+
+| `u` (bytes/blk) | MSAQ wide / MXINT8 | vs prior cp.async |
+|---|---|---|
+| u2 (26 B) | **0.89×** | 0.46× |
+| u3 (22 B) | **0.86×** | 0.65× |
+| u4 (18 B) | **0.47×** (2.1× faster) | 0.40× |
+
+RTX 3090 (sm_86), `H=8 Lk=16384 D=128`, pure-HBM regime, warm cross-measured
+(clock-/order-verified — `tests/kv_clock_verify.py`). Bit-exact vs the certified
+path (`max|diff|` u3 0.0, u4 2e-6); all 54 KV + emulation tests pass. The W-only
+decode GEMV reaches the same crossover (`u4` 0.69× MXINT8, Phase 16). Full
+phase-by-phase history (occupancy split-K → coalescing → two-pass → cp.async →
+wide-load) is in `change.md`.
+
 ## Layout
 
 ```
@@ -48,6 +70,11 @@ ms/
 
 ### `.cu` completeness (honest status)
 
+> **Note:** the table below is the *original correctness-first baseline* status.
+> The decode paths have since been optimized and GPU-certified — see **Results**
+> above and `change.md` (Phase 1–18). `kv_attention.cu` and `w_gemv.cu` now beat
+> the matched MXINT8 baseline.
+
 All four kernels' **logic is verified on CPU** by `tests/test_emulation.py`
 (`rel_fro < 1e-9` vs the oracle, mirroring each kernel's exact byte-addressing
 and arithmetic). What remains is CUDA *execution* — compile + the GPU
@@ -58,7 +85,7 @@ and arithmetic). What remains is CUDA *execution* — compile + the GPU
 | `ms_utils.cuh` | unpack primitive **complete & matches the oracle's bit-math** |
 | `w_gemv.cu` | correctness-first draft, **logic-verified**; x via L2 broadcast (no shared-mem K ceiling) |
 | `wonly_gemm` / `wa_gemm` (`wa_gemm.cu`) | correctness-first baselines, **logic-verified** (no tensor cores yet) |
-| `kv_attention.cu` | correctness-first flash-decode, **logic-verified** (no tensor-core QKᵀ/PV yet) |
+| `kv_attention.cu` | **optimized & GPU-certified** — split-K flash-decode + key-per-thread wide-read; beats matched MXINT8 at all `u` (Phase 18). No tensor-core QKᵀ/PV yet |
 
 All `.cu` are **UNVALIDATED-ON-GPU** until the GPU gates run. None is the
 optimized path: `w_gemv` still needs split-K + `__shfl_down` + `__hfma2`;
