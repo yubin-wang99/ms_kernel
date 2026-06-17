@@ -485,6 +485,40 @@ global에서 직접. unpack은 staged shared를 base_u=blk*CP_CHUNK*UB로 재사
 
 ---
 
+# Phase 14 — wide-load packing 재설계 (u=4 GEMV) ✅ — **큰 도약**
+
+## 진단 (cp.async 이후 병목 재확인)
+cp.async가 global load를 숨긴 뒤에도 bfe(ALU 절감)는 **여전히 무효**(0.1284 vs 0.1285ms)
+→ 병목은 extraction ALU가 아니라 **shared에서의 narrow per-byte load throughput**(원소당
+~16 byte-load). 해법은 load **수**를 줄이는 것 = **wide(int4) load**.
+
+## 구현 (`w_gemv.cu` wonly_gemv_wide_kernel + 새 op + pack/ops dispatch)
+u=4는 dense가 이미 nibble-packed(32 code = 16 byte)이고 **16 byte == int4 폭**. weight를
+**column-major `[nb, OUT, 16]`** 로 두면(= 기존 u4 plane의 단순 transpose, 비트 재패킹 없음)
+thread o가 자기 열의 16 byte를 **한 번의 coalesced int4 load**로 읽고 32 code를 레지스터에서
+`bfe`로 추출 → narrow load ~16개가 1개로 붕괴. (연속 열이 16 B 간격 = warp-contiguous → coalesced.)
+- `pack_weight`가 u4일 때 `upper_cm`/`shared_cm`(transpose) 추가, `ms_lib.ops.wonly_gemv`가
+  u4 → `wonly_gemv_wide`로 라우팅. split-K + 기존 combine 재사용. **u4 전용**(UB=16).
+- 재인증: wide vs 기존 max|diff|=**0.0**(bit-identical), test_w + 전 117 테스트 통과.
+
+## 결과 (GPU1, OUT=K=4096, u4)
+| | time | BW | 비고 |
+|---|------|-----|-----|
+| scalar | 0.227 ms | 4.7% | |
+| cp.async | 0.141 ms | 7.5% | |
+| **WIDE (int4)** | **0.0665 ms** | **16.0%** | cp.async 대비 **2.13×**, scalar 대비 **3.4×** |
+| MXINT8 | 0.048 ms | 38.9% | **WIDE/MXINT8 = 1.40×** |
+
+- MSAQ/MXINT8 GEMV 격차: 5.2× → 2.7×(cp.async) → **1.40×(wide)**. achieved BW 4.7% → 16%.
+- 가설대로: 병목은 narrow shared-load 수였고 int4가 ~16→1로 붕괴시켜 해결. (wide는 cp.async
+  없이도 충분 — coalesced int4가 이미 효율적.)
+
+## 한계 / 다음
+- **u=4 전용**(UB=16=int4). u3(20)/u2(24)는 int4 미정렬이라 미적용 → 그쪽은 cp.async 유지.
+- MXINT8(39%)엔 아직 1.4× 못 미침 — 추가로 wide+cp.async 결합, 또는 KV wide-load가 후보.
+
+---
+
 # 한글 요약 — 방안 1~5 정리 (효과 / 구현 / 남은 과제)
 
 (아래 표는 Phase 1~5를 모두 반영한 최종 상태. 상세는 위 각 Phase 참조.)

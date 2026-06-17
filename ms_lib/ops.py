@@ -63,9 +63,18 @@ def _kv_planes(p, device):
 
 # --- ops ---------------------------------------------------------------------
 def wonly_gemv(p, x_bf16):
-    """W-only decode GEMV. p from pack_weight; x_bf16 [K] -> y [OUT] bf16."""
+    """W-only decode GEMV. p from pack_weight; x_bf16 [K] -> y [OUT] bf16.
+    u=4 routes to the wide-load (column-major int4) kernel."""
     _require()
-    s, up, sh = _weight_planes(p, x_bf16.device)
+    dev = x_bf16.device
+    s = torch.from_numpy(p["scale_exp"]).to(dev)
+    if int(p["u"]) == 4 and "upper_cm" in p:
+        up_cm = torch.from_numpy(p["upper_cm"]).to(dev)
+        sh_cm = torch.from_numpy(p["shared_cm"]).to(dev)
+        return _OPS.wonly_gemv_wide(x_bf16, s, up_cm, sh_cm,
+                                    int(p["OUT"]), int(p["nb"]), int(p["gs"]))
+    up = torch.from_numpy(p["upper"]).to(dev)
+    sh = torch.from_numpy(p["shared"]).to(dev)
     return _OPS.wonly_gemv(x_bf16, s, up, sh,
                            int(p["OUT"]), int(p["nb"]),
                            int(p["u"]), int(p["gs"]))

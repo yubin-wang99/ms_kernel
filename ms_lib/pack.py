@@ -120,13 +120,21 @@ def pack_weight(W, u, gs):
     up = _pack_codes_lsb(qu, wbits)                # [OUT, nb, UB]
     sh = _pack_codes_lsb(rs, u)                    # [OUT, nb, SB]
 
-    return dict(
+    d = dict(
         scale_exp=np.ascontiguousarray(exp.T.astype(np.int8)),     # [nb, OUT]
         upper=np.ascontiguousarray(up.transpose(1, 2, 0)),         # [nb, UB, OUT]
         shared=np.ascontiguousarray(sh.transpose(1, 2, 0)),        # [nb, SB, OUT]
         OUT=OUT, K=K, nb=nb, u=u, gs=gs, wbits=wbits,
         UB=UB, SB=SB, n_group=n_group,
     )
+    # u=4 wide-load GEMV plane: COLUMN-MAJOR [nb, OUT, UB(=16)] so a thread can
+    # int4-load its column's whole 16-byte (nibble-packed) block in ONE wide,
+    # coalesced load (UB=16 == int4 width). Just a transpose of the dense u4
+    # plane (no re-packing). bytes/codes identical -> oracle unaffected.
+    if u == 4:
+        d["upper_cm"] = np.ascontiguousarray(d["upper"].transpose(0, 2, 1))   # [nb, OUT, UB]
+        d["shared_cm"] = np.ascontiguousarray(d["shared"].transpose(0, 2, 1)) # [nb, OUT, SB]
+    return d
 
 
 def unpack_weight(p):

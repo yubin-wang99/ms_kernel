@@ -12,6 +12,9 @@
 torch::Tensor wonly_gemv_cuda(
     torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
     int64_t OUT, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor wonly_gemv_wide_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t OUT, int64_t NB, int64_t gs);
 
 // defined in wa_gemm.cu
 torch::Tensor wonly_gemm_cuda(
@@ -45,6 +48,8 @@ torch::Tensor mxint8_kv_decode_cuda(
 TORCH_LIBRARY(msaq, m) {
     m.def("wonly_gemv(Tensor x, Tensor scale_exp, Tensor upper, Tensor shared, "
           "int OUT, int NB, int u, int gs) -> Tensor", &wonly_gemv_cuda);
+    m.def("wonly_gemv_wide(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int OUT, int NB, int gs) -> Tensor", &wonly_gemv_wide_cuda);
     m.def("wonly_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wonly_gemm_cuda);
     m.def("wa_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "

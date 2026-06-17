@@ -151,6 +151,49 @@ __global__ void wonly_gemv_cpasync_kernel(
     if (o < OUT) partial[(long)sp * OUT + o] = acc;
 }
 
+// ---- u=4 WIDE-LOAD split-K GEMV (column-major plane -> int4 load + bfe) ------
+//   The cp.async kernel hid the global load but stayed bound by NARROW per-byte
+//   shared reads in the unpack (bfe didn't help -> not ALU-bound). This reads the
+//   weight COLUMN-MAJOR [NB,OUT,16]: thread o int4-loads its 16-byte nibble block
+//   in ONE wide coalesced load (UB=16==int4) and extracts all 32 codes via bfe
+//   from registers -> ~16 narrow loads collapse to 1. u=4 only (UB=16). split-K +
+//   the same combine. (Per-thread loads of consecutive columns are 16 B apart =
+//   warp-contiguous -> coalesced.)
+__global__ void wonly_gemv_wide_kernel(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp,   // [NB, OUT]
+        const uint8_t* __restrict__ upper_cm,    // [NB, OUT, 16]
+        const uint8_t* __restrict__ shared_cm,   // [NB, OUT, SB]
+        float* __restrict__ partial,             // [splitK, OUT]
+        int OUT, int NB, int gs, int SB, int splitK) {
+    const int o  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y;
+    if (o >= OUT) return;
+    const int per = (NB + splitK - 1) / splitK;
+    const int b0  = sp * per, b1 = min(b0 + per, NB);
+
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const uint4 up4 = *reinterpret_cast<const uint4*>(
+                              upper_cm + ((long)blk * OUT + o) * 16);   // 16 B, one wide load
+        const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+        uint8_t sb[8];                                   // SB <= 8 shared-code bytes
+        const long sbase = ((long)blk * OUT + o) * SB;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = shared_cm[sbase + i];
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            const int up_code = ms::bfe_s32((int)uw[k >> 3], (k & 7) * 4, 4);
+            const int g = k / gs;
+            const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+            const int w = up_code * 16 + sh_code;
+            acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
+        }
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
 } // namespace
 
 // Host launcher. Signature matches ms_lib.ops.wonly_gemv / the pybind schema.
@@ -197,5 +240,29 @@ torch::Tensor wonly_gemv_cuda(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
         (int)OUT, splitK);
+    return y;
+}
+
+// u=4 wide-load GEMV (column-major planes). Same split-K + combine.
+torch::Tensor wonly_gemv_wide_cuda(
+        torch::Tensor x, torch::Tensor scale_exp,
+        torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t OUT, int64_t NB, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    const int SB = ((BLOCK / (int)gs) * 4 + 7) / 8;       // u=4
+    auto y = torch::empty({OUT}, x.options());
+    const int threads = 128;
+    const int blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB);
+    auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
+
+    wonly_gemv_wide_kernel<<<dim3(blocks, splitK), threads>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(),
+        upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+        partial.data_ptr<float>(), (int)OUT, (int)NB, (int)gs, SB, splitK);
+    gemv_combine_kernel<<<blocks, threads>>>(
+        partial.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
     return y;
 }
