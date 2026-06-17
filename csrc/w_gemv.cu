@@ -25,6 +25,7 @@
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 #include <cstdlib>
+#include <type_traits>
 #include "core/ms_utils.cuh"
 
 namespace {
@@ -151,45 +152,79 @@ __global__ void wonly_gemv_cpasync_kernel(
     if (o < OUT) partial[(long)sp * OUT + o] = acc;
 }
 
-// ---- u=4 WIDE-LOAD split-K GEMV (column-major plane -> int4 load + bfe) ------
+// ---- WIDE-LOAD split-K GEMV (column-major plane -> wide load + register extract)
 //   The cp.async kernel hid the global load but stayed bound by NARROW per-byte
 //   shared reads in the unpack (bfe didn't help -> not ALU-bound). This reads the
-//   weight COLUMN-MAJOR [NB,OUT,16]: thread o int4-loads its 16-byte nibble block
-//   in ONE wide coalesced load (UB=16==int4) and extracts all 32 codes via bfe
-//   from registers -> ~16 narrow loads collapse to 1. u=4 only (UB=16). split-K +
-//   the same combine. (Per-thread loads of consecutive columns are 16 B apart =
-//   warp-contiguous -> coalesced.)
+//   weight COLUMN-MAJOR [NB,OUT,UB]: thread o loads its column's whole UB-byte
+//   block in ONE (u4: int4) or a few (u2/u3: 4-aligned uint32) wide coalesced
+//   loads and extracts all 32 codes from registers -> ~UB narrow byte-loads
+//   collapse to UB/16..UB/4. (Per-thread loads of consecutive columns are UB B
+//   apart = warp-contiguous -> coalesced.) Templated on U4 with `if constexpr`
+//   so the u4 (uint4+bfe, no straddle) and u2/u3 (word-load + general straddle
+//   extract) paths don't share registers — same lesson as KV Phase 18. split-K +
+//   the same combine.
+template<bool U4>
 __global__ void wonly_gemv_wide_kernel(
         const __nv_bfloat16* __restrict__ x,
         const int8_t*  __restrict__ scale_exp,   // [NB, OUT]
-        const uint8_t* __restrict__ upper_cm,    // [NB, OUT, 16]
+        const uint8_t* __restrict__ upper_cm,    // [NB, OUT, UB]
         const uint8_t* __restrict__ shared_cm,   // [NB, OUT, SB]
         float* __restrict__ partial,             // [splitK, OUT]
-        int OUT, int NB, int gs, int SB, int splitK) {
-    const int o  = blockIdx.x * blockDim.x + threadIdx.x;
-    const int sp = blockIdx.y;
-    if (o >= OUT) return;
+        int OUT, int NB, int u, int gs, int UB, int SB, int splitK) {
+    const int tid = threadIdx.x;
+    const int o   = blockIdx.x * blockDim.x + tid;
+    const int sp  = blockIdx.y;
     const int per = (NB + splitK - 1) / splitK;
     const int b0  = sp * per, b1 = min(b0 + per, NB);
-
     const int gs_shift = __ffs(gs) - 1;                  // gs is a power of 2: k/gs == k>>shift
     float acc = 0.0f;
-    for (int blk = b0; blk < b1; ++blk) {
-        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
-        const uint4 up4 = *reinterpret_cast<const uint4*>(
-                              upper_cm + ((long)blk * OUT + o) * 16);   // 16 B, one wide load
-        const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
-        uint8_t sb[8];                                   // SB <= 8 shared-code bytes
-        const long sbase = ((long)blk * OUT + o) * SB;
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = shared_cm[sbase + i];
-        #pragma unroll
-        for (int k = 0; k < BLOCK; ++k) {
-            const int up_code = ms::bfe_s32((int)uw[k >> 3], (k & 7) * 4, 4);
-            const int g = k >> gs_shift;                 // (was k/gs: a runtime divide ~15us)
-            const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
-            const int w = up_code * 16 + sh_code;
-            acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
+
+    if constexpr (U4) {
+        // u4: column's 16 B == one int4. Per-column stride 16 == load width, so the
+        // direct per-thread load is already fully sector-coalesced -> no staging.
+        if (o >= OUT) return;
+        for (int blk = b0; blk < b1; ++blk) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            uint8_t sb[8];
+            const long sbase = ((long)blk * OUT + o) * SB;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = shared_cm[sbase + i];
+            const uint4 up4 = *reinterpret_cast<const uint4*>(
+                                  upper_cm + ((long)blk * OUT + o) * UB);   // 16 B, one load
+            const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+            #pragma unroll
+            for (int k = 0; k < BLOCK; ++k) {
+                const int up_code = ms::bfe_s32((int)uw[k >> 3], (k & 7) * 4, 4);
+                const int g = k >> gs_shift;
+                const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                const int w = up_code * 16 + sh_code;
+                acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
+            }
+        }
+    } else {
+        // u2/u3: column's UB=20/24 B aren't an int4, so load them as 4-aligned
+        // uint32 words into registers and extract with the general straddle path.
+        // (Staging the tile to shared was tried and is SLOWER here — unlike KV's
+        // output reduction, GEMV reduces within-thread and the cm layout already
+        // makes consecutive columns contiguous, so the shared round-trip + barriers
+        // cost more than they save. See change.md Phase 19.)
+        if (o >= OUT) return;
+        for (int blk = b0; blk < b1; ++blk) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            uint8_t sb[8];
+            const long sbase = ((long)blk * OUT + o) * SB;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = shared_cm[sbase + i];
+            uint32_t ureg[6];                            // UB/4 <= 6 words (u2: 24B)
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(
+                                      upper_cm + ((long)blk * OUT + o) * UB);
+            #pragma unroll
+            for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+            const uint8_t* ublk = reinterpret_cast<const uint8_t*>(ureg);
+            for (int k = 0; k < BLOCK; ++k) {            // contiguous extract (KV-style)
+                const int w = ms::unpack_ms_kv_elem(ublk, sb, 0, 0, 0, 0, k, u, gs, UB, SB);
+                acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
+            }
         }
     }
     partial[(long)sp * OUT + o] = acc;
@@ -244,26 +279,33 @@ torch::Tensor wonly_gemv_cuda(
     return y;
 }
 
-// u=4 wide-load GEMV (column-major planes). Same split-K + combine.
+// wide-load GEMV (column-major planes), all u. Same split-K + combine.
 torch::Tensor wonly_gemv_wide_cuda(
         torch::Tensor x, torch::Tensor scale_exp,
         torch::Tensor upper_cm, torch::Tensor shared_cm,
-        int64_t OUT, int64_t NB, int64_t gs) {
+        int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
-    const int SB = ((BLOCK / (int)gs) * 4 + 7) / 8;       // u=4
+    const int wbits = 8 - (int)u;
+    const int UB = BLOCK * wbits / 8;
+    const int SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
     auto y = torch::empty({OUT}, x.options());
     const int threads = 128;
     const int blocks = (int)((OUT + threads - 1) / threads);
-    // wide kernel does only 1 int4 load/block -> needs MORE splits for MLP (the
+    // wide kernel does few loads/block -> needs MORE splits for MLP (the
     // narrow-load kernels saturate at mult~3; wide wants ~16). See change.md Phase 16.
     const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
     auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
 
-    wonly_gemv_wide_kernel<<<dim3(blocks, splitK), threads>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-        scale_exp.data_ptr<int8_t>(),
-        upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
-        partial.data_ptr<float>(), (int)OUT, (int)NB, (int)gs, SB, splitK);
+    auto launch = [&](auto U4tag) {
+        wonly_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
+    };
+    if ((int)u == 4) launch(std::true_type{});
+    else             launch(std::false_type{});
+
     gemv_combine_kernel<<<blocks, threads>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);

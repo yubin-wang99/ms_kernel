@@ -75,11 +75,14 @@ def bench_wonly_gemv(u=3, gs=8, OUT=4096, K=4096):
     rng = np.random.default_rng(0)
     W = (rng.standard_normal((OUT, K)) * rng.uniform(0.2, 4.0, (OUT, 1))).astype(np.float32)
     pm, px = pack_weight(W, u, gs), pack_weight_mxint8(W)
-    s, up, sh = _cuda(pm["scale_exp"]), _cuda(pm["upper"]), _cuda(pm["shared"])
+    s = _cuda(pm["scale_exp"])
     sx, qw = _cuda(px["scale_exp"]), _cuda(px["qweight"])
     x = torch.from_numpy(rng.standard_normal(K).astype(np.float32)).to(torch.bfloat16).cuda()
     Wbf = torch.from_numpy(W).to(torch.bfloat16).cuda()
-    t_msaq = measure_latency(lambda: torch.ops.msaq.wonly_gemv(x, s, up, sh, OUT, pm["nb"], u, gs))
+    # GEMV uses the wide-load (column-major) path for ALL u (Phase 14/16/19); move
+    # the cm planes to the GPU ONCE (the ops.py wrapper would re-copy per call).
+    up_cm, sh_cm = _cuda(pm["upper_cm"]), _cuda(pm["shared_cm"])
+    t_msaq = measure_latency(lambda: torch.ops.msaq.wonly_gemv_wide(x, s, up_cm, sh_cm, OUT, pm["nb"], u, gs))
     t_mx = measure_latency(lambda: torch.ops.msaq.mxint8_gemv(x, sx, qw, OUT, px["nb"]))
     t_bl = measure_latency(lambda: x @ Wbf.t())
     _row(f"W-only GEMV  (OUT={OUT}, K={K}, MSAQ u{u}gs{gs})", t_msaq, t_mx, t_bl, "cuBLAS")

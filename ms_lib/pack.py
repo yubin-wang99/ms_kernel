@@ -127,13 +127,13 @@ def pack_weight(W, u, gs):
         OUT=OUT, K=K, nb=nb, u=u, gs=gs, wbits=wbits,
         UB=UB, SB=SB, n_group=n_group,
     )
-    # u=4 wide-load GEMV plane: COLUMN-MAJOR [nb, OUT, UB(=16)] so a thread can
-    # int4-load its column's whole 16-byte (nibble-packed) block in ONE wide,
-    # coalesced load (UB=16 == int4 width). Just a transpose of the dense u4
-    # plane (no re-packing). bytes/codes identical -> oracle unaffected.
-    if u == 4:
-        d["upper_cm"] = np.ascontiguousarray(d["upper"].transpose(0, 2, 1))   # [nb, OUT, UB]
-        d["shared_cm"] = np.ascontiguousarray(d["shared"].transpose(0, 2, 1)) # [nb, OUT, SB]
+    # Wide-load GEMV plane: COLUMN-MAJOR [nb, OUT, UB] so a thread reads its
+    # column's whole UB-byte block in ONE (u4: int4) or a few (u2/u3: 4-aligned
+    # uint32) wide, coalesced loads instead of UB byte-strided reads. Just a
+    # transpose of the dense plane (no re-packing); bytes/codes identical ->
+    # oracle unaffected. Built for all u (u4 = int4 width; u2/u3 word-loaded).
+    d["upper_cm"] = np.ascontiguousarray(d["upper"].transpose(0, 2, 1))   # [nb, OUT, UB]
+    d["shared_cm"] = np.ascontiguousarray(d["shared"].transpose(0, 2, 1)) # [nb, OUT, SB]
     return d
 
 
