@@ -904,3 +904,33 @@ dense 바이트를 레지스터(uint32 word)로 적재한 뒤, **rolling 64-bit 
 
 → **이제 W-only GEMV·KV decode는 전 u에서 MXINT8 추월.** 남은 근소 열위는 GEMM/W+A의 u2/u3
 (1.02~1.07, tiled라 compute-bound → tensor-core 필요)뿐.
+
+---
+
+# Phase 21 — GEMM/W+A에 streaming unpack 이식 ❌ 시도 후 REVERT (negative result)
+
+GEMV에서 통한 streaming bit-buffer unpack(P20)을 GEMM/W+A의 B-tile staging에 이식 시도.
+B-staging을 per-(o,k)에서 **column-streaming**(스레드가 열 하나를 통째로: UB바이트를 열 간
+coalesced로 모아 32코드를 rolling buffer로 풀기)으로 바꿈. 헬퍼 `dequant_col_stream` 추가,
+wonly_gemm_tiled·wa_gemm_tiled 둘 다 적용. 재인증 99개 통과(bit-exact).
+
+## 결과 — 전부 악화 (revert)
+| | u2 | u3 | u4 |
+|---|----|----|----|
+| GEMM (P19→P21) | 1.05→**1.21** | 1.05→**1.12** | 1.00→**1.04** |
+| W+A (P19→P21) | 1.05→**1.12** | 1.05→**1.07** | 1.00→**1.07** |
+
+## 왜 실패했나 (GEMV와 정반대)
+- **GEMM/W+A는 FMA-bound** (tiled가 unpack을 타일당 1회로 분할상환 → unpack은 전체의 ~1.5%).
+  즉 staging은 애초에 병목이 아님 → "싼 추출"로 바꿔도 시간이 안 줄어듦.
+- column-streaming은 staging 스레드를 TBN×TBK개 → **TBN개로 줄여 병렬성 손실**, streaming
+  레지스터(ureg/sreg/buf)가 **occupancy를 깎음**. 병목 아닌 곳을 만지며 **구조적 손해만** 봄.
+- **u4도 악화**(1.00→1.04)된 게 결정적 증거: u4는 원래 unpack(nibble bfe)이 싼데도 느려짐
+  = 이득이 extraction이 아니라 staging 구조(병렬성/occupancy)에서 나왔던 것.
+- 대조: GEMV decode는 unpack이 **분할상환 안 되는**(M=1) extraction-bound라 streaming이 결정적.
+  같은 기법이 bound 종류에 따라 정반대 결과 → **병목 규명이 전부**.
+
+## 조치 / 결론
+`csrc/wa_gemm.cu` 전부 revert(per-element staging 복귀). GEMM/W+A u2/u3의 잔여 열위(1.02~1.07)는
+unpack이 아니라 **FP32 CUDA-core 연산 자체**가 한계 → 진짜 레버는 **tensor-core(INT8 IMMA /
+BF16 WMMA)** 뿐(P11 WMMA는 opt-in). unpack 미세최적으로는 안 줄어듦이 측정으로 확정됨.
