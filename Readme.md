@@ -42,7 +42,11 @@ RTX 3090 (sm_86), warm cross-measured (clock-/order-verified —
 `tests/kv_clock_verify.py`); bit-exact vs the certified path; all GPU +
 emulation tests pass. Full settings (sizes, regimes, timing procedure) in
 [`methodology.md`](methodology.md). The prefill GEMM / W+A kernels beat MXINT8 at u4 (0.92–0.93×)
-and lag slightly at u2/u3 (1.02–1.07×, tiled → compute-bound; needs tensor cores).
+and lag slightly at u2/u3 (1.02–1.07×, FP32-tiled → FMA-bound). BF16 WMMA
+(opt-in, matched) makes both ~1.5× faster and *widens* u4's win (0.89×) but
+does **not** cross u2/u3 (1.14–1.17×): the faster matmul exposes the per-element
+unpack, which only a cp.async-hidden-unpack pipeline (CUTLASS-grade) closes — see
+`change.md` Phase 22.
 Full phase-by-phase history (split-K → coalescing → two-pass → cp.async →
 wide-load → streaming unpack) and the 4-kernel scoreboard are in `change.md`.
 

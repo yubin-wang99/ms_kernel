@@ -934,3 +934,43 @@ wonly_gemm_tiled·wa_gemm_tiled 둘 다 적용. 재인증 99개 통과(bit-exact
 `csrc/wa_gemm.cu` 전부 revert(per-element staging 복귀). GEMM/W+A u2/u3의 잔여 열위(1.02~1.07)는
 unpack이 아니라 **FP32 CUDA-core 연산 자체**가 한계 → 진짜 레버는 **tensor-core(INT8 IMMA /
 BF16 WMMA)** 뿐(P11 WMMA는 opt-in). unpack 미세최적으로는 안 줄어듦이 측정으로 확정됨.
+
+---
+
+# Phase 22 — tensor-core(BF16 WMMA)로 GEMM u2/u3 crossover 시도 → u4만 성공, u2/u3 ❌
+
+목표: GEMM/W+A u2/u3의 잔여 열위(FP32 tiled 1.02~1.07)를 tensor-core로 넘기기.
+
+## 구현 — matched WMMA 비교 완성
+MSAQ는 이미 `wonly_gemm_wmma`(BF16 WMMA, P11, opt-in `MS_TILE_CFG=10`)가 있었으나 **MXINT8 쪽
+WMMA가 없어 matched 비교 불가**였음. `mxint8_gemm_wmma`를 추가(동일 구조, staging만 int8→bf16
+직접). 둘 다 `MS_TILE_CFG=10`에서 WMMA. 재인증 `test_w`(cfg=10) 통과, rel 1.7e-3.
+
+## 결과 (M=512, OUT=K=4096, matched) — WMMA가 비율을 **악화**
+| u | FP32 tiled MSAQ/MX | **WMMA MSAQ/MX** | WMMA 절대가속(MSAQ/MX) |
+|---|--------------------|------------------|------------------------|
+| u2 | 1.07 | **1.17 ❌** | 1.40× / 1.53× |
+| u3 | 1.06 | **1.14 ❌** | 1.42× / 1.53× |
+| u4 | 0.92 | **0.89 ✅** | 1.59× / 1.54× |
+
+## 진단 — faster matmul이 unpack을 노출
+- WMMA는 matmul을 ~1.5× 가속(둘 다 절대 빨라짐) → 커널이 **staging-bound로 이동**(P11이 지적한
+  "small-tile WMMA, no cp.async → tensor core 부분 기아"). 그러자 staging의 MSAQ **per-element
+  unpack이 더 큰 비중**이 됨.
+- u4(nibble bfe, 싼 unpack)는 노출돼도 싸서 crossover 유지(0.89, 절대 1.6× 빠름).
+- u2/u3(straddle unpack, 무거움)는 노출이 손해 → 비율 **악화**(MXINT8의 싼 int8 read만 matmul
+  가속을 온전히 누림). FP32 tiled에선 FMA-bound라 unpack이 가려져 1.0 근처였는데, WMMA가 그걸 벗김.
+
+## streaming unpack을 WMMA staging에 시도 ❌ (negative, revert)
+P20의 streaming bit-buffer unpack을 WMMA Bs staging에 이식(column-streaming + bf16 출력 헬퍼).
+**훨씬 악화**(u2 1.17→1.82). 원인: WMMA 커널은 128 thread + fragment 레지스터가 큰데, column-
+streaming이 staging thread를 64개로 줄이고 streaming 레지스터(ureg/sreg/buf)까지 더해 **occupancy
+붕괴**(P21과 동일, fragment 때문에 더 심함). → revert. byte-straddle staging 유지.
+
+## 결론 / 남은 레버
+- **BF16 WMMA로는 u2/u3 crossover 불가** — small-tile WMMA가 unpack을 노출시키고, 그 unpack을
+  싸게 만들 방법(streaming)은 이 커널 구조(적은 thread + fragment 레지스터)에서 occupancy를 깎음.
+- u4는 tensor-core로 더 빨라짐(0.89, 절대 1.6×) — WMMA는 u4에 유효.
+- u2/u3 진짜 crossover는 **cp.async로 unpack을 load 그늘에 숨기는 CUTLASS-급 파이프라인**
+  (custom iterator의 load()에 unpack 주입 + 큰 타일 + double-buffer)이 필요 — 별도 대형 작업.
+  (matched WMMA infra는 opt-in으로 보존; default는 FP32 tiled 유지해 headline 비교 불변.)
