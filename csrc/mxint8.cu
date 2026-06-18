@@ -507,7 +507,6 @@ __global__ void mxint8_kv_split_kernel(
     const int hk = h / (H / Hkv);               // GQA: q head -> kv head
     const int s = blockIdx.y;
     const int tid = threadIdx.x;
-    const int lane = tid & 31, warpId = tid >> 5, nWarps = blockDim.x >> 5;
     const bool active = tid < D;
 
     extern __shared__ float smem[];
@@ -523,19 +522,26 @@ __global__ void mxint8_kv_split_kernel(
     for (int cs = j0; cs < j1; cs += KV_CHUNK) {
         const int nC = min(KV_CHUNK, j1 - cs);
 
-        // ---- Pass 1: scores (warp per key, __shfl reduction) ----
-        for (int kk = warpId; kk < nC; kk += nWarps) {
-            const int j = cs + kk;
-            float part = 0.0f;
-            for (int d = lane; d < D; d += 32) {
-                const int blk = d / BLOCK, kd = d % BLOCK;
-                const long qbase = (long)(hk * NB + blk) * BLOCK * Lcap;   // [H,nb,L,32]
-                const long sbase = (long)(hk * NB + blk) * Lcap;
-                part += q_sh[d] * (float)kq[qbase + (long)j * BLOCK + kd]
-                                * ms::e8m0_to_scale(ks[sbase + j]);
+        // ---- Pass 1: scores (THREAD per key, in-thread dot; no warp reduction) ----
+        //   Matched to the MSAQ wide kernel (kv_decode_wide_kernel): thread t owns key
+        //   cs+t and accumulates the full q.K dot across the nb head_dim blocks in
+        //   registers -> removes the per-key __shfl reduction. This is the format-
+        //   AGNOSTIC half of the Phase-18 win (the other half, sub-byte sector util,
+        //   is moot for int8 which already fills a sector); porting it here makes the
+        //   KV-read comparison fair (was warp-per-key vs MSAQ's thread-per-key).
+        //   [H,nb,L,32] kd-innermost -> a thread's 32 bytes are contiguous and
+        //   consecutive keys are 32B apart -> coalesced, fully-useful loads.
+        if (tid < nC) {
+            const int key = cs + tid;
+            float dot = 0.0f;
+            for (int blk = 0; blk < NB; ++blk) {
+                const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lcap + key]);
+                const long kbase = ((long)(hk * NB + blk) * Lcap + key) * BLOCK;
+                #pragma unroll
+                for (int kd = 0; kd < BLOCK; ++kd)
+                    dot += q_sh[blk * BLOCK + kd] * ((float)kq[kbase + kd] * ksc);
             }
-            part = warp_reduce_sum(part);
-            if (lane == 0) sc[kk] = part * sm_scale;
+            sc[tid] = dot * sm_scale;
         }
         __syncthreads();
 
