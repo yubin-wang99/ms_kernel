@@ -33,7 +33,8 @@ torch::Tensor wa_gemm_cuda(
 torch::Tensor kv_decode_attention_cuda(
     torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
     torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
-    int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs);
+    int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs,
+    int64_t Lcap);
 std::vector<torch::Tensor> kv_write_cuda(
     torch::Tensor X, int64_t H, int64_t L, int64_t D, int64_t NB, int64_t u, int64_t gs);
 void kv_append_cuda(
@@ -56,7 +57,7 @@ torch::Tensor mxint8_wa_gemm_cuda(
 torch::Tensor mxint8_kv_decode_cuda(
     torch::Tensor q, torch::Tensor ks, torch::Tensor kq,
     torch::Tensor vs, torch::Tensor vq,
-    int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB);
+    int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t Lcap);
 std::vector<torch::Tensor> mxint8_kv_write_cuda(
     torch::Tensor X, int64_t H, int64_t L, int64_t D, int64_t NB);
 void mxint8_kv_append_cuda(
@@ -80,7 +81,7 @@ TORCH_LIBRARY(msaq, m) {
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wa_gemm_cuda);
     m.def("kv_decode_attention(Tensor q, Tensor ks, Tensor ku, Tensor kh, "
           "Tensor vs, Tensor vu, Tensor vh, "
-          "int H, int Hkv, int Lk, int D, int NB, int u, int gs) -> Tensor",
+          "int H, int Hkv, int Lk, int D, int NB, int u, int gs, int Lcap=-1) -> Tensor",
           &kv_decode_attention_cuda);
     // ---- plain MXINT8 baselines ----
     m.def("mxint8_gemv(Tensor x, Tensor scale_exp, Tensor qweight, "
@@ -92,7 +93,7 @@ TORCH_LIBRARY(msaq, m) {
     m.def("mxint8_wa_gemm(Tensor X, Tensor scale_exp, Tensor qweight, "
           "int M, int OUT, int K, int NB) -> Tensor", &mxint8_wa_gemm_cuda);
     m.def("mxint8_kv_decode(Tensor q, Tensor ks, Tensor kq, "
-          "Tensor vs, Tensor vq, int H, int Hkv, int Lk, int D, int NB) -> Tensor",
+          "Tensor vs, Tensor vq, int H, int Hkv, int Lk, int D, int NB, int Lcap=-1) -> Tensor",
           &mxint8_kv_decode_cuda);
     m.def("mxint8_kv_write(Tensor X, int H, int L, int D, int NB) -> Tensor[]", &mxint8_kv_write_cuda);
     m.def("mxint8_kv_append(Tensor X, Tensor(a!) scale_exp, Tensor(b!) qweight, "

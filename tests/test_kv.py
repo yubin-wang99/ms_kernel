@@ -121,6 +121,37 @@ def test_kv_decode_gqa_vs_oracle(rng, cfg):
     assert rel_fro(got, ref) < REL_FRO_TOL
 
 
+# ---- 3c. Growing cache: stride==Lcap > attended Lk (the harness's decode path) -
+#   Contract: attending Lk keys must be INVARIANT to the cache capacity Lcap (the
+#   slots >= Lk are never read). So a [Lcap] cache and an exactly-[Lk] cache must
+#   give BIT-IDENTICAL output — a stronger, config-independent check than oracle.
+@requires_kernel
+def test_kv_decode_lcap_stride(rng, cfg):
+    import torch
+    u, gs = cfg
+    H, Lk, D = 4, 96, 128
+    nb, wbits = D // 32, 8 - u
+    UB, SB = 32 * wbits // 8, ((32 // gs) * u + 7) // 8
+    K = (rng.standard_normal((H, Lk, D)) * 0.5).astype(np.float32)
+    V = (rng.standard_normal((H, Lk, D)) * 0.5).astype(np.float32)
+    Q = (rng.standard_normal((H, D)) * 0.5).astype(np.float32)
+    Kb, Vb = (torch.from_numpy(a).to(torch.bfloat16).cuda() for a in (K, V))
+    qt = torch.from_numpy(Q).to(torch.bfloat16).cuda()
+
+    def decode(Lcap):
+        cache = lambda: (torch.zeros((H, nb, Lcap), dtype=torch.int8, device="cuda"),
+                         torch.zeros((H, nb, Lcap, UB), dtype=torch.uint8, device="cuda"),
+                         torch.zeros((H, nb, Lcap, SB), dtype=torch.uint8, device="cuda"))
+        ks, ku, kh = cache(); vs, vu, vh = cache()
+        for pos in range(Lk):
+            torch.ops.msaq.kv_append(Kb[:, pos, :].contiguous(), ks, ku, kh, H, D, nb, pos, Lcap, u, gs)
+            torch.ops.msaq.kv_append(Vb[:, pos, :].contiguous(), vs, vu, vh, H, D, nb, pos, Lcap, u, gs)
+        return torch.ops.msaq.kv_decode_attention(qt, ks, ku, kh, vs, vu, vh,
+                                                  H, H, Lk, D, nb, u, gs, Lcap).float().cpu().numpy()
+
+    assert np.array_equal(decode(Lk), decode(256))   # capacity-invariant (256 > Lk)
+
+
 # ---- 4. KV append (decode): per-token in-place quantize, byte-exact to write ---
 @requires_kernel
 def test_kv_append_vs_pack(rng, cfg):

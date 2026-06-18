@@ -497,7 +497,7 @@ __global__ void mxint8_kv_split_kernel(
         const int8_t* __restrict__ ks, const int8_t* __restrict__ kq,  // K: scale[H,nb,L], q[H,nb,L,32]
         const int8_t* __restrict__ vs, const int8_t* __restrict__ vq,  // V
         float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
-        int H, int Hkv, int Lk, int D, int NB, int key_tile, int S, float sm_scale) {
+        int H, int Hkv, int Lk, int Lcap, int D, int NB, int key_tile, int S, float sm_scale) {
     const int h = blockIdx.x;
     const int hk = h / (H / Hkv);               // GQA: q head -> kv head
     const int s = blockIdx.y;
@@ -524,8 +524,8 @@ __global__ void mxint8_kv_split_kernel(
             float part = 0.0f;
             for (int d = lane; d < D; d += 32) {
                 const int blk = d / BLOCK, kd = d % BLOCK;
-                const long qbase = (long)(hk * NB + blk) * BLOCK * Lk;   // [H,nb,L,32]
-                const long sbase = (long)(hk * NB + blk) * Lk;
+                const long qbase = (long)(hk * NB + blk) * BLOCK * Lcap;   // [H,nb,L,32]
+                const long sbase = (long)(hk * NB + blk) * Lcap;
                 part += q_sh[d] * (float)kq[qbase + (long)j * BLOCK + kd]
                                 * ms::e8m0_to_scale(ks[sbase + j]);
             }
@@ -541,8 +541,8 @@ __global__ void mxint8_kv_split_kernel(
 
         // ---- Pass 2: out[d] += Σ_kk p_kk·V[d,kk] ----
         const int blk = tid / BLOCK, kd = tid % BLOCK;
-        const long qbase = (long)(hk * NB + blk) * BLOCK * Lk;
-        const long sbase = (long)(hk * NB + blk) * Lk;
+        const long qbase = (long)(hk * NB + blk) * BLOCK * Lcap;
+        const long sbase = (long)(hk * NB + blk) * Lcap;
         float lsum = 0.0f, a = 0.0f;
         for (int kk = 0; kk < nC; ++kk) {
             const float p = expf(sc[kk] - m_new);
@@ -729,7 +729,8 @@ torch::Tensor mxint8_wa_gemm_cuda(
 torch::Tensor mxint8_kv_decode_cuda(
         torch::Tensor q, torch::Tensor ks, torch::Tensor kq,
         torch::Tensor vs, torch::Tensor vq,
-        int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB) {
+        int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t Lcap) {
+    if (Lcap < 0) Lcap = Lk;                       // default: cache exactly sized (stride==Lk)
     auto out = torch::empty({H, D}, q.options());
     const int threads = next_pow2((int)D);
     const size_t smem = (size_t)((int)D + KV_CHUNK) * sizeof(float);  // q_sh[D] + sc[CHUNK]
@@ -747,7 +748,7 @@ torch::Tensor mxint8_kv_decode_cuda(
         ks.data_ptr<int8_t>(), kq.data_ptr<int8_t>(),
         vs.data_ptr<int8_t>(), vq.data_ptr<int8_t>(),
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-        (int)H, (int)Hkv, (int)Lk, (int)D, (int)NB, key_tile, S, sm);
+        (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, key_tile, S, sm);
 
     mxint8_kv_combine_kernel<<<(int)H, threads>>>(
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
