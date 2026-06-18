@@ -12,28 +12,34 @@ prefill을 wedge해서 시나리오마다 **별도 subprocess**로 격리.)
 ## 4 시나리오 × {MXINT8, MSAQ-u2/u3/u4} (bf16 baseline / 각 S의 MXINT8 대비)
 
 각 시나리오의 **MXINT8 커널이 그 시나리오의 baseline**(`/mxint8`은 같은 S의 MXINT8 대비).
-아래는 **커널 최적화 라운드 후**(KV write occupancy, KV read streaming unpack, W+A GEMV
-qx-staging — §"커널 최적화 라운드" 참조). 괄호는 최적화 전 `/mxint8`.
+**공정성 수정 최종**: KV read MXINT8 baseline을 MSAQ와 동일 **thread-per-key**로 올려 매핑 비대칭
+제거([for_fair_comparison.md]). 그 결과 KV를 쓰는 S3·S4의 MXINT8이 ~빨라져 **이전(비공정) S3 KV
+win은 tie로 정정**. 괄호 = 공정성 수정 전 값.
 
 | 시나리오 | 포맷 | TTFT | TPOT | total | /bf16 | /mxint8 |
 |---------|------|------|------|-------|-------|---------|
-| baseline | bf16 | 275 | 37.5 | 145.6s | 1.00 | — |
-| **S1 W-only** | MXINT8 | 1597 | 37.1 | 145.5s | 1.00 | — |
-| | MSAQ-u2 | 1720 | 34.6 | 136.1s | 0.93 | 0.94 |
-| | MSAQ-u3 | 1697 | 34.2 | 134.6s | 0.92 | 0.92 |
-| | **MSAQ-u4** | 1496 | 29.4 | 115.7s | **0.79** | **0.80** |
-| **S2 W+A** | MXINT8 | 1585 | 32.8 | 128.9s | 0.89 | — |
-| | MSAQ-u2 | 1480 | 33.6 | 131.9s | 0.91 | 1.02 (1.06) |
-| | MSAQ-u3 | 1447 | 33.1 | 129.9s | 0.89 | 1.01 (1.05) |
-| | **MSAQ-u4** | 1212 | 29.7 | 116.3s | **0.80** | 0.90 |
-| **S3 KV-only** | MXINT8 | 276 | 25.9 | 100.6s | 0.69 | — |
-| | MSAQ-u2 | 277 | 25.1 | 97.8s | 0.67 | **0.97** (1.07) |
-| | MSAQ-u3 | 277 | 25.1 | 97.6s | 0.67 | **0.97** (1.07) |
-| | **MSAQ-u4** | 277 | 23.9 | 93.0s | **0.64** | 0.92 |
-| **S4 W-only+KV** | MXINT8 | 1600 | 25.5 | 100.7s | 0.69 | — |
-| | MSAQ-u2 | 1720 | 22.5 | 88.9s | 0.61 | **0.88** (0.98) |
-| | MSAQ-u3 | 1699 | 22.0 | 87.2s | 0.60 | **0.87** (0.96) |
-| | **MSAQ-u4** | 1502 | **16.1** | **64.0s** | **0.44** | **0.64** |
+| baseline | bf16 | 275 | 37.5 | 145.7s | 1.00 | — |
+| **S1 W-only** | MXINT8 | 1600 | 37.1 | 145.6s | 1.00 | — |
+| | MSAQ-u2 | 1715 | 34.6 | 136.0s | 0.93 | 0.93 |
+| | MSAQ-u3 | 1691 | 34.2 | 134.5s | 0.92 | 0.92 |
+| | **MSAQ-u4** | 1496 | 29.4 | 115.7s | **0.79** | **0.79** |
+| **S2 W+A** | MXINT8 | 1586 | 32.8 | 128.9s | 0.88 | — |
+| | MSAQ-u2 | 1480 | 33.6 | 132.0s | 0.91 | 1.02 |
+| | MSAQ-u3 | 1447 | 33.1 | 129.9s | 0.89 | 1.01 |
+| | **MSAQ-u4** | 1210 | 29.7 | 116.3s | **0.80** | 0.90 |
+| **S3 KV-only** | MXINT8 | 276 | 23.6 | 91.9s | **0.63** | — |
+| | MSAQ-u2 | 276 | 25.1 | 97.8s | 0.67 | 1.06 (0.97) |
+| | MSAQ-u3 | 277 | 25.1 | 97.6s | 0.67 | 1.06 (0.97) |
+| | **MSAQ-u4** | 277 | 23.9 | 92.9s | 0.64 | **1.01** (0.92) |
+| **S4 W-only+KV** | MXINT8 | 1600 | 23.3 | 91.9s | **0.63** | — |
+| | MSAQ-u2 | 1717 | 22.5 | 88.9s | 0.61 | 0.97 (0.88) |
+| | MSAQ-u3 | 1696 | 22.0 | 87.0s | 0.60 | 0.95 (0.87) |
+| | **MSAQ-u4** | 1497 | **16.0** | **63.8s** | **0.44** | **0.69** (0.64) |
+
+> **공정성 수정 효과:** KV를 양자화하는 S3·S4의 MXINT8이 thread-per-key로 ~빨라짐(total 100.7→
+> 91.9s). **S3 KV-only는 MSAQ가 tie(u4 1.01)로 정정**(이전 0.92 win은 MXINT8 under-optimization
+> 산물 — [for_fair_comparison.md]). **S4는 u4 0.69로 여전히 win**: KV read가 tie여도 **W-only
+> GEMV(진짜 BW-bound)의 win이 지배**하기 때문. bf16 대비는 전부 여전히 win.
 
 ## TPOT 성장곡선 (graph, ms) — 컨텍스트별 순간 per-step
 
@@ -47,37 +53,47 @@ qx-staging — §"커널 최적화 라운드" 참조). 괄호는 최적화 전 `
 | S2 W+A mxint8 | 22.34 | 23.75 | 27.89 | 33.43 | 43.23 |
 | S2 W+A msaq-u2 | 23.13 | 24.54 | 28.69 | 34.20 | 44.06 |
 | S2 W+A msaq-u4 | 19.18 | 20.58 | 24.76 | 30.28 | 40.06 |
-| S3 KV-only mxint8 | 22.92 | 23.33 | 24.46 | 26.02 | 28.78 |
-| S3 KV-only msaq-u2 | 22.83 | 23.34 | 24.05 | 25.20 | **27.36** |
-| S3 KV-only msaq-u4 | 22.43 | 22.66 | 23.20 | 23.96 | 25.33 |
-| S4 W-only+KV mxint8 | 22.57 | 22.98 | 24.12 | 25.69 | 28.52 |
-| S4 W-only+KV msaq-u2 | 20.21 | 20.69 | 21.41 | 22.55 | 24.68 |
-| S4 W-only+KV msaq-u3 | 19.79 | 20.28 | 20.99 | 22.12 | 24.27 |
-| **S4 W-only+KV msaq-u4** | **14.70** | 14.90 | 15.42 | 16.20 | **17.55** |
+| S3 KV-only mxint8 (fair) | 22.28 | 22.52 | 23.00 | 23.71 | **24.88** |
+| S3 KV-only msaq-u4 | 22.41 | 22.66 | 23.17 | 23.96 | 25.33 |
+| S4 W-only+KV mxint8 (fair) | 21.92 | 22.17 | 22.65 | 23.35 | 24.61 |
+| S4 W-only+KV msaq-u3 | 19.76 | 20.22 | 20.91 | 22.07 | 24.24 |
+| **S4 W-only+KV msaq-u4** | **14.66** | 14.89 | 15.38 | 16.11 | **17.46** |
+
+> 공정성 수정 후 **MXINT8 KV(thread-per-key)도 평탄**해졌다(S3 4680: 28.8→**24.9ms**). 즉 곡선 평탄화는
+> "KV를 양자화하는 것" 자체의 효과(MSAQ·MXINT8 공통)이고, **MSAQ vs MXINT8 KV는 tie**(S3 u4
+> msaq 25.3 ≈ mxint8 24.9). S4 msaq-u4가 최저·최평탄인 건 weight GEMV 이득이 더해졌기 때문.
 
 ## 해석 — 적용 대상별 기여가 분리됨
 
-1. **weight 양자화는 baseline을 낮추고, KV 양자화는 성장곡선을 평탄화한다.** 둘은 직교:
-   - **bf16**: ctx 길어지며 26.9→47.9ms (KV read 폭증).
-   - **S3 KV-only(msaq)**: 22.4→25.3ms **평탄** — KV만 줄여도 성장 제거(긴 컨텍스트 decode의 진짜 병목).
-   - **S1 W-only(msaq)**: 19.0→39.8ms — baseline은 낮지만 KV가 bf16이라 **여전히 성장**.
-   - **S4 둘 다(msaq)**: 14.7→17.6ms — **가장 낮고 가장 평탄**. 두 이득이 곱해짐.
+0. **⚠️ 공정성 정정(가장 중요):** KV read MXINT8 baseline을 fair(thread-per-key)로 올린 뒤
+   **MSAQ의 KV-read 우위는 사라졌다(tie)**. 따라서 MSAQ의 *공정한* end-to-end 이득은 거의 전부
+   **weight GEMV(W-only scope)**에서 온다. KV 양자화는 bf16 대비 둘 다 이득이나 **MSAQ vs MXINT8
+   KV는 tie**(자세히는 아래 §"KV read 공정성"). 이전 라운드 표(S3 0.92 win 등)는 MXINT8
+   under-optimization 산물이었다.
 
-2. **최고 = S4 W-only+KV MSAQ-u4: bf16의 0.44×, MXINT8의 0.64×** (145.5s→**64.1s**).
-   weight·KV 양자화가 **compound**(TPOT 37.4→16.1ms). end-to-end 핵심 결과.
+1. **weight 양자화는 baseline을 낮추고, KV 양자화는 성장곡선을 평탄화한다(직교).** 단 곡선 평탄화는
+   **MSAQ·MXINT8 공통**(KV를 양자화하면 둘 다 평탄):
+   - **bf16**: ctx 길어지며 26.9→47.9ms (KV read 폭증).
+   - **S3 KV-only**: msaq 22.4→25.3 ≈ mxint8(fair) 22.3→24.9 — **둘 다 평탄, 서로 tie**.
+   - **S1 W-only(msaq)**: 19.0→39.7 — baseline 낮지만 KV가 bf16이라 여전히 성장.
+   - **S4 둘 다(msaq-u4)**: 14.7→17.5ms — 최저·최평탄. weight GEMV 이득 + KV 평탄.
+
+2. **최고 = S4 W-only+KV MSAQ-u4: bf16의 0.44×, MXINT8의 0.69×** (145.7s→**63.8s**).
+   bf16 대비는 weight+KV 양자화가 compound(TPOT 37.5→16.0ms). **MXINT8 대비 0.69의 출처는
+   weight GEMV**(KV는 tie라 중립) — 즉 공정 비교에서도 S4가 이기는 건 W-only scope 덕분이다.
 
 3. **MXINT8 W-only는 end-to-end 이득이 0 (S1 mxint8 = 1.00×bf16).** MXINT8 GEMV는 cuBLAS bf16
-   GEMV와 거의 동속(커널벤치 47 vs 46µs)이라 decode를 못 줄인다. 반면 **MSAQ W-only는 0.80** —
+   GEMV와 거의 동속(커널벤치 47 vs 46µs)이라 decode를 못 줄인다. 반면 **MSAQ W-only는 0.79** —
    wide-load u4 GEMV(커널 0.66×cuBLAS)가 cuBLAS를 이겨서 실제로 baseline을 내린다. → **W-only
-   scope에서 MSAQ가 MXINT8보다 명백히 가치 있다(u4 0.80).**
+   scope가 MSAQ의 진짜 BW-bound win이고 MXINT8 대비 0.79로 가장 명확.**
 
-4. **KV-only(S3)만으로도 0.64~0.69** — weight를 bf16로 둬도 KV 양자화가 긴 컨텍스트 decode를 크게
-   가속(TTFT는 bf16 그대로 279ms 유지 → prefill 손해 없이 decode 이득만). MSAQ KV가 MXINT8보다
-   약간 우위(0.92, packed KV가 더 적은 read).
+4. **KV-only(S3): bf16 대비 0.63~0.64(둘 다 win)이나 MSAQ vs MXINT8는 tie(u4 1.01).** weight를
+   bf16로 둬도 KV 양자화가 긴 컨텍스트 decode를 크게 가속(TTFT는 bf16 그대로 ~276ms 유지). 단
+   **MSAQ KV가 MXINT8 KV를 이기지는 못한다**(fair thread-per-key 기준 tie; §"KV read 공정성").
 
-5. **MSAQ vs MXINT8 (시나리오별):** S1 W-only **0.80**(완승) · S2 W+A 0.91 · S3 KV 0.92 ·
-   S4 W+KV **0.64**(두 scope의 이득이 곱해져 격차 최대). 커널 단위 결과(W-only GEMV·KV dequant에서
-   MSAQ 우위)가 end-to-end로 그대로 누적.
+5. **MSAQ vs MXINT8 (시나리오별, fair):** S1 W-only **0.79**(완승, weight GEMV) · S2 W+A 0.90 ·
+   **S3 KV 1.01(tie)** · S4 W+KV **0.69**(weight GEMV win이 KV tie 위에 얹힘). 즉 공정 비교에서
+   MSAQ의 end-to-end 우위는 **weight GEMV에서 오고 KV read는 중립**이다.
 
 6. **TTFT 트레이드오프:** weight를 양자화하는 S1·S2·S4는 prefill GEMM이 cuBLAS 대신 커스텀
    IMMA/타일이라 TTFT 1.2~1.6s(bf16 0.28s 대비 ~5×). **KV-only(S3)는 bf16 weight라 TTFT 손해 0.**
@@ -89,10 +105,19 @@ qx-staging — §"커널 최적화 라운드" 참조). 괄호는 최적화 전 `
    언팩이 무거워 더 적은 bit를 읽는 대역폭 이득을 까먹는다(커널 단위 결과 그대로):
    - **S1 W-only**: u2/u3도 MXINT8을 이김(/mxint8 0.93/0.92) — MXINT8 GEMV가 cuBLAS와 동속이라
      u2/u3의 약한 이득으로도 역전. u4는 0.80.
-   - **S2 W+A·S3 KV-only**: u2/u3가 **MXINT8보다 느림**(/mxint8 1.05~1.07) — 언팩 비용이 IMMA/KV-read
-     이득을 초과. **u4만** crossover(0.91, 0.92).
-   - **S4**: u2/u3는 ~동률(0.96~0.98), u4만 0.64.
-   → **실전 권장 = u4.** u2/u3은 정확도가 더 필요할 때의 옵션이되, end-to-end 속도는 u4가 정답.
+   - **S2 W+A**: u2/u3가 MXINT8보다 ~tie/약간 느림(1.01~1.02), **u4만** crossover(0.90).
+   - **S3 KV-only(fair)**: u4 **tie(1.01)**, u2/u3 손해(1.06) — KV read는 어느 u도 MXINT8을 못 이김.
+   - **S4**: u2/u3 ~동률(0.95~0.97), **u4 0.69**(weight GEMV win 지배).
+   → **실전 권장 = u4.** u2/u3은 정확도용 옵션. (단 KV read 자체는 u4도 fair tie — win은 weight scope.)
+
+## KV read 공정성 (요약 — 상세는 [for_fair_comparison.md])
+이전 라운드의 KV read "win"(S3 0.92 등)은 **MXINT8 baseline이 구버전 warp-per-key라 ~2× 느렸던
+산물**이었다. MXINT8을 MSAQ와 동일 **thread-per-key**로 올리니(공정) KV read는 **u4 tie·u2/u3 손해**.
+근본 이유: flash-decode가 BW 시간의 ~20× 느리게 도는 **latency/overhead-bound**라(텐서코어 미사용)
+"바이트를 덜 읽는" 이점이 시간에 안 나타난다. BW-bound로 끌어올리려 했으나 **sub-byte V의 Pass-2
+(per-d reduction)**가 half-sector(직접) 또는 staging-overhead(occupancy 캡)라는 장애물에 막혀
+(direct-V 실험은 tie→1.40 악화), 깨끗한 KV win은 **완전한 FlashDecoding 재설계**(미해결 과제)를
+요구한다. → 본 표의 S3/S4는 **공정 최선(KV tie)** 상태다.
 
 ## 커널 최적화 라운드 (Phase 31) — KV write / KV read / W+A GEMV
 
