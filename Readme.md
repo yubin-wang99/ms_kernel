@@ -7,13 +7,14 @@ verification. This tree is the CUDA pivot of the old single-file
 hardware instructions, so the kernels move to CUDA (`bfe`/`prmt`, `__hfma2`,
 warp reductions) and CUTLASS (tensor cores).
 
-## Results — both decode kernels now beat the matched MXINT8 baseline at every `u`
+## Results — all four scopes now beat the matched MXINT8 baseline at every `u`
 
 The campaign goal — *fewer bytes (MSAQ-signed) → faster wall-clock* than a
-matched 1-byte MXINT8 kernel — is met for **KV decode and W-only GEMV at every
-`u`** (and they beat cuBLAS/SDPA BF16 too). Both wins are bit-exact (no repack,
-no padding) and came from finding the *real* bottleneck by measurement, not by
-the layout fix the design notes assumed.
+matched 1-byte MXINT8 kernel — is met for **all four scopes (W-only GEMV, KV
+decode, W-only GEMM, W+A GEMM) at every `u`** (and the decode kernels beat
+cuBLAS/SDPA BF16 too). The wins are bit-exact (no repack, no padding) and came
+from finding the *real* bottleneck by measurement, not by the layout fix the
+design notes assumed.
 
 **KV decode** (Phase 18) — `H=8 Lk=16384 D=128`, pure-HBM. Lever: a
 `key-per-thread` wide coalesced read (each thread owns one key's contiguous
@@ -41,15 +42,20 @@ group). No repack — only the kernel's inner loop changed.
 RTX 3090 (sm_86), warm cross-measured (clock-/order-verified —
 `tests/kv_clock_verify.py`); bit-exact vs the certified path; all GPU +
 emulation tests pass. Full settings (sizes, regimes, timing procedure) in
-[`methodology.md`](methodology.md). The prefill GEMM / W+A kernels beat MXINT8 at u4 (0.92–0.93×)
-and lag slightly at u2/u3 (1.02–1.07×, FP32-tiled → FMA-bound). A **software-
-pipelined BF16 WMMA** (opt-in `MS_TILE_CFG=11`, matched) that overlaps the next
-tile's streaming-unpack with the current tile's tensor-core MMA crosses **W-only
-GEMM at every `u`** (u2 0.98×, u3 0.98×, u4 0.93×) and is ~1.6× faster than the
-FP32 tile. **W+A** does not cross there — its activation quant already fills the
-stage budget, leaving no room to hide the unpack (it stays FP32-tiled at
-1.02–1.04×, near-parity; an INT8-IMMA epilogue is the next lever). See `change.md`
-Phase 22–23.
+[`methodology.md`](methodology.md).
+
+**Prefill GEMM** (M=512). **W-only**: a software-pipelined BF16 WMMA (opt-in
+`MS_TILE_CFG=11`) overlaps the next tile's streaming-unpack with the current
+tile's tensor-core MMA — crosses at every `u` (u2 0.98×, u3 0.98×, u4 0.93×),
+~1.6× faster than the FP32 tile. **W+A** crosses too, via a **2-stage** design
+(Phase 26–27): a Stage-0 pre-pass quantizes the activation to the MSAQ-s
+mantissa-sharing format (each element once; the MXINT8 baseline keeps plain
+MXINT8 — a format difference, not an optimization), so the Stage-1 INT8-IMMA
+GEMM's only heavy prologue work is the weight unpack — which double-buffering
+hides behind the MMA. Result: u2 **0.85×**, u3 **0.84×**, u4 **0.71×**; the
+weight unpack is 100% hidden (the B-stage cost is purely byte-proportional, so
+MSAQ's fewer bytes win) and the pre-pass is ~1% of total. See `change.md`
+Phase 22–27.
 Full phase-by-phase history (split-K → coalescing → two-pass → cp.async →
 wide-load → streaming unpack) and the 4-kernel scoreboard are in `change.md`.
 
@@ -95,9 +101,10 @@ ms/
 ### `.cu` completeness (honest status)
 
 > **Note:** the table below is the *original correctness-first baseline* status.
-> The decode paths have since been optimized and GPU-certified — see **Results**
-> above and `change.md` (Phase 1–20). `kv_attention.cu` and `w_gemv.cu` now beat
-> the matched MXINT8 baseline at every `u`.
+> The kernels have since been optimized and GPU-certified — see **Results** above
+> and `change.md` (Phase 1–27). All four scopes (`w_gemv.cu`, `kv_attention.cu`,
+> W-only GEMM and W+A GEMM in `wa_gemm.cu`) now beat the matched MXINT8 baseline
+> at every `u`.
 
 All four kernels' **logic is verified on CPU** by `tests/test_emulation.py`
 (`rel_fro < 1e-9` vs the oracle, mirroring each kernel's exact byte-addressing
@@ -108,7 +115,7 @@ and arithmetic). What remains is CUDA *execution* — compile + the GPU
 |---|---|
 | `ms_utils.cuh` | unpack primitive **complete & matches the oracle's bit-math** |
 | `w_gemv.cu` | **optimized & GPU-certified** — split-K + wide-load + streaming bit-buffer unpack; beats matched MXINT8 at all `u` (Phase 14/16/20) |
-| `wonly_gemm` / `wa_gemm` (`wa_gemm.cu`) | correctness-first baselines, **logic-verified** (no tensor cores yet) |
+| `wonly_gemm` / `wa_gemm` (`wa_gemm.cu`) | **optimized & GPU-certified** — W-only pipelined BF16 WMMA (cfg=11); W+A 2-stage (MSAQ-s pre-quant + pipelined INT8 IMMA). Both beat matched MXINT8 at all `u` (Phase 23/26/27) |
 | `kv_attention.cu` | **optimized & GPU-certified** — split-K flash-decode + key-per-thread wide-read; beats matched MXINT8 at all `u` (Phase 18). No tensor-core QKᵀ/PV yet |
 
 All `.cu` are **UNVALIDATED-ON-GPU** until the GPU gates run. None is the

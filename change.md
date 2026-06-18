@@ -821,19 +821,19 @@ BW가 ~0.5× — **열당 stride(20/24)가 어떤 벡터폭과도 안 맞아 DRA
 | u3 | 39.5 | 48.2 | 46.0 | **0.82 ✅** (1.43→ P20) |
 | u4 | 27.4 | 48.5 | 46.3 | **0.56 ✅** |
 
-**2. W-only GEMM (prefill M=512)** — SOTA: shared-mem tiled GEMM(P9)+M-adaptive tile 64²/128²(P10)
+**2. W-only GEMM (prefill M=512)** — SOTA: tiled GEMM(P9/10) → **software-pipelined BF16 WMMA + streaming unpack(P23, cfg=11)**. **전 u 추월 ✅**
 | u | MSAQ | MXINT8 | cuBLAS | MSAQ/MX |
 |---|------|--------|--------|---------|
-| u2 | 2560 | 2401 | 284 | 1.07 ❌ |
-| u3 | 2542 | 2408 | 287 | 1.06 ❌ |
-| u4 | 2227 | 2427 | 287 | **0.92 ✅** |
+| u2 | 1589 | 1624 | 283 | **0.98 ✅** (FP32 1.07→ P23) |
+| u3 | 1599 | 1633 | 285 | **0.98 ✅** (FP32 1.06→ P23) |
+| u4 | 1530 | 1648 | 287 | **0.93 ✅** |
 
-**3. W+A GEMM (prefill M=512)** — SOTA: tiled GEMM + on-the-fly MXINT8 activation quant fold(P9)
+**3. W+A GEMM (prefill M=512)** — SOTA: **2-stage = MSAQ-s 활성화 선-양자화(P27) + pipelined INT8 IMMA(P26)**(weight unpack을 MMA 뒤에 숨김). **전 u 추월 ✅**
 | u | MSAQ | MXINT8 | cuBLAS | MSAQ/MX |
 |---|------|--------|--------|---------|
-| u2 | 3685 | 3574 | 286 | 1.03 ❌ |
-| u3 | 3632 | 3574 | 286 | 1.02 ❌ |
-| u4 | 3335 | 3574 | 287 | **0.93 ✅** |
+| u2 | 2360 | 2763 | 286 | **0.85 ✅** (FP32 1.03→ P26) |
+| u3 | 2316 | 2765 | 286 | **0.84 ✅** (FP32 1.02→ P26) |
+| u4 | 1968 | 2776 | 287 | **0.71 ✅** |
 
 **4. KV decode (H=8 Lk=16384 D=128, HBM)** — SOTA: split-K flash-decode(P1)+token-major coalescing(4a)+two-pass barrier-light(방안3)+key-per-thread wide-read(P18)
 | u | MSAQ | MXINT8 | SDPA | MSAQ/MX |
@@ -847,13 +847,15 @@ BW가 ~0.5× — **열당 stride(20/24)가 어떤 벡터폭과도 안 맞아 DRA
   봤으나 **틀렸음**. plane-split(완전 coalesced load)이 0 speedup이고 u2(25B)·u3(22B)가 같은
   40µs(바이트 무관)였던 게 증거 → 실제는 **extraction(straddle unpack)-bound**. streaming
   bit-buffer unpack으로 추출 ALU를 줄여 해결(P20). **register-aligned repack/padding 불필요**.
-- **GEMM/W+A u2/u3 (1.02–1.07) = compute(FMA) bound**: tiled가 unpack을 타일당 1회로 분할상환해
-  memory-bound를 벗어남 → 바이트 절약이 안 보이고, u2/u3의 무거운 straddle unpack만 근소 열위로 남음.
-  (참고: GEMV처럼 streaming unpack을 B-tile staging에 이식하면 줄어들 여지 — 미시도.)
+- **GEMM/W+A u2/u3 (당시 1.02–1.07로 열위) → 이후 전부 crossover**: 그땐 FP32-tiled가 FMA-bound라
+  바이트 절약이 안 보였음. **해결책은 tensor-core로 매트멀을 빨라지게 해 memory-bound로 밀고, weight
+  unpack을 MMA 뒤에 숨기는 것**: W-only는 pipelined WMMA(P23, 0.93~0.98), **W+A는 활성화를 별도
+  선-패스로 빼 GEMM prologue를 weight-unpack 전용으로 만든 2-stage IMMA(P26/27, 0.71~0.85)**.
+  분해 결과 B-stage가 바이트 비례(unpack 100% 숨음) → MSAQ가 바이트를 덜 읽어 이김.
 - **KV가 u2/u3도 넘는 이유(대조)**: token-major라 key가 contiguous → key-per-thread가 u2/u3도
   coalesced. GEMV out-innermost와 달리 레이아웃이 정렬에 유리.
-- **남은 레버**: GEMM/W+A u2/u3 → tensor-core(IMMA/WMMA, P11 WMMA는 현재 opt-in) 또는 streaming
-  unpack 이식. (GEMV·KV는 전 u crossover 완료.)
+- **현재 상태**: **4 scope(GEMV·KV·W-only GEMM·W+A) 전부 전 u에서 MXINT8 추월 완료.** 남은 레버는
+  cuBLAS 격차(tensor-core 본선 튜닝) + W+A epilogue(~12%)를 CUTLASS fused-fragment로 줄이기.
 
 ---
 
