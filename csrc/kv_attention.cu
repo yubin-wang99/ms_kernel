@@ -519,6 +519,37 @@ __global__ void kv_write_kernel(
     }
 }
 
+// ---- KV QUANTIZE (decode append): the L=1, in-place specialization of write ---
+//   Each decode step quantizes the new token's K (or V) [H,D] and writes it into
+//   the pre-allocated cache at token slot `pos` (stride Lcap). thread = (h,blk)
+//   (work = H*nb blocks, tiny) -> launch-latency dominated; fuse into the
+//   projection/RoPE epilogue or attention prologue in deployment. Same
+//   decompose+bit-pack primitive and token-major slot as the write kernel, so the
+//   read path sees one consistent format. (change.md Phase 28.)
+__global__ void kv_append_kernel(
+        const __nv_bfloat16* __restrict__ X,    // [H, D] (new token's K or V)
+        int8_t*  __restrict__ scale_exp,         // [H, nb, Lcap]
+        uint8_t* __restrict__ upper,             // [H, nb, Lcap, UB]
+        uint8_t* __restrict__ shared,            // [H, nb, Lcap, SB]
+        int H, int D, int NB, int pos, int Lcap, int u, int gs, int UB, int SB) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= H * NB) return;
+    const int h = t / NB, blk = t % NB, ng = 32 / gs, wbits = 8 - u;
+    float x[32];
+    const long xb = (long)h * D + (long)blk * 32;
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) x[k] = __bfloat162float(X[xb + k]);
+    int q_upper[32], r_shared[16];
+    const int ea = ms::decompose_ms_block(x, u, gs, q_upper, r_shared);
+    const long slot = (long)(h * NB + blk) * Lcap + pos;
+    uint8_t ubuf[32], sbuf[8];
+    ms::pack_codes_lsb(q_upper, 32, wbits, ubuf, UB);
+    ms::pack_codes_lsb(r_shared, ng, u, sbuf, SB);
+    for (int bi = 0; bi < UB; ++bi) upper[slot * UB + bi] = ubuf[bi];
+    for (int bi = 0; bi < SB; ++bi) shared[slot * SB + bi] = sbuf[bi];
+    scale_exp[slot] = (int8_t)ea;
+}
+
 } // namespace
 
 // Host launcher. Signature matches ms_lib.ops.kv_decode_attention / the schema.
@@ -614,4 +645,21 @@ std::vector<torch::Tensor> kv_write_cuda(
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
         (int)H, (int)L, (int)D, (int)NB, (int)u, (int)gs, UB, SB);
     return {scale_exp, upper, shared};
+}
+
+// Decode-append launcher: quantize one new token X[H,D] into the cache planes
+// (scale_exp[H,nb,Lcap], upper[H,nb,Lcap,UB], shared[H,nb,Lcap,SB]) at slot `pos`,
+// in place. Mutates the three cache tensors (no allocation, no return).
+void kv_append_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
+        int64_t H, int64_t D, int64_t NB, int64_t pos, int64_t Lcap, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    const int wbits = 8 - (int)u;
+    const int UB = BLOCK * wbits / 8;
+    const int SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
+    const int total = (int)(H * NB), TPB = 128;
+    kv_append_kernel<<<(total + TPB - 1) / TPB, TPB>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
+        (int)H, (int)D, (int)NB, (int)pos, (int)Lcap, (int)u, (int)gs, UB, SB);
 }

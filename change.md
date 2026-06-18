@@ -1185,3 +1185,24 @@ MSAQ 포맷에서는 **활성화도 weight/KV와 동일한 mantissa-sharing**으
 | u3 | 2316 | 2765 | **0.84** | 20µs |
 | u4 | 1968 | 2776 | **0.71** | 20µs |
 - decompose 양자화는 plain보다 약간 무겁지만(17→20µs) 여전히 **1%** — crossover 그대로 유지(P26의 0.70~0.84 ≈ 0.71~0.85).
+
+# Phase 28 — End-to-end 하니스용 quantize 커널 3종 (KV write / KV append / W+A GEMV)
+
+지금까지 모든 scope는 "이미 packed된 입력"을 받아 GEMV/GEMM/attention을 측정했다. TTFT·TPOT·총 추론시간을 재려면 **런타임 양자화 자체**를 커널로 가져와야 한다(prefill에서 KV write, decode마다 KV append, decode마다 W+A GEMV의 활성화). 세 커널 모두 같은 §0 프리미티브를 공유.
+
+## §0 공유 프리미티브 (`ms_utils.cuh`) — `ms_lib.pack.decompose`의 device 대응
+- `e8m0_exp_from_amax(amax)` — 블록 amax → E8M0 지수(`floor(log2 amax) - E_MAX`, [-127,127] 클램프).
+- `decompose_ms_block(x[32], u, gs, q_upper[32], r_shared[ng])` — 한 스레드가 32-블록을 통째로 들고 base scale `sa`·(8−u)-bit upper·u-bit shared로 분해. `reference.quant_act(share=True)`와 비트 동일.
+- `pack_codes_lsb(codes, n, width, buf, nbytes)` — dense LSB 비트팩(extract_code의 역). KV plane용.
+
+## KV write (prefill) — `kv_attention.cu kv_write_kernel`
+- bf16 `X[H,L,D]` → 인증된 token-major MSAQ plane(`scale_exp[H,nb,L]`, `upper[H,nb,L,UB]`, `shared[H,nb,L,SB]`). **thread-per-token**(P18 read의 write 거울): 고정 (h,blk)에서 연속 토큰이 UB-연속 바이트를 store → coalesced. `H·ceil(L/256)` 블록이라 split 불필요.
+- matched `mxint8_kv_write` (int8 직접 `qweight[H,nb,L,32]`).
+
+## KV append (decode) — `kv_attention.cu kv_append_kernel`
+- write의 **L=1·pos** 특수화: decode 한 스텝의 새 토큰 `X[H,D]`를 미리 잡아둔 cache의 slot `pos`(stride Lcap)에 in-place 기록. thread=(h,blk), work=H·nb(작음) → launch-latency 지배 → 배포 시 projection/RoPE epilogue 또는 attention prologue에 fuse 대상. 같은 decompose+pack·token-major slot이라 read 경로가 하나의 포맷만 본다.
+- matched `mxint8_kv_append`.
+
+## 검증
+- write·append plane 모두 `pack_kv`에 **byte-exact**(scale_exp/upper/shared diff 0, 모든 u/gs). append는 토큰별로 채운 cache(Lcap=L)가 통째 write와 동일함을 확인.
+- end-to-end write/append → kv_decode → oracle **rel_fro 1.6e-3** (< 2e-2). 게이트: `test_kv_write_vs_pack`, `test_kv_write_then_decode_vs_oracle`, `test_kv_append_vs_pack`, `test_kv_append_then_decode_vs_oracle`.

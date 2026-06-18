@@ -580,6 +580,31 @@ __global__ void mxint8_kv_write_kernel(
         scale_exp[tok] = (int8_t)ea;
     }
 }
+
+// Matched MXINT8 decode-append: quantize one new token X[H,D] into qweight cache
+// at slot `pos` (stride Lcap), in place. thread = (h,blk). (change.md Phase 28.)
+__global__ void mxint8_kv_append_kernel(
+        const __nv_bfloat16* __restrict__ X,    // [H, D]
+        int8_t* __restrict__ scale_exp,          // [H, nb, Lcap]
+        int8_t* __restrict__ qweight,            // [H, nb, Lcap, 32]
+        int H, int D, int NB, int pos, int Lcap) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= H * NB) return;
+    const int h = t / NB, blk = t % NB;
+    const long xb = (long)h * D + (long)blk * BLOCK;
+    float amax = 1e-30f;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) amax = fmaxf(amax, fabsf(__bfloat162float(X[xb + k])));
+    const int ea = ms::e8m0_exp_from_amax(amax);
+    const float s = exp2f((float)ea);
+    const long slot = (long)(h * NB + blk) * Lcap + pos;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) {
+        int q = (int)rintf(__bfloat162float(X[xb + k]) / s);
+        qweight[slot * BLOCK + k] = (int8_t)max(-127, min(127, q));
+    }
+    scale_exp[slot] = (int8_t)ea;
+}
 } // namespace
 
 // ---- host launchers ---------------------------------------------------------
@@ -689,4 +714,16 @@ std::vector<torch::Tensor> mxint8_kv_write_cuda(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), (int)H, (int)L, (int)D, (int)NB);
     return {scale_exp, qweight};
+}
+
+// Matched MXINT8 decode-append launcher (mutates scale_exp/qweight in place).
+void mxint8_kv_append_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight,
+        int64_t H, int64_t D, int64_t NB, int64_t pos, int64_t Lcap) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    const int total = (int)(H * NB), TPB = 128;
+    mxint8_kv_append_kernel<<<(total + TPB - 1) / TPB, TPB>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
+        (int)H, (int)D, (int)NB, (int)pos, (int)Lcap);
 }

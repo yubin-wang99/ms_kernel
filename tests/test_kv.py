@@ -93,3 +93,53 @@ def test_kv_write_then_decode_vs_oracle(rng, cfg):
     pV = pack_kv(Vb.float().cpu().numpy(), u, gs)
     ref = kv_attention(bf16np(Q)[:, None, :], pK, pV, causal=True)[:, 0, :]
     assert rel_fro(got, ref) < REL_FRO_TOL
+
+
+# ---- 4. KV append (decode): per-token in-place quantize, byte-exact to write ---
+@requires_kernel
+def test_kv_append_vs_pack(rng, cfg):
+    import torch
+    u, gs = cfg
+    H, L, D = 4, 48, 128
+    K = (rng.standard_normal((H, L, D)) * rng.uniform(0.3, 3, (H, 1, 1))).astype(np.float32)
+    Kb = torch.from_numpy(K).to(torch.bfloat16).cuda()
+    nb, wbits = D // 32, 8 - u
+    UB, SB = 32 * wbits // 8, ((32 // gs) * u + 7) // 8
+    # pre-allocate the cache (capacity == final length so the slot stride matches)
+    se = torch.empty((H, nb, L), dtype=torch.int8, device="cuda")
+    up = torch.empty((H, nb, L, UB), dtype=torch.uint8, device="cuda")
+    sh = torch.empty((H, nb, L, SB), dtype=torch.uint8, device="cuda")
+    for pos in range(L):                                  # decode loop: one token / step
+        torch.ops.msaq.kv_append(Kb[:, pos, :].contiguous(), se, up, sh,
+                                 H, D, nb, pos, L, u, gs)
+    p = pack_kv(Kb.float().cpu().numpy(), u, gs)          # whole-tensor write (oracle)
+    assert np.array_equal(se.cpu().numpy(), p["scale_exp"])    # byte-exact to write
+    assert np.array_equal(up.cpu().numpy(), p["upper"])
+    assert np.array_equal(sh.cpu().numpy(), p["shared"])
+
+
+@requires_kernel
+def test_kv_append_then_decode_vs_oracle(rng, cfg):
+    import torch
+    u, gs = cfg
+    H, Lk, D = 8, 96, 128
+    K = (rng.standard_normal((H, Lk, D)) * 0.5).astype(np.float32)
+    V = (rng.standard_normal((H, Lk, D)) * 0.5).astype(np.float32)
+    Q = (rng.standard_normal((H, D)) * 0.5).astype(np.float32)
+    Kb, Vb = (torch.from_numpy(a).to(torch.bfloat16).cuda() for a in (K, V))
+    qt, nb, wbits = torch.from_numpy(Q).to(torch.bfloat16).cuda(), D // 32, 8 - u
+    UB, SB = 32 * wbits // 8, ((32 // gs) * u + 7) // 8
+    cache = lambda: (torch.empty((H, nb, Lk), dtype=torch.int8, device="cuda"),
+                     torch.empty((H, nb, Lk, UB), dtype=torch.uint8, device="cuda"),
+                     torch.empty((H, nb, Lk, SB), dtype=torch.uint8, device="cuda"))
+    ks, ku, kh = cache()
+    vs, vu, vh = cache()
+    for pos in range(Lk):                                 # build both caches token-by-token
+        torch.ops.msaq.kv_append(Kb[:, pos, :].contiguous(), ks, ku, kh, H, D, nb, pos, Lk, u, gs)
+        torch.ops.msaq.kv_append(Vb[:, pos, :].contiguous(), vs, vu, vh, H, D, nb, pos, Lk, u, gs)
+    got = torch.ops.msaq.kv_decode_attention(qt, ks, ku, kh, vs, vu, vh,
+                                             H, Lk, D, nb, u, gs).float().cpu().numpy()
+    pK = pack_kv(Kb.float().cpu().numpy(), u, gs)
+    pV = pack_kv(Vb.float().cpu().numpy(), u, gs)
+    ref = kv_attention(bf16np(Q)[:, None, :], pK, pV, causal=True)[:, 0, :]
+    assert rel_fro(got, ref) < REL_FRO_TOL
