@@ -493,6 +493,12 @@ inline int next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 //   -> coalesced store (u4: 512 B/warp). Blocks = H*ceil(L/TPB), occupancy free
 //   (no split needed). decompose_ms_block + dense LSB bit-pack (ms_utils). One
 //   plane set (K or V) per call. (change.md Phase 28.)
+// thread-per-token, one head_dim BLOCK per block-grid-z. Lifting nb into the grid
+// (vs an in-thread blk loop) is the occupancy fix for GQA: at H=8 the old grid was
+// only H*ceil(L/256)=32 blocks -> <0.5 block/SM on the 82-SM 3090, so the kernel ran
+// ~10x off its (BW-light) ceiling. grid (H, ceil(L/TPB), nb) -> H*ceil(L/128)*nb
+// (~224) blocks fills the machine. Consecutive threads = consecutive tokens at a
+// fixed (h,blk) -> UB-contiguous coalesced store (the Phase-18 write mirror, kept).
 __global__ void kv_write_kernel(
         const __nv_bfloat16* __restrict__ X,    // [H, L, D]
         int8_t*  __restrict__ scale_exp,         // [H, nb, L]
@@ -500,27 +506,26 @@ __global__ void kv_write_kernel(
         uint8_t* __restrict__ shared,            // [H, nb, L, SB]
         int H, int L, int D, int NB, int u, int gs, int UB, int SB) {
     const int h = blockIdx.x;
+    const int blk = blockIdx.z;                            // one head_dim block per grid-z
     const int j = blockIdx.y * blockDim.x + threadIdx.x;
     if (j >= L) return;
     const int ng = 32 / gs, wbits = 8 - u;
-    for (int blk = 0; blk < NB; ++blk) {
-        float x[32];
-        const long xb = ((long)h * L + j) * D + (long)blk * 32;
-        #pragma unroll
-        for (int k = 0; k < 32; ++k) x[k] = __bfloat162float(X[xb + k]);
-        int q_upper[32], r_shared[16];
-        const int ea = ms::decompose_ms_block(x, u, gs, q_upper, r_shared);
-        const long tok = (long)(h * NB + blk) * L + j;
-        uint32_t ureg[8] = {0u,0u,0u,0u,0u,0u,0u,0u};   // <=24 packed upper bytes
-        ms::pack_codes_lsb(q_upper, 32, wbits, (uint8_t*)ureg, UB);
-        uint32_t* dU = reinterpret_cast<uint32_t*>(upper + tok * UB);  // UB,tok*UB 4-aligned
-        #pragma unroll
-        for (int w = 0; w < 8; ++w) if (w < (UB >> 2)) dU[w] = ureg[w];
-        uint8_t sbuf[8];
-        ms::pack_codes_lsb(r_shared, ng, u, sbuf, SB);
-        for (int bi = 0; bi < SB; ++bi) shared[tok * SB + bi] = sbuf[bi];
-        scale_exp[tok] = (int8_t)ea;
-    }
+    float x[32];
+    const long xb = ((long)h * L + j) * D + (long)blk * 32;
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) x[k] = __bfloat162float(X[xb + k]);
+    int q_upper[32], r_shared[16];
+    const int ea = ms::decompose_ms_block(x, u, gs, q_upper, r_shared);
+    const long tok = (long)(h * NB + blk) * L + j;
+    uint32_t ureg[8] = {0u,0u,0u,0u,0u,0u,0u,0u};         // <=24 packed upper bytes
+    ms::pack_codes_lsb(q_upper, 32, wbits, (uint8_t*)ureg, UB);
+    uint32_t* dU = reinterpret_cast<uint32_t*>(upper + tok * UB);  // UB,tok*UB 4-aligned
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) if (w < (UB >> 2)) dU[w] = ureg[w];
+    uint8_t sbuf[8];
+    ms::pack_codes_lsb(r_shared, ng, u, sbuf, SB);
+    for (int bi = 0; bi < SB; ++bi) shared[tok * SB + bi] = sbuf[bi];
+    scale_exp[tok] = (int8_t)ea;
 }
 
 // ---- KV QUANTIZE (decode append): the L=1, in-place specialization of write ---
@@ -645,8 +650,9 @@ std::vector<torch::Tensor> kv_write_cuda(
     auto scale_exp = torch::empty({H, NB, L}, i8);
     auto upper     = torch::empty({H, NB, L, UB}, u8);
     auto shared    = torch::empty({H, NB, L, SB}, u8);
-    const int TPB = 256;
-    kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB), TPB, 0, at::cuda::getCurrentCUDAStream()>>>(
+    const int TPB = 128;                                  // smaller block + grid-z=nb -> more blocks
+    kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB, (int)NB), TPB, 0,
+                      at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
         (int)H, (int)L, (int)D, (int)NB, (int)u, (int)gs, UB, SB);

@@ -592,23 +592,22 @@ __global__ void mxint8_kv_write_kernel(
         int8_t* __restrict__ qweight,            // [H, nb, L, 32]
         int H, int L, int D, int NB) {
     const int h = blockIdx.x;
+    const int blk = blockIdx.z;                           // grid-z = nb (matched occupancy fix)
     const int j = blockIdx.y * blockDim.x + threadIdx.x;
     if (j >= L) return;
-    for (int blk = 0; blk < NB; ++blk) {
-        const long xb = ((long)h * L + j) * D + (long)blk * BLOCK;
-        float amax = 1e-30f;
-        #pragma unroll
-        for (int k = 0; k < BLOCK; ++k) amax = fmaxf(amax, fabsf(__bfloat162float(X[xb + k])));
-        const int ea = ms::e8m0_exp_from_amax(amax);
-        const float s = exp2f((float)ea);
-        const long tok = (long)(h * NB + blk) * L + j;
-        #pragma unroll
-        for (int k = 0; k < BLOCK; ++k) {
-            int q = (int)rintf(__bfloat162float(X[xb + k]) / s);
-            qweight[tok * BLOCK + k] = (int8_t)max(-127, min(127, q));
-        }
-        scale_exp[tok] = (int8_t)ea;
+    const long xb = ((long)h * L + j) * D + (long)blk * BLOCK;
+    float amax = 1e-30f;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) amax = fmaxf(amax, fabsf(__bfloat162float(X[xb + k])));
+    const int ea = ms::e8m0_exp_from_amax(amax);
+    const float s = exp2f((float)ea);
+    const long tok = (long)(h * NB + blk) * L + j;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) {
+        int q = (int)rintf(__bfloat162float(X[xb + k]) / s);
+        qweight[tok * BLOCK + k] = (int8_t)max(-127, min(127, q));
     }
+    scale_exp[tok] = (int8_t)ea;
 }
 
 // Matched MXINT8 decode-append: quantize one new token X[H,D] into qweight cache
@@ -765,8 +764,9 @@ std::vector<torch::Tensor> mxint8_kv_write_cuda(
     auto i8 = X.options().dtype(torch::kInt8);
     auto scale_exp = torch::empty({H, NB, L}, i8);
     auto qweight   = torch::empty({H, NB, L, BLOCK}, i8);
-    const int TPB = 256;
-    mxint8_kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB), TPB, 0, at::cuda::getCurrentCUDAStream()>>>(
+    const int TPB = 128;                                  // matched: grid-z=nb occupancy fix
+    mxint8_kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB, (int)NB), TPB, 0,
+                             at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), (int)H, (int)L, (int)D, (int)NB);
     return {scale_exp, qweight};
