@@ -1207,6 +1207,23 @@ MSAQ 포맷에서는 **활성화도 weight/KV와 동일한 mantissa-sharing**으
 - write·append plane 모두 `pack_kv`에 **byte-exact**(scale_exp/upper/shared diff 0, 모든 u/gs). append는 토큰별로 채운 cache(Lcap=L)가 통째 write와 동일함을 확인.
 - end-to-end write/append → kv_decode → oracle **rel_fro 1.6e-3** (< 2e-2). 게이트: `test_kv_write_vs_pack`, `test_kv_write_then_decode_vs_oracle`, `test_kv_append_vs_pack`, `test_kv_append_then_decode_vs_oracle`.
 
+## 성능 (KV write/append, H=32 D=128, warm) — vs MXINT8·BF16
+KV write (prefill, 전체 [H,L,D] → 캐시, MSAQ u4):
+| L | MSAQ | MXINT8 | BF16 | MSAQ/MX | MSAQ/BF16 |
+|---|------|--------|------|---------|-----------|
+| 1024 | 101µs | 130µs | 23µs | **0.78** | 4.3 |
+| 2048 | 193µs | 226µs | 43µs | **0.85** | 4.5 |
+| 4096 | 326µs | 370µs | 83µs | **0.88** | 3.9 |
+- **MSAQ < MXINT8** (0.78~0.91): bf16 로드+amax+양자화는 동일하지만 MSAQ는 packed plane(u4 ≈ 32원소/4.5B)을 store, MXINT8은 full int8(32B) → **store 대역폭 ~7× 적음** → decompose 비용 상쇄하고 이김.
+- vs BF16 ~4×: bf16 캐시는 순수 memcpy(양자화 없음). prefill 1회 비용이고 decode read에서 회수(read가 매 스텝).
+
+KV append (decode, 단일 토큰 [H,D] → slot, Lcap=4096):
+| u | MSAQ | MXINT8 | BF16 copy | MSAQ/MX |
+|---|------|--------|-----------|---------|
+| u2 | 10.5µs | 8.8µs | 17.5µs | 1.20 |
+| u4 | 8.7µs | 8.7µs | 16.1µs | 1.00 |
+- work = H·nb = 128 스레드 → **launch-latency 지배**(~8~17µs ≈ 커널 런치). 알고리즘 차이가 아니라 런치 비용(MSAQ/MXINT8가 torch generic `copy_`보다 빠른 것도 런치 오버헤드 차이). 배포 시 projection/RoPE epilogue나 attention prologue에 **fuse** 대상.
+
 ## W+A GEMV (decode) — `w_gemv.cu wa_gemv_wide_kernel` + `wa_gemv_cuda`
 - W-only wide GEMV(column-major plane + bfe(u4)/streaming(u2u3) unpack)에 **활성화도 MSAQ-s로 양자화**한 버전. Stage 0 pre-pass(`ms_launch_quant_act_msaq`, M=1)가 x[K]를 int8 word `qx=q_upper·2^u+r_shared` + 블록 base exp `sa_exp[NB]`로 분해(W+A GEMM의 활성화 prepass 재사용). qw unpack은 W-only와 **바이트 동일**; 유일한 차이는 누적: 블록마다 **정수 dot** `idot=Σ qw·qx`(int8·int8→int32) 후 두 블록 스케일을 **한 번** fold(`acc += idot·sw·sa`) — 원소당 float madd가 아님. sw는 (blk,o)별(weight), sa는 blk별(activation, 컬럼 공유).
 - matched `mxint8_wa_gemv`: plain-MXINT8 활성화 prepass(`ms_launch_quant_act`) + 동일 int-dot. 두 operand 모두 full int8(decompose 없음) = W+A decode scope의 matched baseline. (활성화 MSAQ-s vs MXINT8 포맷 차이는 Phase 27의 규약대로 baseline에 미러하지 않음.)
