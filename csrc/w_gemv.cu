@@ -28,6 +28,11 @@
 #include <type_traits>
 #include "core/ms_utils.cuh"
 
+// MSAQ-s activation pre-pass (defined in wa_gemm.cu): bf16 X[M,K] -> int8 word
+// qX[M,K] + base exp sa_exp[M,nb]. The W+A GEMV calls it with M=1.
+void ms_launch_quant_act_msaq(const __nv_bfloat16* X, int8_t* qX, int8_t* sa_exp,
+                              int M, int K, int NB, int u, int gs);
+
 namespace {
 
 constexpr int BLOCK = 32;
@@ -254,6 +259,98 @@ __global__ void wonly_gemv_wide_kernel(
     partial[(long)sp * OUT + o] = acc;
 }
 
+// ---- W+A GEMV (decode): wide-load skeleton + int dot ------------------------
+//   The W-only wide GEMV above with the activation ALSO quantized (MSAQ-s).
+//   A separate pre-pass (ms_launch_quant_act_msaq, M=1) decomposes x[K] into the
+//   int8 word qx[k] = q_upper*2^u + r_shared and the per-block base exp sa_exp[blk]
+//   (the activation analog of the weight word). The unpack of qw is byte-identical
+//   to W-only; the ONLY change is the accumulation: per block we run an INTEGER
+//   dot idot = sum_k qw*qx (int8*int8 -> int32) and fold the two block scales ONCE
+//   at the end (acc += idot * sw * sa) instead of a float madd per element. sw is
+//   per (blk,o) (weight), sa is per blk (activation, shared across columns).
+//   (change.md Phase 28.)
+template<bool U4>
+__global__ void wa_gemv_wide_kernel(
+        const int8_t*  __restrict__ qx,          // [K]    activation int8 word (MSAQ-s)
+        const int8_t*  __restrict__ sa_exp,      // [NB]   activation block base exp
+        const int8_t*  __restrict__ scale_exp,   // [NB, OUT]    weight base exp
+        const uint8_t* __restrict__ upper_cm,    // [NB, OUT, UB]   column-major
+        const uint8_t* __restrict__ shared_cm,   // [NB, OUT, SB]
+        float* __restrict__ partial,             // [splitK, OUT]
+        int OUT, int NB, int u, int gs, int UB, int SB, int splitK) {
+    const int o   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp  = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK;
+    const int b0  = sp * per, b1 = min(b0 + per, NB);
+    const int gs_shift = __ffs(gs) - 1;
+    float acc = 0.0f;
+
+    if constexpr (U4) {
+        if (o >= OUT) return;
+        for (int blk = b0; blk < b1; ++blk) {
+            const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const float sa = ms::e8m0_to_scale(sa_exp[blk]);
+            uint8_t sb[8];
+            const long sbase = ((long)blk * OUT + o) * SB;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = shared_cm[sbase + i];
+            const uint4 up4 = *reinterpret_cast<const uint4*>(
+                                  upper_cm + ((long)blk * OUT + o) * UB);
+            const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+            const int8_t* qxb = qx + blk * BLOCK;
+            int idot = 0;
+            #pragma unroll
+            for (int k = 0; k < BLOCK; ++k) {
+                const int up_code = ms::bfe_s32((int)uw[k >> 3], (k & 7) * 4, 4);
+                const int g = k >> gs_shift;
+                const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                const int w = up_code * 16 + sh_code;
+                idot += w * (int)qxb[k];
+            }
+            acc += (float)idot * sw * sa;
+        }
+    } else {
+        if (o >= OUT) return;
+        const int wbits = 8 - u;
+        const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+        const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+        for (int blk = b0; blk < b1; ++blk) {
+            const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const float sa = ms::e8m0_to_scale(sa_exp[blk]);
+            const long sbase = ((long)blk * OUT + o) * SB;
+            uint32_t sreg[3] = {0u,0u,0u};
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (i < SB) sreg[i >> 2] |= (uint32_t)shared_cm[sbase + i] << (8 * (i & 3));
+            uint32_t ureg[6] = {0u,0u,0u,0u,0u,0u};
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(
+                                      upper_cm + ((long)blk * OUT + o) * UB);
+            #pragma unroll
+            for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+            const int gsmask = gs - 1;
+            uint64_t ubuf = 0; int unb = 0, uwi = 0;
+            uint64_t sbuf = 0; int snb = 0, swi = 0;
+            int sh_code = 0;
+            const int8_t* qxb = qx + blk * BLOCK;
+            int idot = 0;
+            for (int k = 0; k < BLOCK; ++k) {
+                if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+                const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+                ubuf >>= wbits; unb -= wbits;
+                if ((k & gsmask) == 0) {
+                    if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+                    sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+                    sbuf >>= u; snb -= u;
+                }
+                const int w = up_code * (1 << u) + sh_code;
+                idot += w * (int)qxb[k];
+            }
+            acc += (float)idot * sw * sa;
+        }
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
 } // namespace
 
 // Host launcher. Signature matches ms_lib.ops.wonly_gemv / the pybind schema.
@@ -324,6 +421,46 @@ torch::Tensor wonly_gemv_wide_cuda(
         wonly_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
+    };
+    if ((int)u == 4) launch(std::true_type{});
+    else             launch(std::false_type{});
+
+    gemv_combine_kernel<<<blocks, threads>>>(
+        partial.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+
+// W+A GEMV: MSAQ-s activation pre-pass (Stage 0) + wide-load int-dot GEMV. x is
+// the bf16 decode vector [K]; weights are the column-major planes (same as wide).
+torch::Tensor wa_gemv_cuda(
+        torch::Tensor x, torch::Tensor scale_exp,
+        torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    const int wbits = 8 - (int)u;
+    const int UB = BLOCK * wbits / 8;
+    const int SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
+    const int K = (int)NB * BLOCK;
+
+    // Stage 0: quantize the activation vector once (M=1) -> int8 word + base exp.
+    auto qx = torch::empty({K}, x.options().dtype(torch::kInt8));
+    auto sa_exp = torch::empty({NB}, x.options().dtype(torch::kInt8));
+    ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                             qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(),
+                             1, K, (int)NB, (int)u, (int)gs);
+
+    auto y = torch::empty({OUT}, x.options());
+    const int threads = 128;
+    const int blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
+
+    auto launch = [&](auto U4tag) {
+        wa_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads>>>(
+            qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
             upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
             partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
     };

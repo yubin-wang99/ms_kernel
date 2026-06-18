@@ -15,8 +15,8 @@
 import numpy as np
 import pytest
 
-from ms_lib.pack import BLOCK, pack_weight, dequant_weight
-from ms_lib.reference import wa_matmul, quant_act
+from ms_lib.pack import BLOCK, pack_weight, pack_weight_mxint8, dequant_weight
+from ms_lib.reference import wa_matmul, wa_matmul_mxint8, quant_act
 from conftest import rel_fro, bf16np, REL_FRO_TOL, requires_kernel
 
 
@@ -47,4 +47,36 @@ def test_wa_gemm_vs_oracle(rng, cfg):
     Xt = torch.from_numpy(X).to(torch.bfloat16).cuda()
     got = ops.wa_gemm(p, Xt).float().cpu().numpy()
     ref = wa_matmul(p, bf16np(X), share_act=True)   # MSAQ path: activation is MSAQ-s
+    assert rel_fro(got, ref) < REL_FRO_TOL
+
+
+# ---- 3. W+A decode GEMV: MSAQ-s activation pre-pass + wide-load int-dot ------
+@requires_kernel
+def test_wa_gemv_vs_oracle(rng, cfg):
+    import torch
+    from ms_lib import ops
+    u, gs = cfg
+    OUT, K = 256, 512
+    W = (rng.standard_normal((OUT, K)) * rng.uniform(0.2, 4.0, (OUT, 1))).astype(np.float32)
+    p = pack_weight(W, u, gs)
+    x = rng.standard_normal(K).astype(np.float32)
+    xt = torch.from_numpy(x).to(torch.bfloat16).cuda()
+    got = ops.wa_gemv(p, xt).float().cpu().numpy()
+    ref = wa_matmul(p, bf16np(x)[None], share_act=True)[0]   # MSAQ-s activation
+    assert rel_fro(got, ref) < REL_FRO_TOL
+
+
+# ---- 4. matched MXINT8 W+A GEMV baseline (plain int8 activation + int-dot) ---
+@requires_kernel
+def test_mxint8_wa_gemv_vs_oracle(rng, cfg):
+    import torch
+    from ms_lib import ops
+    u, gs = cfg
+    OUT, K = 256, 512
+    W = (rng.standard_normal((OUT, K)) * rng.uniform(0.2, 4.0, (OUT, 1))).astype(np.float32)
+    pm = pack_weight_mxint8(W)
+    x = rng.standard_normal(K).astype(np.float32)
+    xt = torch.from_numpy(x).to(torch.bfloat16).cuda()
+    got = ops.mxint8_wa_gemv(pm, xt).float().cpu().numpy()
+    ref = wa_matmul_mxint8(pm, bf16np(x)[None])[0]           # plain MXINT8 activation
     assert rel_fro(got, ref) < REL_FRO_TOL

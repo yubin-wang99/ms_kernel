@@ -65,6 +65,34 @@ __global__ void mxint8_gemv_combine_kernel(
     y[o] = __float2bfloat16(acc);
 }
 
+// Matched MXINT8 W+A GEMV: plain-MXINT8 activation pre-pass + int dot. Mirror of
+// the MSAQ wa_gemv (same int idot=sum qw*qx fold) but both operands are full
+// int8 (no decompose) -> the matched baseline for the W+A decode scope.
+__global__ void mxint8_wa_gemv_kernel(
+        const int8_t* __restrict__ qx,           // [K]    activation int8 (MXINT8)
+        const int8_t* __restrict__ sa_exp,       // [NB]   activation base exp
+        const int8_t* __restrict__ scale_exp,    // [NB, OUT]    weight base exp
+        const int8_t* __restrict__ qweight,      // [NB, 32, OUT]
+        float* __restrict__ partial,             // [splitK, OUT]
+        int OUT, int NB, int splitK) {
+    const int o  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y;
+    if (o >= OUT) return;
+    const int per = (NB + splitK - 1) / splitK;
+    const int b0 = sp * per, b1 = min(b0 + per, NB);
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const float sa = ms::e8m0_to_scale(sa_exp[blk]);
+        int idot = 0;
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k)
+            idot += (int)qweight[(blk * BLOCK + k) * OUT + o] * (int)qx[blk * BLOCK + k];
+        acc += (float)idot * sw * sa;
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
 // ---- W-only prefill GEMM — SHARED-MEMORY TILED, matched to wa_gemm.cu --------
 //   Same tiling as the MSAQ kernel; only the B-tile load differs (direct int8 vs
 //   unpack), keeping the comparison matched.
@@ -618,6 +646,31 @@ torch::Tensor mxint8_gemv_cuda(
                                 x.options().dtype(torch::kFloat32));
     mxint8_gemv_splitk_kernel<<<dim3(blocks, splitK), threads>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
+        partial.data_ptr<float>(), (int)OUT, (int)NB, splitK);
+    mxint8_gemv_combine_kernel<<<blocks, threads>>>(
+        partial.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+
+// Matched MXINT8 W+A GEMV: plain-MXINT8 activation pre-pass (ms_launch_quant_act)
+// + int-dot GEMV. x is bf16 [K]; weight qweight[NB,32,OUT] + scale_exp[NB,OUT].
+torch::Tensor mxint8_wa_gemv_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight,
+        int64_t OUT, int64_t NB) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    const int K = (int)NB * BLOCK;
+    auto qx = torch::empty({K}, x.options().dtype(torch::kInt8));
+    auto sa_exp = torch::empty({NB}, x.options().dtype(torch::kInt8));
+    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                        qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), 1, K, (int)NB);
+    auto y = torch::empty({OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB);
+    auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
+    mxint8_wa_gemv_kernel<<<dim3(blocks, splitK), threads>>>(
+        qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(),
         scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
         partial.data_ptr<float>(), (int)OUT, (int)NB, splitK);
     mxint8_gemv_combine_kernel<<<blocks, threads>>>(

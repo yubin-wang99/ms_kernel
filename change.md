@@ -1206,3 +1206,17 @@ MSAQ 포맷에서는 **활성화도 weight/KV와 동일한 mantissa-sharing**으
 ## 검증
 - write·append plane 모두 `pack_kv`에 **byte-exact**(scale_exp/upper/shared diff 0, 모든 u/gs). append는 토큰별로 채운 cache(Lcap=L)가 통째 write와 동일함을 확인.
 - end-to-end write/append → kv_decode → oracle **rel_fro 1.6e-3** (< 2e-2). 게이트: `test_kv_write_vs_pack`, `test_kv_write_then_decode_vs_oracle`, `test_kv_append_vs_pack`, `test_kv_append_then_decode_vs_oracle`.
+
+## W+A GEMV (decode) — `w_gemv.cu wa_gemv_wide_kernel` + `wa_gemv_cuda`
+- W-only wide GEMV(column-major plane + bfe(u4)/streaming(u2u3) unpack)에 **활성화도 MSAQ-s로 양자화**한 버전. Stage 0 pre-pass(`ms_launch_quant_act_msaq`, M=1)가 x[K]를 int8 word `qx=q_upper·2^u+r_shared` + 블록 base exp `sa_exp[NB]`로 분해(W+A GEMM의 활성화 prepass 재사용). qw unpack은 W-only와 **바이트 동일**; 유일한 차이는 누적: 블록마다 **정수 dot** `idot=Σ qw·qx`(int8·int8→int32) 후 두 블록 스케일을 **한 번** fold(`acc += idot·sw·sa`) — 원소당 float madd가 아님. sw는 (blk,o)별(weight), sa는 blk별(activation, 컬럼 공유).
+- matched `mxint8_wa_gemv`: plain-MXINT8 활성화 prepass(`ms_launch_quant_act`) + 동일 int-dot. 두 operand 모두 full int8(decompose 없음) = W+A decode scope의 matched baseline. (활성화 MSAQ-s vs MXINT8 포맷 차이는 Phase 27의 규약대로 baseline에 미러하지 않음.)
+
+## 검증·성능 (OUT=K=4096, warm)
+- 게이트 `test_wa_gemv_vs_oracle`(MSAQ-s, `wa_matmul(share_act=True)`) + `test_mxint8_wa_gemv_vs_oracle`(`wa_matmul_mxint8`) 모두 통과(rel_fro < 2e-2, 모든 u/gs).
+
+| u | MSAQ | MXINT8 | MSAQ/MX |
+|---|------|--------|---------|
+| u2 | 47.6µs | 40.5µs | 1.17 |
+| u3 | 46.6µs | 40.5µs | 1.15 |
+| u4 | 33.2µs | 40.5µs | **0.82** |
+- W-only GEMV와 **동일한 crossover 프로파일**: u4만 win(wide int4 load + nibble bfe), u2/u3는 streaming unpack 비용이 int-dot 위에 그대로 남아 not-win. 활성화 prepass(M=1)는 공유되어 비교에 중립.

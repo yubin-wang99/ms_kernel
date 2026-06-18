@@ -80,6 +80,18 @@ def wonly_gemv(p, x_bf16):
                            int(p["u"]), int(p["gs"]))
 
 
+def wa_gemv(p, x_bf16):
+    """W+A decode GEMV. p from pack_weight; x_bf16 [K] -> y [OUT] bf16. Activation
+    quantized to MSAQ-s on the fly (pre-pass), weight wide-load int-dot."""
+    _require()
+    dev = x_bf16.device
+    s = torch.from_numpy(p["scale_exp"]).to(dev)
+    up_cm = torch.from_numpy(p["upper_cm"]).to(dev)
+    sh_cm = torch.from_numpy(p["shared_cm"]).to(dev)
+    return _OPS.wa_gemv(x_bf16, s, up_cm, sh_cm,
+                        int(p["OUT"]), int(p["nb"]), int(p["u"]), int(p["gs"]))
+
+
 def wonly_gemm(p, X_bf16):
     """W-only prefill GEMM. p from pack_weight; X_bf16 [M,K] -> Y [M,OUT] bf16."""
     _require()
@@ -121,6 +133,12 @@ def mxint8_gemv(p, x_bf16):
     _require()
     s, qw = _mxint8_weight_planes(p, x_bf16.device)
     return _OPS.mxint8_gemv(x_bf16, s, qw, int(p["OUT"]), int(p["nb"]))
+
+
+def mxint8_wa_gemv(p, x_bf16):
+    _require()
+    s, qw = _mxint8_weight_planes(p, x_bf16.device)
+    return _OPS.mxint8_wa_gemv(x_bf16, s, qw, int(p["OUT"]), int(p["nb"]))
 
 
 def mxint8_gemm(p, X_bf16):
