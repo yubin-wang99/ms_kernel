@@ -1,68 +1,73 @@
-# End-to-End Harness 결과 (Llama-3.1-8B, RTX 3090)
+# End-to-End Harness 결과 (Llama-3.1-8B, RTX 3090) — CUDA-graph, 4 시나리오
 
 `tests/harness.py` 실측. 32-layer full forward, **prefill=800 / decode=3880**, GQA 32Q:8KV,
-vocab 128256. glue(RMSNorm·RoPE·SwiGLU·SDPA)는 bf16 공통. 시간 단위 ms(별도 표기 외).
-설계·가정은 [harness_design.md](harness_design.md), 커널별 분석은 [kernel_ver1.md](kernel_ver1.md).
+vocab 128256. glue(RMSNorm·RoPE·SwiGLU·SDPA)는 bf16 공통. 시간 ms(별도 표기 외).
+설계는 [harness_design.md](harness_design.md), 커널별 분석은 [kernel_ver1.md](kernel_ver1.md).
 
-## 전체 표
+**측정 방식:** decode TPOT는 **CUDA graph**로 측정(스텝 1개를 컨텍스트 체크포인트마다 capture→replay
+→trajectory 적분)해 Python per-op dispatch 오버헤드를 제거. weight/KV 양자화를 **독립 knob**으로
+분리해 4가지 시나리오로 적용 대상별 기여를 격리. (반복 graph capture가 같은 프로세스의 다음 eager
+prefill을 wedge해서 시나리오마다 **별도 subprocess**로 격리.)
 
-| 경로 | TTFT | TPOT(mean) | total | /bf16 | /mxint8 |
-|------|------|-----------|-------|-------|---------|
-| bf16 | **272** | 41.4 | 161.1s | 1.00 | — |
-| mxint8_wonly | 1615 | 31.6 | 124.2s | 0.77 | — |
-| mxint8_wa | 1594 | 26.0 | 102.4s | 0.64 | — |
-| msaq_wonly-u2 | 1726 | 28.4 | 112.1s | 0.70 | 0.90 |
-| msaq_wonly-u3 | 1706 | 28.1 | 110.7s | 0.69 | 0.89 |
-| **msaq_wonly-u4** | 1504 | **24.4** | **96.1s** | **0.60** | **0.77** |
-| msaq_wa-u2 | 1485 | 29.9 | 117.3s | 0.73 | 1.15 |
-| msaq_wa-u3 | 1454 | 28.6 | 112.6s | 0.70 | 1.10 |
-| msaq_wa-u4 | 1215 | 26.1 | 102.7s | 0.64 | 1.00 |
+## 4 시나리오 (각각 bf16 baseline 대비 / 같은 시나리오의 MXINT8 대비)
 
-> total = TTFT + Σ decode. decode 3880 ≫ prefill 800이라 **TPOT가 total을 지배**.
-> `/mxint8`은 같은 변형(wonly↔wonly, wa↔wa)의 MXINT8 대비.
+| 시나리오 | 양자화 대상 | 포맷 | TTFT | TPOT | total | /bf16 | /mxint8 |
+|---------|-----------|------|------|------|-------|-------|---------|
+| baseline | 없음 | bf16 | 275 | 37.4 | 145.5s | 1.00 | — |
+| **S1 W-only** | weight | MXINT8 | 1601 | 37.2 | 145.8s | **1.00** | — |
+| | | MSAQ-u4 | 1499 | 29.5 | 115.9s | **0.80** | 0.79 |
+| **S2 W+A** | weight+act | MXINT8 | 1586 | 32.8 | 129.0s | 0.89 | — |
+| | | MSAQ-u4 | 1210 | 29.9 | 117.1s | 0.80 | 0.91 |
+| **S3 KV-only** | KV cache | MXINT8 | 279 | 25.9 | 100.6s | 0.69 | — |
+| | | MSAQ-u4 | 279 | 23.9 | 93.0s | **0.64** | 0.92 |
+| **S4 W-only+KV** | weight+KV | MXINT8 | 1601 | 25.6 | 100.8s | 0.69 | — |
+| | | **MSAQ-u4** | 1503 | **16.1** | **64.1s** | **0.44** | **0.64** |
 
-## TPOT 성장곡선 (스텝별 순간 TPOT, ms) — 핵심 그림
+## TPOT 성장곡선 (graph, ms) — 컨텍스트별 순간 per-step
 
-| 경로 | t=1 | t=256 | t=1024 | t=2048 | t=3880 |
-|------|-----|-------|--------|--------|--------|
-| bf16 | 34.8 | 34.9 | 35.1 | 41.0 | **53.2** |
-| mxint8_wonly | 33.1 | 32.1 | 32.3 | 28.6 | 31.8 |
-| mxint8_wa | 27.7 | 25.5 | 25.8 | 25.2 | 27.5 |
-| **msaq_wonly-u4** | 25.0 | 24.3 | 24.1 | 24.2 | **25.0** |
-| msaq_wa-u4 | 26.7 | 26.3 | 26.2 | 25.8 | 26.5 |
+| 경로 | ctx 801 | 1056 | 1824 | 2848 | 4680 |
+|------|------|------|------|------|------|
+| bf16 baseline | 26.9 | 28.3 | 32.4 | 38.1 | **47.9** |
+| S1 W-only mxint8 | 26.6 | 28.0 | 32.2 | 37.8 | 47.6 |
+| S1 W-only msaq-u4 | 19.0 | 20.4 | 24.6 | 30.1 | 39.8 |
+| S3 KV-only mxint8 | 22.9 | 23.3 | 24.5 | 26.0 | 28.8 |
+| S3 KV-only msaq-u4 | 22.4 | 22.7 | 23.2 | 24.0 | 25.3 |
+| **S4 W-only+KV msaq-u4** | **14.7** | 14.9 | 15.5 | 16.2 | **17.6** |
 
-- **bf16는 컨텍스트가 길어질수록 TPOT가 급증**(34.8→53.2ms): KV 캐시가 커지며 매 스텝 KV read
-  대역폭이 폭증. **msaq u4는 거의 평탄**(25.0→25.0): packed KV(~0.6B/elem)라 KV read가 길어져도
-  싸게 유지. → **긴 컨텍스트일수록 MSAQ 이득이 벌어진다**(설계 가설 확인). u2/u3은 streaming
-  unpack이 무거워 후반에 다소 상승(24→33), u4만 평탄.
+## 해석 — 적용 대상별 기여가 분리됨
 
-## 해석
+1. **weight 양자화는 baseline을 낮추고, KV 양자화는 성장곡선을 평탄화한다.** 둘은 직교:
+   - **bf16**: ctx 길어지며 26.9→47.9ms (KV read 폭증).
+   - **S3 KV-only(msaq)**: 22.4→25.3ms **평탄** — KV만 줄여도 성장 제거(긴 컨텍스트 decode의 진짜 병목).
+   - **S1 W-only(msaq)**: 19.0→39.8ms — baseline은 낮지만 KV가 bf16이라 **여전히 성장**.
+   - **S4 둘 다(msaq)**: 14.7→17.6ms — **가장 낮고 가장 평탄**. 두 이득이 곱해짐.
 
-1. **최고 end-to-end: `msaq_wonly-u4` = bf16의 0.60×, MXINT8의 0.77×** (총 161→96s).
-   decode가 memory-bound라 W-only GEMV(u4) + 작은 KV read가 총시간을 끌어내림.
+2. **최고 = S4 W-only+KV MSAQ-u4: bf16의 0.44×, MXINT8의 0.64×** (145.5s→**64.1s**).
+   weight·KV 양자화가 **compound**(TPOT 37.4→16.1ms). end-to-end 핵심 결과.
 
-2. **TTFT는 bf16 압승(0.27s vs 양자화 1.2~1.7s).** prefill은 compute-bound이고 bf16은 cuBLAS
-   텐서코어를, 양자화는 커스텀 IMMA/타일 커널(~5–6× 느림)을 쓴다. 하지만 decode 3880스텝이
-   total을 지배해 **양자화가 total에서 역전**.
+3. **MXINT8 W-only는 end-to-end 이득이 0 (S1 mxint8 = 1.00×bf16).** MXINT8 GEMV는 cuBLAS bf16
+   GEMV와 거의 동속(커널벤치 47 vs 46µs)이라 decode를 못 줄인다. 반면 **MSAQ W-only는 0.80** —
+   wide-load u4 GEMV(커널 0.66×cuBLAS)가 cuBLAS를 이겨서 실제로 baseline을 내린다. → **W-only
+   scope에서 MSAQ가 MXINT8보다 명백히 가치 있다(0.79).**
 
-3. **W-only vs W+A (방향이 갈림):**
-   - **MSAQ:** wonly-u4(96s) > wa-u4(102.7s). decode GEMV가 지배하는데 W-only GEMV(커널 0.63)가
-     W+A GEMV(0.82)보다 빠르고, prefill 비중은 작아 wonly가 total 우위.
-   - **MXINT8:** wa(102.4s) > wonly(124.2s). MXINT8는 W+A에서 INT8 IMMA(prefill)+int-dot(decode)로
-     양쪽 다 가속 → wa가 우위.
+4. **KV-only(S3)만으로도 0.64~0.69** — weight를 bf16로 둬도 KV 양자화가 긴 컨텍스트 decode를 크게
+   가속(TTFT는 bf16 그대로 279ms 유지 → prefill 손해 없이 decode 이득만). MSAQ KV가 MXINT8보다
+   약간 우위(0.92, packed KV가 더 적은 read).
 
-4. **MSAQ vs MXINT8 (동일 변형):**
-   - **W-only: MSAQ 완승** (u4 0.77, u2/u3 0.89~0.90). 적은 KV·weight read가 그대로 이득.
-   - **W+A: 박빙** (u4 1.00, u2/u3 1.10~1.15). W+A decode GEMV는 u4만 crossover하고 u2/u3은
-     streaming unpack 비용이 남아 MXINT8과 비슷하거나 약간 뒤짐 — 커널 단위 결과와 일치.
+5. **MSAQ vs MXINT8 (시나리오별):** S1 W-only **0.79**(완승) · S2 W+A 0.91 · S3 KV 0.92 ·
+   S4 W+KV **0.64**(두 scope의 이득이 곱해져 격차 최대). 커널 단위 결과(W-only GEMV·KV dequant에서
+   MSAQ 우위)가 end-to-end로 그대로 누적.
 
-5. **결론:** 디코드 지배 워크로드(긴 생성)에서 **mantissa-sharing(u4)이 end-to-end로 이긴다.**
-   가장 강한 조합은 **W-only u4**(KV·weight read 절감이 평탄한 TPOT로 직결). 짧은 프롬프트·긴
-   생성일수록(이 시나리오: 800/3880) 이득이 크고, 컨텍스트가 길수록 더 벌어진다.
+6. **TTFT 트레이드오프:** weight를 양자화하는 S1·S2·S4는 prefill GEMM이 cuBLAS 대신 커스텀
+   IMMA/타일이라 TTFT 1.2~1.6s(bf16 0.28s 대비 ~5×). **KV-only(S3)는 bf16 weight라 TTFT 손해 0.**
+   decode 3880이 total을 지배해 weight-quant도 total에선 이득이지만, **짧은 생성**이면 KV-only가
+   TTFT까지 안전한 선택.
 
-## 주의(측정의 한계)
+## 이전(Python-loop) 대비
+이전 coupled-run의 W-only+KV(=S4) MSAQ-u4는 0.60×bf16이었으나, **CUDA graph로 dispatch
+오버헤드를 제거하니 0.44×**로 더 벌어짐 — Python 루프의 per-op dispatch가 TPOT를 부풀려 비율을
+1.0쪽으로 희석했음을 확인. graph 측정이 커널의 실제 이득을 드러낸다.
 
-- autoregressive decode가 Python 루프 구동이라 절대 TPOT에 **per-op dispatch 오버헤드**가 포함된다
-  (모든 경로 공통 → 비율은 유효하나 절대 비율은 커널 단위(0.54~0.63)보다 1.0쪽으로 희석).
-  실제 fused 엔진(CUDA graph)이면 격차가 더 벌어질 것.
-- 타이밍 하니스: 가중치 랜덤·레이어 재사용(타이밍은 값과 무관), glue·lm_head는 bf16 공통.
+## 주의
+타이밍 하니스: 가중치 랜덤·레이어 재사용(타이밍은 값 무관), glue·lm_head는 bf16 공통. graph는 스텝당
+back-to-back 커널 시간(dispatch-free)을 재고, total은 trajectory 적분.

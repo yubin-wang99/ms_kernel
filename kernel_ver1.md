@@ -203,10 +203,12 @@ decode가 그대로 append/read한다.
 - append는 단독으로 의미 있는 시간이 아니므로 fuse하여 TPOT 오버헤드를 0에 가깝게 만든다.
 - 세 KV 커널이 단일 포맷을 공유하므로, prefill→decode 전환에서 캐시 재포맷 비용이 없다.
 
-### 실측 (Llama-3.1-8B full forward, prefill=800/decode=3880 — [harness_results.md])
-위 융합을 실제로 구현·측정한 결과: **최고 경로 `msaq_wonly-u4`가 bf16의 0.60×, MXINT8의
-0.77×**(총 161→96s). decode가 total을 지배하고, decode 경로(GEMV·KV read)가 memory-bound라
-mantissa-sharing(u4)이 직접 총시간을 끌어내린다. TPOT 성장곡선이 결정적 — bf16은 컨텍스트가
-길어지며 34.8→53.2ms로 폭증하지만 msaq u4는 25.0ms로 평탄(packed KV read가 길어져도 쌈) →
-**긴 컨텍스트일수록 이득이 벌어진다.** prefill(TTFT)은 cuBLAS를 쓰는 bf16이 빠르나(양자화 IMMA가
-~5–6× 느림), decode 3880스텝이 total을 지배해 역전된다.
+### 실측 (Llama-3.1-8B full forward, prefill=800/decode=3880, CUDA-graph — [harness_results.md])
+위 융합을 실제로 구현·측정(weight/KV 양자화를 독립 적용하는 4 시나리오, dispatch-free graph):
+- **최고 = W-only+KV MSAQ-u4: bf16의 0.44×, MXINT8의 0.64×**(145.5s→64.1s). weight·KV 양자화가
+  **compound**(TPOT 37.4→16.1ms).
+- **weight 양자화는 baseline을 낮추고, KV 양자화는 TPOT 성장곡선을 평탄화**(직교): bf16은 ctx
+  801→4680에서 27→48ms 폭증, KV-only(msaq)는 22→25ms 평탄, 둘 다면 15→18ms.
+- **W-only scope에서 MSAQ가 MXINT8 대비 명확히 가치(0.79)**: MXINT8 GEMV는 cuBLAS와 동속이라
+  end-to-end 이득 0(S1 mxint8=1.00)이지만, MSAQ wide-load u4 GEMV는 cuBLAS를 이겨 0.80.
+- KV-only만으로 0.64(TTFT는 bf16 유지). prefill(TTFT)은 cuBLAS bf16이 빠르나 decode가 total 지배.

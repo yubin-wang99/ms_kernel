@@ -1261,3 +1261,28 @@ KV append (decode, 단일 토큰 [H,D] → slot, Lcap=4096):
 - W-only/W+A: MSAQ는 **wonly-u4**가 최강(decode GEMV 0.63), MXINT8은 wa가 최강(IMMA+int-dot).
   MSAQ vs MXINT8 — W-only 완승(0.77~0.90), W+A 박빙(u4 1.00).
 - 한계: Python 루프 decode라 절대 TPOT에 dispatch 오버헤드 포함(공통)→비율은 커널단위(0.54~0.63)보다 희석.
+
+# Phase 30 — CUDA-graph 측정 + weight/KV 양자화 분리(4 시나리오)
+
+dispatch 오버헤드 제거 위해 decode TPOT를 **CUDA graph**로 측정. 발견·수정: 모든 커널이 **default
+stream**에 런치돼 graph capture가 **빈 그래프**가 됐음(capture는 current stream 감시) → 31개 런치
+전부 `at::cuda::getCurrentCUDAStream()`로 수정(stream 정합성 버그이기도). 반복 capture가 같은
+프로세스의 다음 eager prefill을 wedge → 시나리오마다 **subprocess 격리**. weight/KV 양자화를 독립
+knob으로 분리해 4 시나리오(S1 W-only/S2 W+A/S3 KV-only/S4 W-only+KV) 측정. 전체 [harness_results.md].
+
+## 핵심 결과 (graph, prefill=800/decode=3880)
+| 시나리오 | 포맷 | TPOT | total | /bf16 | /mxint8 |
+|---------|------|------|-------|-------|---------|
+| baseline | bf16 | 37.4 | 145.5s | 1.00 | — |
+| S1 W-only | MXINT8 | 37.2 | 145.8s | **1.00** | — |
+| S1 W-only | MSAQ-u4 | 29.5 | 115.9s | 0.80 | **0.79** |
+| S3 KV-only | MSAQ-u4 | 23.9 | 93.0s | 0.64 | 0.92 |
+| **S4 W-only+KV** | **MSAQ-u4** | **16.1** | **64.1s** | **0.44** | **0.64** |
+
+- **weight 양자화=baseline↓, KV 양자화=성장곡선 평탄화(직교)**. bf16 ctx별 27→48ms 폭증,
+  KV-only(msaq) 22→25 평탄, 둘 다 15→18 최저·최평탄.
+- **최고 S4 MSAQ-u4 0.44×bf16** (weight·KV 이득 compound).
+- **MXINT8 W-only=이득 0**(GEMV가 cuBLAS와 동속)인데 **MSAQ W-only=0.80**(wide u4 GEMV가 cuBLAS
+  를 이김) → W-only scope에서 MSAQ가 MXINT8 대비 0.79로 명확히 가치.
+- graph로 dispatch 제거하니 이전 coupled-run의 0.60(S4 상당)이 **0.44로 더 벌어짐** → Python 루프가
+  비율을 희석했음 확인.
