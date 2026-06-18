@@ -53,7 +53,44 @@ element 취급의 일부이며 별도 비대칭 없음.
   16 vs 3**과 **qx-staging 유무**는 *수치적으로 다른 설정*임을 명시. (qx-staging은 MSAQ의
   unpack-stall을 풀어주는 것이라 mantissa-sharing-유도 lever로 정당화. change.md P31 참조.)
 
-### 🟥 KV read (dequant attention) — 최적화 수준 비대칭 (가장 주의)
+### ✅🟥 KV read (dequant attention) — 비대칭 **해결**, 그리고 공정 결과의 진실
+**해결:** MXINT8 KV read를 MSAQ와 동일하게 **thread-per-key**(in-thread q·K dot, 워프
+reduction 제거)로 올렸다(`mxint8_kv_split_kernel`, 정확도 GQA rel_fro 1.7e-3). 이제 두 KV read는
+Pass-1 매핑까지 동일하고, **element 취급(int8 직읽 vs sub-byte 언팩)만** 다르다.
+
+**비대칭의 실제 크기(정량화):** thread-per-key로 올리니 **MXINT8 KV read가 ~2× 빨라졌다**
+(Lk=4680 254→**120µs**, Lk=2848 137→**76µs**). 즉 이전 MSAQ의 KV-read "압승"(u4 0.41~0.77)은
+**거의 전부 이 최적화 비대칭의 산물**이었고 mantissa-sharing 효과가 아니었다.
+
+**공정 비교 결과(둘 다 thread-per-key):**
+| Lk | u4 /mx | u2 /mx |
+|----|--------|--------|
+| 1056 | 1.04 | 1.83 |
+| 2848 | 1.03 | 1.46 |
+| 4680 | 1.01 | 1.64 |
+→ **u4는 거의 정확히 tie(1.01~1.04, 미세 손해), u2/u3는 명확히 손해.** MSAQ KV read는 공정
+비교에서 **이기지 못한다.**
+
+**왜 못 이기나(근본):** wide 커널은 u4 언팩을 이미 ~2µs 안으로 숨긴다(MSAQ 225µs vs MXINT8
+223µs). 그런데 이 커널은 **~66 GB/s**로 돌아 **BW-bound가 아니라 latency/compute-bound**다(스칼라
+flash-decode, 텐서코어 미사용). BW-bound가 아니면 "바이트를 덜 읽는" 이점이 시간에 반영되지 않는다
+→ u4는 정확히 tie, u2/u3은 추가 언팩만큼 손해. (split-K를 늘리면 per-block 오버헤드가 적은 MXINT8이
+더 이득 → 오히려 MSAQ가 더 짐.)
+
+**MSAQ가 이기는 유일한 국면 = BW-bound attention.** decode attention은 KV 캐시를 1회만 읽어
+(재사용 없음) 본질적으로 memory-bound여야 한다. 제대로 된 FlashDecoding(텐서코어 MMA로 Q·K^T,
+P·V) 커널이면 BW-bound가 되고, 거기서 MSAQ u4는 바이트 비율 그대로 **~0.56×**로 이긴다. 현재
+스칼라 커널은 66 GB/s(BW의 7~8× 부족)라 그 국면에 도달하지 못한다. → **공정한 MSAQ KV 우위는
+BW-bound(텐서코어) flash-decode 재작성이 전제**이며, 이는 양 포맷 모두에 대한 대규모 작업이다.
+
+<details><summary>(원래 적출된 비대칭 — 기록용)</summary>
+
+원래 문제: MSAQ는 thread-per-key(wide, Phase 18)인데 MXINT8 KV read만 구버전 warp-per-key+
+`__shfl` reduction에 남아 있었음. thread-per-key의 "워프 reduction 제거"는 format-무관 최적화라
+MXINT8에도 적용돼야 공정 → 위에서 적용·정량화 완료.
+</details>
+
+### (구) 🟥 KV read 비대칭 — 상세(해결 전)
 | 항목 | MSAQ `kv_decode_wide_kernel` | MXINT8 `mxint8_kv_split_kernel` |
 |------|------|------|
 | Pass-1 매핑 | **thread-per-key**(키별 in-thread dot, 워프 reduction **없음**), kv_attention.cu:367 | **warp-per-key**(lane=d, `__shfl` reduction), mxint8.cu:526 |
@@ -76,9 +113,11 @@ element 취급의 일부이며 별도 비대칭 없음.
 ---
 
 ## 요약 — 무엇이 진짜 "element 취급 외 차이"인가
-1. **🟥 KV read 매핑(thread-per-key vs warp-per-key)** — 유일하게 결과를 편향시킬 수 있는 비대칭.
-   thread-per-key의 "워프 reduction 제거" 부분이 format-무관인데 MXINT8엔 미적용. **권장: MXINT8
-   KV read를 thread-per-key로 맞춘 뒤 S3/S4 재측정.**
+1. **✅ KV read 매핑 — 해결됨.** MXINT8을 thread-per-key로 올려 Pass-1까지 동일하게 맞춤.
+   정량화 결과 그 비대칭이 **~2× MXINT8 KV read를 가렸었고**, 공정 비교에선 **MSAQ KV read가
+   u4에서 tie(1.01~1.04)·u2/u3에서 손해** → 이전 KV "압승"은 산물. 공정한 MSAQ KV 우위는
+   **BW-bound(텐서코어) flash-decode**에서만 성립(스칼라 커널은 latency-bound라 바이트 절약이
+   시간에 안 나타남). 상세는 위 KV read 절.
 2. **⚠️ GEMV split-K mult(16 vs 3), qx-staging 유무** — 각자 최적(best-vs-best)이라 방어 가능하나
    "동일 설정"은 아님. 명시 필요.
 3. **⚠️ GEMV 레이아웃/적재폭, KV read 적재폭** — packed 포맷이 강제하는 불가피한 차이(각자 coalesced).
@@ -86,6 +125,9 @@ element 취급의 일부이며 별도 비대칭 없음.
 5. **✅ scale 처리, GEMM 전부, KV write/append 구조, 누적기** — matched.
 6. **(D) W+A 활성화 포맷(MSAQ-s vs MXINT8)** — 의도된 문서화 차이.
 
-**결론:** scale을 포함한 대부분은 element 취급에만 차이가 있고 공정하다. 단 **KV read의 thread-per-key
-vs warp-per-key**는 format-무관 최적화가 MSAQ에만 들어간 비대칭이라, KV를 포함한 시나리오(S3·S4)의
-MSAQ 우위를 다소 과대평가할 수 있다 — 이것만 MXINT8쪽도 올리면 비교가 완전히 깨끗해진다.
+**결론:** scale을 포함한 대부분은 element 취급에만 차이가 있고 공정하다. **KV read의 매핑 비대칭은
+해결**(MXINT8도 thread-per-key)했고, 그 결과 **이전 KV "압승"은 ~2× MXINT8 under-optimization
+산물**이었음이 드러났다 — 공정 비교에선 MSAQ KV read가 u4 tie·u2/u3 손해다. 따라서 **KV를 포함한
+시나리오(S3·S4)의 종전 수치는 MSAQ를 과대평가**했으며, 공정 커널로 재측정이 필요하다(아래 진행 중).
+MSAQ가 KV read를 공정하게 이기려면 스칼라 flash-decode를 **BW-bound(텐서코어 MMA)**로 재작성해야
+한다 — 그때 비로소 "바이트를 덜 읽는" 이점이 시간으로 환원된다(u4 ~0.56× 기대).
