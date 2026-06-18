@@ -202,3 +202,11 @@ decode가 그대로 append/read한다.
 - prefill 경로는 compute-bound라, W+A를 INT8 IMMA 2-stage로 돌려야 TTFT에서 이득이 난다.
 - append는 단독으로 의미 있는 시간이 아니므로 fuse하여 TPOT 오버헤드를 0에 가깝게 만든다.
 - 세 KV 커널이 단일 포맷을 공유하므로, prefill→decode 전환에서 캐시 재포맷 비용이 없다.
+
+### 실측 (Llama-3.1-8B full forward, prefill=800/decode=3880 — [harness_results.md])
+위 융합을 실제로 구현·측정한 결과: **최고 경로 `msaq_wonly-u4`가 bf16의 0.60×, MXINT8의
+0.77×**(총 161→96s). decode가 total을 지배하고, decode 경로(GEMV·KV read)가 memory-bound라
+mantissa-sharing(u4)이 직접 총시간을 끌어내린다. TPOT 성장곡선이 결정적 — bf16은 컨텍스트가
+길어지며 34.8→53.2ms로 폭증하지만 msaq u4는 25.0ms로 평탄(packed KV read가 길어져도 쌈) →
+**긴 컨텍스트일수록 이득이 벌어진다.** prefill(TTFT)은 cuBLAS를 쓰는 bf16이 빠르나(양자화 IMMA가
+~5–6× 느림), decode 3880스텝이 total을 지배해 역전된다.

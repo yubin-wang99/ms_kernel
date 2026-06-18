@@ -1237,3 +1237,27 @@ KV append (decode, 단일 토큰 [H,D] → slot, Lcap=4096):
 | u3 | 46.6µs | 40.5µs | 1.15 |
 | u4 | 33.2µs | 40.5µs | **0.82** |
 - W-only GEMV와 **동일한 crossover 프로파일**: u4만 win(wide int4 load + nibble bfe), u2/u3는 streaming unpack 비용이 int-dot 위에 그대로 남아 not-win. 활성화 prepass(M=1)는 공유되어 비교에 중립.
+
+# Phase 29 — End-to-end harness (Llama-3.1-8B full forward) 결과
+
+7종 커널을 실제 Llama-3.1-8B 32-layer 디코더에 끼워 TTFT·TPOT·총시간 측정. GQA(32Q:8KV)
+지원을 위해 decode attention에 `num_kv_heads` 추가(q head→kv head h/group), 고정용량 KV 캐시를
+위해 plane stride `Lcap`을 attended `Lk`와 분리(둘 다 게이트 통과). 설계 [harness_design.md],
+전체 결과·곡선 [harness_results.md].
+
+## 핵심 결과 (prefill=800, decode=3880, RTX 3090)
+| 경로 | TTFT | TPOT | total | /bf16 | /mxint8 |
+|------|------|------|-------|-------|---------|
+| bf16 | 272ms | 41.4ms | 161.1s | 1.00 | — |
+| mxint8_wonly | 1615ms | 31.6ms | 124.2s | 0.77 | — |
+| mxint8_wa | 1594ms | 26.0ms | 102.4s | 0.64 | — |
+| **msaq_wonly-u4** | 1504ms | **24.4ms** | **96.1s** | **0.60** | **0.77** |
+| msaq_wa-u4 | 1215ms | 26.1ms | 102.7s | 0.64 | 1.00 |
+
+- **최고 = msaq_wonly-u4: bf16의 0.60×, MXINT8의 0.77×.** decode가 지배(3880≫800).
+- **TPOT 성장곡선**: bf16 34.8→53.2ms(KV 커지며 폭증) vs msaq u4 25.0→25.0ms(packed KV로 평탄)
+  → **긴 컨텍스트일수록 MSAQ 이득↑**(설계 가설 확인).
+- **TTFT는 bf16 압승**(cuBLAS prefill vs 커스텀 IMMA ~5–6× 느림)이나 decode가 total 지배해 역전.
+- W-only/W+A: MSAQ는 **wonly-u4**가 최강(decode GEMV 0.63), MXINT8은 wa가 최강(IMMA+int-dot).
+  MSAQ vs MXINT8 — W-only 완승(0.77~0.90), W+A 박빙(u4 1.00).
+- 한계: Python 루프 decode라 절대 TPOT에 dispatch 오버헤드 포함(공통)→비율은 커널단위(0.54~0.63)보다 희석.
