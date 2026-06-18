@@ -1131,3 +1131,23 @@ weight unpack만 남아 **이미 P23에서 푼 W-only GEMM + int8 epilogue**로 
   그 충돌을 없애 W+A를 W-only로 환원 → crossover 상속. **이제 4 scope(GEMV·KV·W-only GEMM·W+A) 전부 전 u
   추월**(W+A는 IMMA 2-stage 기본).
 - 배포 시 선-패스는 상류(layernorm/직전 GEMM) epilogue로 fuse하면 비용 0. 벤치는 forward마다 발생하므로 타이밍 포함.
+
+## 세부 병목 분해 (MSAQ wa_imma, M=512, us; MS_WA_DIAG로 구간 격리)
+| u | full | St0 quant | epilogue(store+scale) | MMA+qX-load | **B-stage(weight read)** | bytes/blk |
+|---|------|-----------|------------------------|-------------|--------------------------|-----------|
+| u2 | 2386 | 17 (0.7%) | 247 (10%) | 638 (27%) | **1501 (63%)** | 25 |
+| u3 | 2328 | 17 | 258 | 626 | **1444 (62%)** | 22 |
+| u4 | 1975 | 17 | 305 (15%) | 653 | **1082 (55%)** | 18 |
+
+**핵심 (무엇이 무엇에 숨는가):**
+- **B-stage 비용이 weight 바이트 수에 정확히 비례**: 60us/byte (u2 1501/25, u4 1082/18, MXINT8 1887/32=59).
+  → **weight unpack(ALU)은 INT8 MMA 그림자에 100% 숨었고**, B-stage는 순수 **weight-memory-bound**. MSAQ가
+  바이트를 덜 읽는 만큼(u4 18 vs 32) 그대로 시간이 줄어 crossover. (unpack이 병목이면 u2가 u4보다 훨씬 느려야
+  하는데, 시간차는 정확히 바이트차 = unpack 무관.)
+- **Stage 0(활성화 양자화)은 17us=0.7%** — 선-패스로 분리해 GEMM 파이프라인과 자원 경쟁 안 함(P23 충돌 해소의 직접 증거).
+- **per-block epilogue(store_matrix_sync + sa·sw scale) = 10~15%** — 남은 주 오버헤드(P24를 죽였던 것이 이제
+  분할상환돼 ~12%로 축소). fragment를 레지스터에서 직접 스케일하는 fused epilogue(CUTLASS)로 더 줄일 여지.
+- MMA+qX-load = ~27% (tensor-core 본선 + 가벼운 int8 활성화 로드).
+
+**요약**: 커널은 이제 **weight-memory-bound**(B-stage 55~63%)라 MSAQ의 바이트 절약이 시간으로 직결. 숨김 관계는
+(1) weight unpack → INT8 MMA 뒤, (2) 활성화 양자화 → 별도 선-패스(GEMM 밖). 남은 레버는 epilogue(~12%)뿐.

@@ -428,7 +428,10 @@ __global__ void wa_imma(
         const int8_t* __restrict__ qX, const int8_t* __restrict__ sa_exp,
         const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper,
         const uint8_t* __restrict__ shared, __nv_bfloat16* __restrict__ Y,
-        int M, int OUT, int K, int NB, int u, int gs, int UB, int SB) {
+        int M, int OUT, int K, int NB, int u, int gs, int UB, int SB, int diag = 0) {
+    // diag (MS_WA_DIAG): 1 = skip per-block epilogue (store+scale); 2 = skip the
+    // B-stage weight unpack+read (Bs=0). full - diag1 = epilogue cost; full - diag2
+    // = B-stage exposed cost (~0 if the unpack hides behind the MMA).
     __shared__ int8_t  As[2][64][32];
     __shared__ int8_t  Bs[2][64][32];
     __shared__ int32_t Cs[64][64];
@@ -446,9 +449,9 @@ __global__ void wa_imma(
         }
         for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // weight unpack (heavy)
             const int oc = idx >> 5, k = idx & 31, o = o0 + oc;
-            Bs[buf][oc][k] = (o < OUT)
+            Bs[buf][oc][k] = (diag == 2) ? (int8_t)0 : ((o < OUT)
                 ? (int8_t)ms::unpack_ms_weight_elem(upper, shared, blk, o, k, OUT, u, gs, UB, SB)
-                : (int8_t)0;
+                : (int8_t)0);
         }
         if (tid < 64) {
             const int o = o0 + tid;
@@ -480,6 +483,7 @@ __global__ void wa_imma(
                 for (int j = 0; j < 2; ++j) wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
         }
         if (blk + 1 < NB) stage(blk + 1, nxt);                    // next unpack — overlaps the MMA
+        if (diag == 1) { __syncthreads(); continue; }             // skip epilogue (isolate its cost)
         #pragma unroll
         for (int i = 0; i < 2; ++i)
             #pragma unroll
@@ -603,11 +607,12 @@ torch::Tensor wa_gemm_cuda(
     auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
     ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
                         qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
+    int diag = 0; if (const char* d = getenv("MS_WA_DIAG")) diag = atoi(d);
     // Stage 1: pure int8 IMMA GEMM
     wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(
         qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
         upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
-        (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
+        (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB, diag);
     return Y;
 }
