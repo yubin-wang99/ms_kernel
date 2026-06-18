@@ -194,6 +194,76 @@ __global__ void mxint8_gemm_wmma(
         }
 }
 
+// ---- W-only WMMA, SOFTWARE-PIPELINED — matched to wonly_gemm_wmma_pipe --------
+//   Same double-buffered overlap (next tile staged while current tile's MMA runs);
+//   only the B-tile load differs (direct int8 vs MSAQ unpack). Opt-in MS_TILE_CFG=11.
+__global__ void mxint8_gemm_wmma_pipe(
+        const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
+        const int8_t* __restrict__ qweight, __nv_bfloat16* __restrict__ Y,
+        int M, int OUT, int K, int NB) {
+    __shared__ __nv_bfloat16 As[2][64][WSK];
+    __shared__ __nv_bfloat16 Bs[2][64][WSK];
+    __shared__ float tmp[4][16][16];
+    const int m0 = blockIdx.y * 64, o0 = blockIdx.x * 64;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wM = warp >> 1, wN = warp & 1;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    auto stage = [&](int b, int buf) {
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[buf][m][k] = (m0 + m < M) ? X[(long)(m0 + m) * K + b * BLOCK + k]
+                                         : __float2bfloat16(0.0f);
+        }
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int oc = idx / BLOCK, k = idx % BLOCK, o = o0 + oc;
+            float v = 0.0f;
+            if (o < OUT) v = (float)qweight[(b * BLOCK + k) * OUT + o]
+                           * ms::e8m0_to_scale(scale_exp[b * OUT + o]);
+            Bs[buf][oc][k] = __float2bfloat16(v);
+        }
+    };
+
+    stage(0, 0);
+    __syncthreads();
+    for (int blk = 0; blk < NB; ++blk) {
+        const int cur = blk & 1, nxt = cur ^ 1;
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[cur][wM*32 + i*16][wk*16], WSK);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[cur][wN*32 + j*16][wk*16], WSK);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        if (blk + 1 < NB) stage(blk + 1, nxt);
+        __syncthreads();
+    }
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            wmma::store_matrix_sync(wt, acc[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int mb = m0 + wM*32 + i*16, ob = o0 + wN*32 + j*16;
+            for (int e = lane; e < 256; e += 32) {
+                const int m = mb + e / 16, o = ob + e % 16;
+                if (m < M && o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(wt[e]);
+            }
+            __syncwarp();
+        }
+}
+
 // ---- W+A GEMM (int8 weight direct + on-the-fly MXINT8 activation, int dot) ---
 // SHARED-MEMORY TILED W+A, matched to wa_gemm.cu (only the B-tile differs:
 // direct int8 vs unpack). As folds sa (activation), Bs folds sw (weight).
@@ -432,7 +502,9 @@ torch::Tensor mxint8_gemm_cuda(
     scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), \
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB
-    if (tile_cfg((int)M) == 10)     // BF16 tensor-core (WMMA), matched to MSAQ
+    if (tile_cfg((int)M) == 11)     // BF16 WMMA software-pipelined, matched to MSAQ
+        mxint8_gemm_wmma_pipe<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(ARGS);
+    else if (tile_cfg((int)M) == 10)  // BF16 tensor-core (WMMA), matched to MSAQ
         mxint8_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(ARGS);
     else
         DISPATCH_TILE(mxint8_gemm_tiled);
@@ -449,7 +521,7 @@ torch::Tensor mxint8_wa_gemm_cuda(
     scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), \
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB
-    DISPATCH_TILE(mxint8_wa_gemm_tiled);
+    DISPATCH_TILE(mxint8_wa_gemm_tiled);   // matched W+A WMMA-pipe removed (MSAQ lost — P23)
 #undef ARGS
     return Y;
 }

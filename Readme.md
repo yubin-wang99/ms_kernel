@@ -42,11 +42,14 @@ RTX 3090 (sm_86), warm cross-measured (clock-/order-verified —
 `tests/kv_clock_verify.py`); bit-exact vs the certified path; all GPU +
 emulation tests pass. Full settings (sizes, regimes, timing procedure) in
 [`methodology.md`](methodology.md). The prefill GEMM / W+A kernels beat MXINT8 at u4 (0.92–0.93×)
-and lag slightly at u2/u3 (1.02–1.07×, FP32-tiled → FMA-bound). BF16 WMMA
-(opt-in, matched) makes both ~1.5× faster and *widens* u4's win (0.89×) but
-does **not** cross u2/u3 (1.14–1.17×): the faster matmul exposes the per-element
-unpack, which only a cp.async-hidden-unpack pipeline (CUTLASS-grade) closes — see
-`change.md` Phase 22.
+and lag slightly at u2/u3 (1.02–1.07×, FP32-tiled → FMA-bound). A **software-
+pipelined BF16 WMMA** (opt-in `MS_TILE_CFG=11`, matched) that overlaps the next
+tile's streaming-unpack with the current tile's tensor-core MMA crosses **W-only
+GEMM at every `u`** (u2 0.98×, u3 0.98×, u4 0.93×) and is ~1.6× faster than the
+FP32 tile. **W+A** does not cross there — its activation quant already fills the
+stage budget, leaving no room to hide the unpack (it stays FP32-tiled at
+1.02–1.04×, near-parity; an INT8-IMMA epilogue is the next lever). See `change.md`
+Phase 22–23.
 Full phase-by-phase history (split-K → coalescing → two-pass → cp.async →
 wide-load → streaming unpack) and the 4-kernel scoreboard are in `change.md`.
 

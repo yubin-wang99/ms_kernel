@@ -271,6 +271,124 @@ __global__ void wonly_gemm_wmma(
         }
 }
 
+// ---- W-only prefill WMMA, SOFTWARE-PIPELINED (cp.async-style overlap) --------
+//   The plain WMMA stage is stage(unpack ALL) -> sync -> matmul -> sync, so the
+//   per-element unpack ALU and the tensor-core MMA run SERIALLY -> staging-bound
+//   (P22: the fast matmul exposes the u2/u3 unpack). Double-buffer As/Bs and, in
+//   each K-step, issue the CURRENT tile's MMA first, then unpack the NEXT tile
+//   into the other buffer: the unpack (ALU + its global byte loads) overlaps the
+//   MMA (tensor-core pipe) -> the unpack hides behind the matmul (the lever P22
+//   flagged). Matched mxint8_gemm_wmma_pipe has the same shape (int8 stage), so
+//   the comparison stays fair. Opt-in via MS_TILE_CFG=11.
+// Stream-dequant one weight column to a bf16 row (for the pipelined WMMA stage):
+// gather the column's UB upper + SB shared bytes once, rolling-bit-buffer emit 32
+// codes (shared advanced per group). Cheaper ALU than per-element straddle; uses
+// 64 of 128 threads, but here the stage OVERLAPS the MMA, so its lower width is
+// hidden — the win is the smaller total work. Same dense bytes -> bit-exact.
+__device__ __forceinline__ void dequant_col_stream_bf16(
+        const uint8_t* __restrict__ upper, const uint8_t* __restrict__ shared,
+        int blk, int o, int OUT, int u, int gs, int UB, int SB,
+        float scale, __nv_bfloat16* dst) {
+    const int wbits = 8 - u;
+    const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+    const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+    const int gsmask = gs - 1;
+    uint32_t ureg[6] = {0u,0u,0u,0u,0u,0u};
+    #pragma unroll
+    for (int bi = 0; bi < 24; ++bi)
+        if (bi < UB) ureg[bi >> 2] |= (uint32_t)upper[((long)blk*UB + bi)*OUT + o] << (8*(bi&3));
+    uint32_t sreg[3] = {0u,0u,0u};
+    #pragma unroll
+    for (int bi = 0; bi < 8; ++bi)
+        if (bi < SB) sreg[bi >> 2] |= (uint32_t)shared[((long)blk*SB + bi)*OUT + o] << (8*(bi&3));
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) {
+        if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+        ubuf >>= wbits; unb -= wbits;
+        if ((k & gsmask) == 0) {
+            if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+            sbuf >>= u; snb -= u;
+        }
+        dst[k] = __float2bfloat16((float)(up_code * (1 << u) + sh_code) * scale);
+    }
+}
+
+__global__ void wonly_gemm_wmma_pipe(
+        const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper, const uint8_t* __restrict__ shared,
+        __nv_bfloat16* __restrict__ Y,
+        int M, int OUT, int K, int NB, int u, int gs, int UB, int SB) {
+    __shared__ __nv_bfloat16 As[2][64][WSK];
+    __shared__ __nv_bfloat16 Bs[2][64][WSK];
+    __shared__ float tmp[4][16][16];
+    const int m0 = blockIdx.y * 64, o0 = blockIdx.x * 64;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wM = warp >> 1, wN = warp & 1;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    // stage block `b` (As=X, Bs=dequant W) into shared buffer `buf`
+    auto stage = [&](int b, int buf) {
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[buf][m][k] = (m0 + m < M) ? X[(long)(m0 + m) * K + b * BLOCK + k]
+                                         : __float2bfloat16(0.0f);
+        }
+        for (int oc = tid; oc < 64; oc += 128) {     // column-streaming unpack (hidden by MMA)
+            const int o = o0 + oc;
+            if (o < OUT) {
+                const float sc = ms::e8m0_to_scale(scale_exp[b * OUT + o]);
+                dequant_col_stream_bf16(upper, shared, b, o, OUT, u, gs, UB, SB, sc, &Bs[buf][oc][0]);
+            } else {
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = __float2bfloat16(0.0f);
+            }
+        }
+    };
+
+    stage(0, 0);
+    __syncthreads();
+    for (int blk = 0; blk < NB; ++blk) {
+        const int cur = blk & 1, nxt = cur ^ 1;
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {        // CURRENT tile MMA (tensor core)
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[cur][wM*32 + i*16][wk*16], WSK);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[cur][wN*32 + j*16][wk*16], WSK);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        if (blk + 1 < NB) stage(blk + 1, nxt);           // NEXT tile unpack — overlaps the MMA
+        __syncthreads();
+    }
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            wmma::store_matrix_sync(wt, acc[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int mb = m0 + wM*32 + i*16, ob = o0 + wN*32 + j*16;
+            for (int e = lane; e < 256; e += 32) {
+                const int m = mb + e / 16, o = ob + e % 16;
+                if (m < M && o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(wt[e]);
+            }
+            __syncwarp();
+        }
+}
+
 // Tile-config dispatch. Swept optimum (RTX 3090, OUT=4096) is M-ADAPTIVE: a
 // 128x128 tile reuses best but yields too few blocks (OUT/128=32 < 82 SMs) until
 // M fills the second grid dim, so small M prefers 64x64 (more blocks). Crossover
@@ -320,7 +438,9 @@ torch::Tensor wonly_gemm_cuda(
     scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(), \
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
-    if (tile_cfg((int)M) == 10)     // BF16 tensor-core (WMMA) path
+    if (tile_cfg((int)M) == 11)     // BF16 WMMA, software-pipelined (unpack hidden behind MMA)
+        wonly_gemm_wmma_pipe<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(ARGS);
+    else if (tile_cfg((int)M) == 10)  // BF16 tensor-core (WMMA) path
         wonly_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(ARGS);
     else
         DISPATCH_TILE(wonly_gemm_tiled);
@@ -340,7 +460,7 @@ torch::Tensor wa_gemm_cuda(
     scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(), \
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
-    DISPATCH_TILE(wa_gemm_tiled);
+    DISPATCH_TILE(wa_gemm_tiled);   // W+A WMMA-pipe was tried; lost (see change.md P23)
 #undef ARGS
     return Y;
 }

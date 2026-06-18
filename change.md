@@ -974,3 +974,42 @@ streaming이 staging thread를 64개로 줄이고 streaming 레지스터(ureg/sr
 - u2/u3 진짜 crossover는 **cp.async로 unpack을 load 그늘에 숨기는 CUTLASS-급 파이프라인**
   (custom iterator의 load()에 unpack 주입 + 큰 타일 + double-buffer)이 필요 — 별도 대형 작업.
   (matched WMMA infra는 opt-in으로 보존; default는 FP32 tiled 유지해 headline 비교 불변.)
+
+---
+
+# Phase 23 — cp.async-style 파이프라인으로 GEMM u2/u3 crossover ✅ (W-only 성공 / W+A 실패)
+
+P22가 가리킨 레버: unpack을 matmul 그늘에 숨기기. (literal cp.async 대신 **double-buffer +
+stage↔MMA overlap**으로 같은 효과.)
+
+## W-only GEMM — 성공 (cfg=11 opt-in)
+`wonly_gemm_wmma_pipe`: As/Bs를 **double-buffer**하고, 루프에서 **현재 타일 MMA를 먼저 발행 →
+다음 타일을 stage**(unpack). stage(ALU/load)가 MMA(tensor core, 다른 pipe)와 겹쳐 unpack이 숨음.
++ stage의 Bs는 **column-streaming unpack**(P20, 싼 ALU). matched `mxint8_gemm_wmma_pipe`도 동형.
+
+| u | FP32 (default) | plain WMMA(P22) | **WMMA-pipe(P23)** |
+|---|----------------|-----------------|--------------------|
+| u2 | 1.07 | 1.17 | **0.98 ✅** |
+| u3 | 1.06 | 1.13 | **0.98 ✅** |
+| u4 | 0.91 | 0.89 | **0.93 ✅** |
+
+- **세 u 모두 MXINT8 추월**(0.93~0.98), cuBLAS 격차 ~8× → **5.3×**, FP32 대비 절대 ~1.6× 빠름.
+- **두 수정이 모두 필요**: pipeline만(1.09), streaming만(비-pipe 1.82=occupancy 붕괴),
+  **합치면 0.98** — streaming의 싼-but-좁은(64 thread) stage가 MMA 그늘에 숨어 병렬성 손실이
+  무의미해짐. (P21에서 streaming이 FP32 tiled에 손해였던 건 거긴 FMA-bound라 stage가 안 숨었기 때문.)
+- 재인증 `test_w`(cfg=11) 통과, rel 1.7e-3.
+
+## W+A GEMM — 실패 (시도 후 제거)
+`wa_gemm_wmma_pipe`(activation quant를 thread-per-row로 stage에 추가) + matched MXINT8도 구현.
+**MSAQ 비율 악화**: streaming 1.27~1.30 / per-element 1.34~1.40 (FP32 1.02~1.04보다 나쁨).
+- 원인: W+A stage는 **activation quant(amax→sa→requant, X 2회 읽기)가 이미 stage 예산을 다 씀**.
+  거기에 weight unpack까지 얹히면 MSAQ stage > MMA 예산 → 안 숨음. MXINT8은 quant만(Bs는 싼 int8)
+  이라 stage < MMA → 숨어서 **MXINT8만 크게 빨라짐**(3548→2942) → 비율이 벌어짐.
+- → W+A pipe 커널·dispatch 전부 **제거**. W+A는 FP32 tiled(1.02~1.04, near-parity) 유지.
+
+## 위치 / default
+- W-only GEMM WMMA-pipe는 **opt-in(cfg=11)** 유지(64×64 고정이라 M-adaptive 검증 후 default 승격
+  가능). default는 FP32 tiled 불변(headline 비교 안정).
+- **이제 GEMV·KV·W-only GEMM이 전 u에서 MXINT8 추월.** 남은 건 W+A u2/u3(1.02~1.04, near-parity)
+  뿐 — activation quant가 stage를 점유해 unpack을 못 숨김. INT8 IMMA(quant를 epilogue scale로
+  빼서 stage를 비움)가 다음 후보.
