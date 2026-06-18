@@ -39,6 +39,7 @@
 #include <math.h>
 #include <type_traits>
 #include "core/ms_utils.cuh"
+#include <ATen/cuda/CUDAContext.h>
 
 namespace {
 
@@ -598,7 +599,7 @@ torch::Tensor kv_decode_attention_cuda(
         const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
                             + (size_t)NB * chunk * (UB + SB);   // q_sh + sc + staged V(up,sh)
         auto launch = [&](auto U4tag) {
-            kv_decode_wide_kernel<decltype(U4tag)::value><<<dim3((int)H, S), threads, smem_w>>>(
+            kv_decode_wide_kernel<decltype(U4tag)::value><<<dim3((int)H, S), threads, smem_w, at::cuda::getCurrentCUDAStream()>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
                 vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
@@ -610,14 +611,14 @@ torch::Tensor kv_decode_attention_cuda(
     } else if (cpasync) {           // hide K/V unpack behind cp.async prefetch
         const size_t smem_cp = (size_t)((int)D + CP_CHUNK) * sizeof(float)
                              + (size_t)2 * 2 * (NB * CP_CHUNK * (UB + SB));   // 2 buf x (K+V)(up+sh)
-        kv_decode_cpasync_kernel<<<dim3((int)H, S), threads, smem_cp>>>(
+        kv_decode_cpasync_kernel<<<dim3((int)H, S), threads, smem_cp, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
             part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
             (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, sm_scale, diag);
     } else {
-        kv_decode_split_kernel<<<dim3((int)H, S), threads, smem>>>(
+        kv_decode_split_kernel<<<dim3((int)H, S), threads, smem, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
@@ -625,7 +626,7 @@ torch::Tensor kv_decode_attention_cuda(
             (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, sm_scale);
     }
 
-    kv_decode_combine_kernel<<<(int)H, threads>>>(
+    kv_decode_combine_kernel<<<(int)H, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         (int)H, (int)D, S);
@@ -645,7 +646,7 @@ std::vector<torch::Tensor> kv_write_cuda(
     auto upper     = torch::empty({H, NB, L, UB}, u8);
     auto shared    = torch::empty({H, NB, L, SB}, u8);
     const int TPB = 256;
-    kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB), TPB>>>(
+    kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB), TPB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
         (int)H, (int)L, (int)D, (int)NB, (int)u, (int)gs, UB, SB);
@@ -663,7 +664,7 @@ void kv_append_cuda(
     const int UB = BLOCK * wbits / 8;
     const int SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
     const int total = (int)(H * NB), TPB = 128;
-    kv_append_kernel<<<(total + TPB - 1) / TPB, TPB>>>(
+    kv_append_kernel<<<(total + TPB - 1) / TPB, TPB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
         (int)H, (int)D, (int)NB, (int)pos, (int)Lcap, (int)u, (int)gs, UB, SB);

@@ -22,6 +22,7 @@
 #include <mma.h>
 #include <math.h>
 #include "core/ms_utils.cuh"
+#include <ATen/cuda/CUDAContext.h>
 
 // Stage-0 activation quant launcher (defined in wa_gemm.cu) — shared so the MXINT8
 // W+A path quantizes the activation identically to MSAQ (matched comparison).
@@ -461,7 +462,7 @@ static inline int tile_cfg(int M) {
 #define LAUNCH_TILE(KERN, BM, BN, RM, RN)                                        \
     KERN<BM, BN, RM, RN>                                                         \
         <<<dim3(((int)OUT + (BN) - 1) / (BN), ((int)M + (BM) - 1) / (BM)),       \
-           dim3(((BM) / (RM)) * ((BN) / (RN)))>>>(ARGS)
+           dim3(((BM) / (RM)) * ((BN) / (RN))), 0, at::cuda::getCurrentCUDAStream()>>>(ARGS)
 #define DISPATCH_TILE(KERN) do {                                                 \
     switch (tile_cfg((int)M)) {                                                  \
         case 0: LAUNCH_TILE(KERN,  32,  32, 2, 2); break;                        \
@@ -645,11 +646,11 @@ torch::Tensor mxint8_gemv_cuda(
     const int splitK = ms::gemv_splitk_count(blocks, (int)NB);
     auto partial = torch::empty({(int64_t)splitK, OUT},
                                 x.options().dtype(torch::kFloat32));
-    mxint8_gemv_splitk_kernel<<<dim3(blocks, splitK), threads>>>(
+    mxint8_gemv_splitk_kernel<<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
         partial.data_ptr<float>(), (int)OUT, (int)NB, splitK);
-    mxint8_gemv_combine_kernel<<<blocks, threads>>>(
+    mxint8_gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
     return y;
@@ -670,11 +671,11 @@ torch::Tensor mxint8_wa_gemv_cuda(
     const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
     const int splitK = ms::gemv_splitk_count(blocks, (int)NB);
     auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
-    mxint8_wa_gemv_kernel<<<dim3(blocks, splitK), threads>>>(
+    mxint8_wa_gemv_kernel<<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(),
         scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
         partial.data_ptr<float>(), (int)OUT, (int)NB, splitK);
-    mxint8_gemv_combine_kernel<<<blocks, threads>>>(
+    mxint8_gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
     return y;
@@ -690,9 +691,9 @@ torch::Tensor mxint8_gemm_cuda(
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB
     if (tile_cfg((int)M) == 11)     // BF16 WMMA software-pipelined, matched to MSAQ
-        mxint8_gemm_wmma_pipe<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(ARGS);
+        mxint8_gemm_wmma_pipe<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
     else if (tile_cfg((int)M) == 10)  // BF16 tensor-core (WMMA), matched to MSAQ
-        mxint8_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(ARGS);
+        mxint8_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
     else
         DISPATCH_TILE(mxint8_gemm_tiled);
 #undef ARGS
@@ -719,7 +720,7 @@ torch::Tensor mxint8_wa_gemm_cuda(
     auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
     ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
                         qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
-    mxint8_wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(
+    mxint8_wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
         qweight.data_ptr<int8_t>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
         (int)M, (int)OUT, (int)K, (int)NB);
@@ -743,14 +744,14 @@ torch::Tensor mxint8_kv_decode_cuda(
     auto part_m = torch::empty({H, (int64_t)S}, fopt);
     auto part_l = torch::empty({H, (int64_t)S}, fopt);
 
-    mxint8_kv_split_kernel<<<dim3((int)H, S), threads, smem>>>(
+    mxint8_kv_split_kernel<<<dim3((int)H, S), threads, smem, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
         ks.data_ptr<int8_t>(), kq.data_ptr<int8_t>(),
         vs.data_ptr<int8_t>(), vq.data_ptr<int8_t>(),
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
         (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, key_tile, S, sm);
 
-    mxint8_kv_combine_kernel<<<(int)H, threads>>>(
+    mxint8_kv_combine_kernel<<<(int)H, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         (int)H, (int)D, S);
@@ -765,7 +766,7 @@ std::vector<torch::Tensor> mxint8_kv_write_cuda(
     auto scale_exp = torch::empty({H, NB, L}, i8);
     auto qweight   = torch::empty({H, NB, L, BLOCK}, i8);
     const int TPB = 256;
-    mxint8_kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB), TPB>>>(
+    mxint8_kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB), TPB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), (int)H, (int)L, (int)D, (int)NB);
     return {scale_exp, qweight};
@@ -777,7 +778,7 @@ void mxint8_kv_append_cuda(
         int64_t H, int64_t D, int64_t NB, int64_t pos, int64_t Lcap) {
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
     const int total = (int)(H * NB), TPB = 128;
-    mxint8_kv_append_kernel<<<(total + TPB - 1) / TPB, TPB>>>(
+    mxint8_kv_append_kernel<<<(total + TPB - 1) / TPB, TPB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
         (int)H, (int)D, (int)NB, (int)pos, (int)Lcap);

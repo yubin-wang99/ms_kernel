@@ -29,6 +29,7 @@
 #include <mma.h>
 #include <math.h>
 #include "core/ms_utils.cuh"
+#include <ATen/cuda/CUDAContext.h>
 
 namespace {
 
@@ -566,13 +567,13 @@ void ms_launch_quant_act(const __nv_bfloat16* X, int8_t* qX, int8_t* sa_exp,
                          int M, int K, int NB) {
     const int tpb = 256, wpb = tpb >> 5;
     const int blocks = ((long)M * NB + wpb - 1) / wpb;
-    quant_act_kernel<<<blocks, tpb>>>(X, qX, sa_exp, M, K, NB);
+    quant_act_kernel<<<blocks, tpb, 0, at::cuda::getCurrentCUDAStream()>>>(X, qX, sa_exp, M, K, NB);
 }
 void ms_launch_quant_act_msaq(const __nv_bfloat16* X, int8_t* qX, int8_t* sa_exp,
                               int M, int K, int NB, int u, int gs) {
     const int tpb = 256, wpb = tpb >> 5;
     const int blocks = ((long)M * NB + wpb - 1) / wpb;
-    quant_act_msaq_kernel<<<blocks, tpb>>>(X, qX, sa_exp, M, K, NB, u, gs);
+    quant_act_msaq_kernel<<<blocks, tpb, 0, at::cuda::getCurrentCUDAStream()>>>(X, qX, sa_exp, M, K, NB, u, gs);
 }
 
 // torch op: MSAQ-s activation quant -> (qX int8 [M,K], sa_exp int8 [M,nb]).
@@ -599,7 +600,7 @@ static inline void gemm_dims(int64_t u, int64_t gs, int& UB, int& SB) {
 #define LAUNCH_TILE(KERN, BM, BN, RM, RN)                                        \
     KERN<BM, BN, RM, RN>                                                         \
         <<<dim3(((int)OUT + (BN) - 1) / (BN), ((int)M + (BM) - 1) / (BM)),       \
-           dim3(((BM) / (RM)) * ((BN) / (RN)))>>>(ARGS)
+           dim3(((BM) / (RM)) * ((BN) / (RN))), 0, at::cuda::getCurrentCUDAStream()>>>(ARGS)
 #define DISPATCH_TILE(KERN) do {                                                 \
     switch (tile_cfg((int)M)) {                                                  \
         case 0: LAUNCH_TILE(KERN,  32,  32, 2, 2); break;                        \
@@ -626,9 +627,9 @@ torch::Tensor wonly_gemm_cuda(
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
     if (tile_cfg((int)M) == 11)     // BF16 WMMA, software-pipelined (unpack hidden behind MMA)
-        wonly_gemm_wmma_pipe<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(ARGS);
+        wonly_gemm_wmma_pipe<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
     else if (tile_cfg((int)M) == 10)  // BF16 tensor-core (WMMA) path
-        wonly_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(ARGS);
+        wonly_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
     else
         DISPATCH_TILE(wonly_gemm_tiled);
 #undef ARGS
@@ -663,7 +664,7 @@ torch::Tensor wa_gemm_cuda(
                              (int)M, (int)K, (int)NB, (int)u, (int)gs);
     int diag = 0; if (const char* d = getenv("MS_WA_DIAG")) diag = atoi(d);
     // Stage 1: pure int8 IMMA GEMM
-    wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(
+    wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
         upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),

@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <type_traits>
 #include "core/ms_utils.cuh"
+#include <ATen/cuda/CUDAContext.h>
 
 // MSAQ-s activation pre-pass (defined in wa_gemm.cu): bf16 X[M,K] -> int8 word
 // qX[M,K] + base exp sa_exp[M,nb]. The W+A GEMV calls it with M=1.
@@ -379,12 +380,12 @@ torch::Tensor wonly_gemv_cuda(
     const bool cpasync = (OUT % 128 == 0) && !(e && atoi(e) == 0);
     if (cpasync) {                  // hide the unpack behind cp.async prefetch
         const size_t smem = (size_t)2 * ((UB + SB) * 128 + 128);
-        wonly_gemv_cpasync_kernel<<<dim3(blocks, splitK), threads, smem>>>(
+        wonly_gemv_cpasync_kernel<<<dim3(blocks, splitK), threads, smem, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
             partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
     } else {
-        wonly_gemv_splitk_kernel<<<dim3(blocks, splitK), threads>>>(
+        wonly_gemv_splitk_kernel<<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             scale_exp.data_ptr<int8_t>(),
             upper.data_ptr<uint8_t>(),
@@ -393,7 +394,7 @@ torch::Tensor wonly_gemv_cuda(
             (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
     }
 
-    gemv_combine_kernel<<<blocks, threads>>>(
+    gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
         (int)OUT, splitK);
@@ -418,7 +419,7 @@ torch::Tensor wonly_gemv_wide_cuda(
     auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
 
     auto launch = [&](auto U4tag) {
-        wonly_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads>>>(
+        wonly_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             scale_exp.data_ptr<int8_t>(),
             upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
@@ -427,7 +428,7 @@ torch::Tensor wonly_gemv_wide_cuda(
     if ((int)u == 4) launch(std::true_type{});
     else             launch(std::false_type{});
 
-    gemv_combine_kernel<<<blocks, threads>>>(
+    gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
     return y;
@@ -459,7 +460,7 @@ torch::Tensor wa_gemv_cuda(
     auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
 
     auto launch = [&](auto U4tag) {
-        wa_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads>>>(
+        wa_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
             qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
             upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
             partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
@@ -467,7 +468,7 @@ torch::Tensor wa_gemv_cuda(
     if ((int)u == 4) launch(std::true_type{});
     else             launch(std::false_type{});
 
-    gemv_combine_kernel<<<blocks, threads>>>(
+    gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
     return y;
