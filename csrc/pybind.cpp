@@ -17,7 +17,8 @@ torch::Tensor wonly_gemv_wide_cuda(
     int64_t OUT, int64_t NB, int64_t u, int64_t gs);
 
 // defined in wa_gemm.cu
-std::vector<torch::Tensor> quant_act_cuda(torch::Tensor X, int64_t M, int64_t K, int64_t NB);
+std::vector<torch::Tensor> quant_act_cuda(torch::Tensor X, int64_t M, int64_t K,
+                                          int64_t NB, int64_t u, int64_t gs);
 torch::Tensor wonly_gemm_cuda(
     torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
     int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
@@ -51,7 +52,7 @@ TORCH_LIBRARY(msaq, m) {
           "int OUT, int NB, int u, int gs) -> Tensor", &wonly_gemv_cuda);
     m.def("wonly_gemv_wide(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
           "int OUT, int NB, int u, int gs) -> Tensor", &wonly_gemv_wide_cuda);
-    m.def("quant_act(Tensor X, int M, int K, int NB) -> Tensor[]", &quant_act_cuda);
+    m.def("quant_act(Tensor X, int M, int K, int NB, int u, int gs) -> Tensor[]", &quant_act_cuda);
     m.def("wonly_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wonly_gemm_cuda);
     m.def("wa_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "

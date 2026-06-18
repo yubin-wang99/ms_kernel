@@ -1151,3 +1151,35 @@ weight unpack만 남아 **이미 P23에서 푼 W-only GEMM + int8 epilogue**로 
 
 **요약**: 커널은 이제 **weight-memory-bound**(B-stage 55~63%)라 MSAQ의 바이트 절약이 시간으로 직결. 숨김 관계는
 (1) weight unpack → INT8 MMA 뒤, (2) 활성화 양자화 → 별도 선-패스(GEMM 밖). 남은 레버는 epilogue(~12%)뿐.
+
+---
+
+# Phase 27 — W+A 활성화 양자화를 plain MXINT8 → MSAQ-s(mantissa-sharing)로 (포맷 정의 수정)
+
+MSAQ 포맷에서는 **활성화도 weight/KV와 동일한 mantissa-sharing**으로 양자화해야 한다(plain MXINT8 아님).
+지금까지 W+A의 활성화는 `round(x/sa)`(full int8)였는데, 이를 `pack.decompose`/`reference.quant_act(share=True)`
+경로(upper + 그룹-shared)로 in-kernel 구현. **scale 처리는 동일(base sa), int8 word 계산만 변경.**
+
+## 변경 (`wa_gemm.cu`만; MXINT8 baseline은 불변)
+- 새 `quant_act_msaq_kernel`(Stage-0): 1 warp/(m,blk). ① E8M0 base sa ② q_upper=clip(round(x/(sa·2^u)),
+  ±(2^(7−u)−1)) ③ residual ④ **gs-그룹 평균(warp shfl_xor)** ⑤ r_shared=clip(round(mean/sa), ±2^(u−1))
+  ⑥ qx=q_upper·2^u+r_shared. `wa_gemm_cuda`가 이 커널로 라우팅(plain은 MXINT8 path가 계속 사용).
+- `wa_gemm_tiled`(FP32-fold A/B)도 **thread-per-row decompose**로 교체(As=qx_msaq·sa).
+- `quant_act` op에 (u,gs) 추가 → MSAQ-s.
+- **matched-baseline 규율 예외**: 이건 최적화가 아니라 **포맷 차이**라 MXINT8 baseline(`mxint8.cu`)의
+  활성화는 plain MXINT8 그대로 유지. 비교의 의미 = "MSAQ-s 활성화 vs MXINT8 활성화".
+
+## 검증
+- Stage-0 출력 vs `quant_act(share=True)`: **qX·sa_exp diff 0**(전 u/gs, bit-exact to decompose).
+- W+A 커널 vs `wa_matmul(share_act=True)`: **rel 1.7e-3**(bf16 라운딩). (vs share_act=False는 3e-2~1e-1로 불일치 = 의도대로.)
+- MXINT8 baseline vs `wa_matmul_mxint8`(=MXINT8 활성화): rel 1.7e-3(불변 확인).
+- 테스트 배선: `test_wa::test_wa_gemm_vs_oracle` → share_act=True; `test_emulation::test_wa_gemm_logic` →
+  MSAQ-s 미러 + share_act=True. **117 테스트 전부 통과.**
+
+## 성능 (M=512, MSAQ-s 활성화)
+| u | MSAQ | MXINT8 | MSAQ/MX | MSAQ-s quant |
+|---|------|--------|---------|--------------|
+| u2 | 2360 | 2763 | **0.85** | 20µs (1%) |
+| u3 | 2316 | 2765 | **0.84** | 20µs |
+| u4 | 1968 | 2776 | **0.71** | 20µs |
+- decompose 양자화는 plain보다 약간 무겁지만(17→20µs) 여전히 **1%** — crossover 그대로 유지(P26의 0.70~0.84 ≈ 0.71~0.85).

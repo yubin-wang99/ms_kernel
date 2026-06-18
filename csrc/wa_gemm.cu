@@ -68,6 +68,43 @@ __global__ void quant_act_kernel(
     if (lane == 0) sa_exp[(long)m * NB + blk] = (int8_t)ea;
 }
 
+// ---- STAGE 0 (MSAQ-s): activation gets the SAME mantissa-sharing format as the
+//   weight (NOT plain MXINT8). Per 32-block: E8M0 base sa; upper code q_upper =
+//   clip(round(x / (sa*2^u))); residual r = x - q_upper*sa*2^u; shared code (one
+//   per gs-group) r_shared = clip(round(mean_g(r) / sa)); int8 word qx =
+//   q_upper*2^u + r_shared (gs elems share r_shared). Scale stays sa (base) — the
+//   sa[m]*sw[o] combine is unchanged. Bit-exact to reference.quant_act(share=True)
+//   / pack.decompose. The MXINT8 baseline keeps the plain-MXINT8 quant above:
+//   this is a FORMAT DIFFERENCE (MSAQ-s vs MXINT8 activation), not an optimization,
+//   so it is NOT mirrored into the baseline. (change.md P27.)
+__global__ void quant_act_msaq_kernel(
+        const __nv_bfloat16* __restrict__ X, int8_t* __restrict__ qX,
+        int8_t* __restrict__ sa_exp, int M, int K, int NB, int u, int gs) {
+    const int wpb = blockDim.x >> 5;
+    const int gw  = blockIdx.x * wpb + (threadIdx.x >> 5);
+    if (gw >= M * NB) return;
+    const int m = gw / NB, blk = gw % NB, lane = threadIdx.x & 31;   // lane == k in [0,32)
+    const long base = (long)m * K + (long)blk * BLOCK;
+    const float x = __bfloat162float(X[base + lane]);
+    float a = fabsf(x);                                          // 1. E8M0 base scale sa
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    int ea = (int)floorf(log2f(fmaxf(a, 1e-30f))) - (int)ms::E_MAX;
+    ea = max(-127, min(127, ea));
+    const float sa = exp2f((float)ea);
+    const float s_unshared = sa * exp2f((float)u);              // 2. coarse scale sa*2^u
+    const int qmax = (1 << (7 - u)) - 1;                        // 3. upper code (8-u bit signed)
+    const int q_upper = max(-qmax, min(qmax, (int)rintf(x / s_unshared)));
+    const float r = x - (float)q_upper * s_unshared;            // 4. residual
+    float rs = r;                                              // 5. mean over the gs-group
+    for (int o = 1; o < gs; o <<= 1) rs += __shfl_xor_sync(0xffffffffu, rs, o);
+    const float res_avg = rs / (float)gs;
+    const int smin = -(1 << (u - 1)), smax = (1 << (u - 1)) - 1; // 6. shared code (u bit signed)
+    const int r_shared = max(smin, min(smax, (int)rintf(res_avg / sa)));
+    qX[base + lane] = (int8_t)(q_upper * (1 << u) + r_shared);   // 7. int8 word
+    if (lane == 0) sa_exp[(long)m * NB + blk] = (int8_t)ea;      // 8. scale = base sa
+}
+
 // Templated shared-memory tiled W-only GEMM. <TBM,TBN> output tile, <RTM,RTN>
 // per-thread register tile; blockDim = (TBM/RTM)*(TBN/RTN). Weight unpacked ONCE
 // per tile (Bs stage) and reused by all TBM rows. Tile config swept via
@@ -178,21 +215,27 @@ __global__ void wa_gemm_tiled(
             Bs[k][oc] = v;
         }
         __syncthreads();
-        for (int m = tid; m < TBM; m += NT) {
+        for (int m = tid; m < TBM; m += NT) {       // thread-per-row MSAQ-s activation quant
             float amax = 1e-30f;
             #pragma unroll
             for (int k = 0; k < TBK; ++k) amax = fmaxf(amax, fabsf(As[k][m]));
-            float ea = floorf(log2f(amax)) - (float)ms::E_MAX;
-            ea = fmaxf(fminf(ea, 127.0f), -127.0f);
-            sa_s[m] = exp2f(ea);
-        }
-        __syncthreads();
-        for (int idx = tid; idx < TBM * TBK; idx += NT) {
-            const int m = idx / TBK, k = idx % TBK;
-            const float sa = sa_s[m];
-            int qx = (int)rintf(As[k][m] / sa);
-            qx = max(-127, min(127, qx));
-            As[k][m] = (float)qx * sa;
+            int ea = (int)floorf(log2f(amax)) - (int)ms::E_MAX;
+            ea = max(-127, min(127, ea));
+            const float sa = exp2f((float)ea); sa_s[m] = sa;
+            const float s_unshared = sa * exp2f((float)u);
+            const int qmax = (1 << (7 - u)) - 1, smin = -(1 << (u - 1)), smax = (1 << (u - 1)) - 1;
+            for (int g0 = 0; g0 < TBK; g0 += gs) {  // residual mean per gs-group -> shared code
+                float ravg = 0.0f;
+                for (int k = g0; k < g0 + gs; ++k) {
+                    const int qu = max(-qmax, min(qmax, (int)rintf(As[k][m] / s_unshared)));
+                    ravg += As[k][m] - (float)qu * s_unshared;
+                }
+                const int rsh = max(smin, min(smax, (int)rintf(ravg / (float)gs / sa)));
+                for (int k = g0; k < g0 + gs; ++k) {
+                    const int qu = max(-qmax, min(qmax, (int)rintf(As[k][m] / s_unshared)));
+                    As[k][m] = (float)(qu * (1 << u) + rsh) * sa;   // qx_msaq * sa
+                }
+            }
         }
         __syncthreads();
         #pragma unroll
@@ -516,22 +559,32 @@ static inline int tile_cfg(int M) {
 
 } // namespace
 
-// Stage-0 launcher, shared by the MSAQ and MXINT8 Stage-1 GEMMs (extern from mxint8.cu).
+// Stage-0 launchers. ms_launch_quant_act = plain MXINT8 (used by the MXINT8
+// baseline, extern from mxint8.cu). ms_launch_quant_act_msaq = MSAQ-s decompose
+// (used by the MSAQ W+A path — the activation gets the mantissa-sharing format).
 void ms_launch_quant_act(const __nv_bfloat16* X, int8_t* qX, int8_t* sa_exp,
                          int M, int K, int NB) {
     const int tpb = 256, wpb = tpb >> 5;
     const int blocks = ((long)M * NB + wpb - 1) / wpb;
     quant_act_kernel<<<blocks, tpb>>>(X, qX, sa_exp, M, K, NB);
 }
+void ms_launch_quant_act_msaq(const __nv_bfloat16* X, int8_t* qX, int8_t* sa_exp,
+                              int M, int K, int NB, int u, int gs) {
+    const int tpb = 256, wpb = tpb >> 5;
+    const int blocks = ((long)M * NB + wpb - 1) / wpb;
+    quant_act_msaq_kernel<<<blocks, tpb>>>(X, qX, sa_exp, M, K, NB, u, gs);
+}
 
-// torch op: runtime activation quant -> (qX int8 [M,K], sa_exp int8 [M,nb]).
+// torch op: MSAQ-s activation quant -> (qX int8 [M,K], sa_exp int8 [M,nb]).
 // Exposed so the benchmark can time Stage 0 alone (the pre-pass decomposition).
-std::vector<torch::Tensor> quant_act_cuda(torch::Tensor X, int64_t M, int64_t K, int64_t NB) {
+std::vector<torch::Tensor> quant_act_cuda(torch::Tensor X, int64_t M, int64_t K,
+                                          int64_t NB, int64_t u, int64_t gs) {
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
     auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
     auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
-    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
-                        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
+    ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+                             qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(),
+                             (int)M, (int)K, (int)NB, (int)u, (int)gs);
     return {qX, sa};
 }
 
@@ -602,11 +655,12 @@ torch::Tensor wa_gemm_cuda(
 #undef ARGS
         return Y;
     }
-    // Stage 0: X -> qX int8 + sa_exp int8 (one quant per element)
+    // Stage 0: X -> qX int8 + sa_exp int8 (MSAQ-s activation: mantissa-sharing)
     auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
     auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
-    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
-                        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
+    ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+                             qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(),
+                             (int)M, (int)K, (int)NB, (int)u, (int)gs);
     int diag = 0; if (const char* d = getenv("MS_WA_DIAG")) diag = atoi(d);
     // Stage 1: pure int8 IMMA GEMM
     wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(

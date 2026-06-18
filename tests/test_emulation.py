@@ -19,7 +19,7 @@ import math
 import numpy as np
 
 from ms_lib.pack import pack_weight, pack_kv, BLOCK, E_MAX
-from ms_lib.reference import wonly_matmul, wa_matmul, kv_attention
+from ms_lib.reference import wonly_matmul, wa_matmul, kv_attention, quant_act
 from conftest import rel_fro
 
 LOGIC_TOL = 1e-9
@@ -109,7 +109,7 @@ def test_wonly_gemm_logic(rng, cfg):
     assert rel_fro(Y, wonly_matmul(p, X)) < LOGIC_TOL
 
 
-# ---- wa_gemm: on-the-fly MXINT8 activation quant + per-block int dot ---------
+# ---- wa_gemm: MSAQ-s activation quant (mantissa-sharing) + per-block int dot ---
 def test_wa_gemm_logic(rng, cfg):
     u, gs = cfg
     M = 16
@@ -117,23 +117,19 @@ def test_wa_gemm_logic(rng, cfg):
     up, sh, se = p["upper"], p["shared"], p["scale_exp"].astype(np.int64)
     UB, SB, nb, OUT, K = p["UB"], p["SB"], p["nb"], p["OUT"], p["K"]
     X = rng.standard_normal((M, K)).astype(np.float64)
+    qX, sX = quant_act(X, u, gs, share=True)   # activation is MSAQ-s (== kernel)
     Y = np.zeros((M, OUT))
     for m in range(M):
         for o in range(OUT):
             acc = 0.0
             for blk in range(nb):
-                xb = X[m, blk * BLOCK:(blk + 1) * BLOCK]
-                amax = max(np.abs(xb).max(), 1e-30)
-                ea = max(min(math.floor(math.log2(amax)) - E_MAX, 127), -127)
-                sa = 2.0 ** ea
                 sw = 2.0 ** int(se[blk, o])
                 idot = 0
                 for k in range(BLOCK):
-                    qx = int(np.clip(np.round(xb[k] / sa), -127, 127))
-                    idot += qx * _unpack(up, sh, blk, o, k, u, gs, UB, SB)
-                acc += idot * sa * sw
+                    idot += int(qX[m, blk, k]) * _unpack(up, sh, blk, o, k, u, gs, UB, SB)
+                acc += idot * sX[m, blk] * sw
             Y[m, o] = acc
-    assert rel_fro(Y, wa_matmul(p, X, share_act=False)) < LOGIC_TOL
+    assert rel_fro(Y, wa_matmul(p, X, share_act=True)) < LOGIC_TOL
 
 
 # ---- kv_decode: online softmax with fused K/V unpack (token-major [H,nb,L,*])

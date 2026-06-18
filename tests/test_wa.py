@@ -46,5 +46,5 @@ def test_wa_gemm_vs_oracle(rng, cfg):
     X = rng.standard_normal((M, K)).astype(np.float32)
     Xt = torch.from_numpy(X).to(torch.bfloat16).cuda()
     got = ops.wa_gemm(p, Xt).float().cpu().numpy()
-    ref = wa_matmul(p, bf16np(X), share_act=False)
+    ref = wa_matmul(p, bf16np(X), share_act=True)   # MSAQ path: activation is MSAQ-s
     assert rel_fro(got, ref) < REL_FRO_TOL
