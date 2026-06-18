@@ -43,6 +43,31 @@ constexpr int BLOCK = 32;
 //   RTM x RTN register tile. Amortizes unpack by TBM(=64); large M -> FMA-bound.
 constexpr int TBK = BLOCK;   // K-tile = one MSAQ block (fixed)
 
+// ---- STAGE 0: runtime activation quantization (pre-pass, memory-bound) -------
+//   X bf16 [M,K] -> qX int8 [M,K] + sa_exp int8 [M,nb]. ONE WARP per (m,blk):
+//   lane k loads x, warp-reduce amax, E8M0 exp = floor(log2 amax) - E_MAX, then
+//   qX = clip(round(x * 2^-exp), +-127). Each element quantized EXACTLY ONCE (vs
+//   the fused kernel re-quantizing every X row OUT/TBN times). Shared by the MSAQ
+//   and MXINT8 Stage-1 GEMMs so the comparison stays matched. (change.md P26.)
+__global__ void quant_act_kernel(
+        const __nv_bfloat16* __restrict__ X, int8_t* __restrict__ qX,
+        int8_t* __restrict__ sa_exp, int M, int K, int NB) {
+    const int wpb = blockDim.x >> 5;
+    const int gw  = blockIdx.x * wpb + (threadIdx.x >> 5);   // global warp -> (m,blk)
+    if (gw >= M * NB) return;
+    const int m = gw / NB, blk = gw % NB, lane = threadIdx.x & 31;
+    const long base = (long)m * K + (long)blk * BLOCK;       // BLOCK == warp width
+    const float x = __bfloat162float(X[base + lane]);
+    float a = fabsf(x);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    int ea = (int)floorf(log2f(fmaxf(a, 1e-30f))) - (int)ms::E_MAX;
+    ea = max(-127, min(127, ea));
+    int q = (int)rintf(x * exp2f(-(float)ea));
+    qX[base + lane] = (int8_t)max(-127, min(127, q));
+    if (lane == 0) sa_exp[(long)m * NB + blk] = (int8_t)ea;
+}
+
 // Templated shared-memory tiled W-only GEMM. <TBM,TBN> output tile, <RTM,RTN>
 // per-thread register tile; blockDim = (TBM/RTM)*(TBN/RTN). Weight unpacked ONCE
 // per tile (Bs stage) and reused by all TBM rows. Tile config swept via
@@ -389,6 +414,92 @@ __global__ void wonly_gemm_wmma_pipe(
         }
 }
 
+// ---- STAGE 1: W+A as PURE INT8 GEMM (IMMA), activation PRE-QUANTIZED ----------
+//   Reads qX int8 (Stage 0 output) directly — the in-kernel activation quant that
+//   filled the prologue in P23/24 is GONE, so the only heavy stage is the weight
+//   unpack (B-stage) = exactly W-only GEMM. INT8 MMA -> int32 per block; the
+//   per-block epilogue applies (2^sa_exp[m,blk] * sw[o,blk]) and accumulates fp32.
+//   Matched mxint8_wa_imma differs only in B-stage (direct int8). (change.md P26.)
+//   DOUBLE-BUFFERED: the next block's A/B stage (the weight UNPACK is the only
+//   heavy part) overlaps the current block's MMA -> the unpack hides behind the
+//   tensor core, exactly the W-only WMMA-pipe lesson (P23) now that Stage 0 freed
+//   the prologue of activation quant.
+__global__ void wa_imma(
+        const int8_t* __restrict__ qX, const int8_t* __restrict__ sa_exp,
+        const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper,
+        const uint8_t* __restrict__ shared, __nv_bfloat16* __restrict__ Y,
+        int M, int OUT, int K, int NB, int u, int gs, int UB, int SB) {
+    __shared__ int8_t  As[2][64][32];
+    __shared__ int8_t  Bs[2][64][32];
+    __shared__ int32_t Cs[64][64];
+    __shared__ float   sa_s[2][64], sw_s[2][64];
+    const int m0 = blockIdx.y * 64, o0 = blockIdx.x * 64;
+    const int tid = threadIdx.x, warp = tid >> 5, wM = warp >> 1, wN = warp & 1;
+    float accf[32];
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) accf[j] = 0.0f;
+
+    auto stage = [&](int blk, int buf) {
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int m = idx >> 5, k = idx & 31;
+            As[buf][m][k] = (m0 + m < M) ? qX[(long)(m0 + m) * K + blk * BLOCK + k] : (int8_t)0;
+        }
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // weight unpack (heavy)
+            const int oc = idx >> 5, k = idx & 31, o = o0 + oc;
+            Bs[buf][oc][k] = (o < OUT)
+                ? (int8_t)ms::unpack_ms_weight_elem(upper, shared, blk, o, k, OUT, u, gs, UB, SB)
+                : (int8_t)0;
+        }
+        if (tid < 64) {
+            const int o = o0 + tid;
+            sw_s[buf][tid] = (o < OUT) ? ms::e8m0_to_scale(scale_exp[blk * OUT + o]) : 0.0f;
+            sa_s[buf][tid] = (m0 + tid < M) ? ms::e8m0_to_scale(sa_exp[(long)(m0 + tid) * NB + blk]) : 0.0f;
+        }
+    };
+
+    stage(0, 0);
+    __syncthreads();
+    for (int blk = 0; blk < NB; ++blk) {
+        const int cur = blk & 1, nxt = cur ^ 1;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> c[2][2];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i)
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::fill_fragment(c[i][j], 0);
+        #pragma unroll
+        for (int wk = 0; wk < 2; ++wk) {                          // MMA (cur, tensor core)
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[cur][wM*32 + i*16][wk*16], 32);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[cur][wN*32 + j*16][wk*16], 32);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
+        }
+        if (blk + 1 < NB) stage(blk + 1, nxt);                    // next unpack — overlaps the MMA
+        #pragma unroll
+        for (int i = 0; i < 2; ++i)
+            #pragma unroll
+            for (int j = 0; j < 2; ++j)
+                wmma::store_matrix_sync(&Cs[wM*32 + i*16][wN*32 + j*16], c[i][j], 64, wmma::mem_row_major);
+        __syncthreads();
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) {                            // per-block scale + accumulate
+            const int e = tid + 128 * j, m = e >> 6, o = e & 63;
+            accf[j] += (float)Cs[m][o] * sa_s[cur][m] * sw_s[cur][o];
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int e = tid + 128 * j, m = m0 + (e >> 6), o = o0 + (e & 63);
+        if (m < M && o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(accf[j]);
+    }
+}
+
 // Tile-config dispatch. Swept optimum (RTX 3090, OUT=4096) is M-ADAPTIVE: a
 // 128x128 tile reuses best but yields too few blocks (OUT/128=32 < 82 SMs) until
 // M fills the second grid dim, so small M prefers 64x64 (more blocks). Crossover
@@ -400,6 +511,25 @@ static inline int tile_cfg(int M) {
 }
 
 } // namespace
+
+// Stage-0 launcher, shared by the MSAQ and MXINT8 Stage-1 GEMMs (extern from mxint8.cu).
+void ms_launch_quant_act(const __nv_bfloat16* X, int8_t* qX, int8_t* sa_exp,
+                         int M, int K, int NB) {
+    const int tpb = 256, wpb = tpb >> 5;
+    const int blocks = ((long)M * NB + wpb - 1) / wpb;
+    quant_act_kernel<<<blocks, tpb>>>(X, qX, sa_exp, M, K, NB);
+}
+
+// torch op: runtime activation quant -> (qX int8 [M,K], sa_exp int8 [M,nb]).
+// Exposed so the benchmark can time Stage 0 alone (the pre-pass decomposition).
+std::vector<torch::Tensor> quant_act_cuda(torch::Tensor X, int64_t M, int64_t K, int64_t NB) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
+    auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
+    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+                        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
+    return {qX, sa};
+}
 
 // ---- host launchers (signatures match ms_lib.ops / the pybind schema) -------
 static inline void gemm_dims(int64_t u, int64_t gs, int& UB, int& SB) {
@@ -448,6 +578,8 @@ torch::Tensor wonly_gemm_cuda(
     return Y;
 }
 
+// W+A GEMM = STAGE 0 (runtime activation quant) + STAGE 1 (pure int8 IMMA GEMM).
+//   MS_WA_FOLD=1 falls back to the old fused FP32-fold tiled path (for A/B checks).
 torch::Tensor wa_gemm_cuda(
         torch::Tensor X, torch::Tensor scale_exp,
         torch::Tensor upper, torch::Tensor shared,
@@ -455,12 +587,27 @@ torch::Tensor wa_gemm_cuda(
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
     int UB, SB; gemm_dims(u, gs, UB, SB);
     auto Y = torch::empty({M, OUT}, X.options());
+    const char* f = getenv("MS_WA_FOLD");
+    if (f && atoi(f) == 1) {        // legacy fused FP32-fold path (A/B reference)
 #define ARGS \
-    reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), \
-    scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(), \
-    reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
-    (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
-    DISPATCH_TILE(wa_gemm_tiled);   // WMMA-pipe(P23), INT8-IMMA(P24), shared-factored(P25): all lost
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), \
+        scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(), \
+        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
+        (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
+        DISPATCH_TILE(wa_gemm_tiled);
 #undef ARGS
+        return Y;
+    }
+    // Stage 0: X -> qX int8 + sa_exp int8 (one quant per element)
+    auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
+    auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
+    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+                        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
+    // Stage 1: pure int8 IMMA GEMM
+    wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(
+        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+        upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
     return Y;
 }

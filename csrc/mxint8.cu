@@ -23,6 +23,10 @@
 #include <math.h>
 #include "core/ms_utils.cuh"
 
+// Stage-0 activation quant launcher (defined in wa_gemm.cu) — shared so the MXINT8
+// W+A path quantizes the activation identically to MSAQ (matched comparison).
+void ms_launch_quant_act(const __nv_bfloat16* X, int8_t* qX, int8_t* sa_exp, int M, int K, int NB);
+
 namespace {
 constexpr int BLOCK = 32;
 
@@ -262,6 +266,82 @@ __global__ void mxint8_gemm_wmma_pipe(
             }
             __syncwarp();
         }
+}
+
+// ---- W+A pure-int8 IMMA GEMM (activation pre-quantized) — matched to wa_imma --
+//   Same 2-stage structure; B-stage reads int8 qweight DIRECTLY (no unpack), so
+//   the MSAQ/MXINT8 delta is exactly the weight unpack. (change.md P26.)
+__global__ void mxint8_wa_imma(
+        const int8_t* __restrict__ qX, const int8_t* __restrict__ sa_exp,
+        const int8_t* __restrict__ scale_exp, const int8_t* __restrict__ qweight,
+        __nv_bfloat16* __restrict__ Y, int M, int OUT, int K, int NB) {
+    __shared__ int8_t  As[2][64][32];
+    __shared__ int8_t  Bs[2][64][32];
+    __shared__ int32_t Cs[64][64];
+    __shared__ float   sa_s[2][64], sw_s[2][64];
+    const int m0 = blockIdx.y * 64, o0 = blockIdx.x * 64;
+    const int tid = threadIdx.x, warp = tid >> 5, wM = warp >> 1, wN = warp & 1;
+    float accf[32];
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) accf[j] = 0.0f;
+
+    auto stage = [&](int blk, int buf) {
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int m = idx >> 5, k = idx & 31;
+            As[buf][m][k] = (m0 + m < M) ? qX[(long)(m0 + m) * K + blk * BLOCK + k] : (int8_t)0;
+        }
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // B-stage: direct int8
+            const int oc = idx >> 5, k = idx & 31, o = o0 + oc;
+            Bs[buf][oc][k] = (o < OUT) ? qweight[(long)(blk * BLOCK + k) * OUT + o] : (int8_t)0;
+        }
+        if (tid < 64) {
+            const int o = o0 + tid;
+            sw_s[buf][tid] = (o < OUT) ? ms::e8m0_to_scale(scale_exp[blk * OUT + o]) : 0.0f;
+            sa_s[buf][tid] = (m0 + tid < M) ? ms::e8m0_to_scale(sa_exp[(long)(m0 + tid) * NB + blk]) : 0.0f;
+        }
+    };
+
+    stage(0, 0);
+    __syncthreads();
+    for (int blk = 0; blk < NB; ++blk) {
+        const int cur = blk & 1, nxt = cur ^ 1;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> c[2][2];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i)
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::fill_fragment(c[i][j], 0);
+        #pragma unroll
+        for (int wk = 0; wk < 2; ++wk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[cur][wM*32 + i*16][wk*16], 32);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[cur][wN*32 + j*16][wk*16], 32);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
+        }
+        if (blk + 1 < NB) stage(blk + 1, nxt);
+        #pragma unroll
+        for (int i = 0; i < 2; ++i)
+            #pragma unroll
+            for (int j = 0; j < 2; ++j)
+                wmma::store_matrix_sync(&Cs[wM*32 + i*16][wN*32 + j*16], c[i][j], 64, wmma::mem_row_major);
+        __syncthreads();
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int e = tid + 128 * j, m = e >> 6, o = e & 63;
+            accf[j] += (float)Cs[m][o] * sa_s[cur][m] * sw_s[cur][o];
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int e = tid + 128 * j, m = m0 + (e >> 6), o = o0 + (e & 63);
+        if (m < M && o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(accf[j]);
+    }
 }
 
 // ---- W+A GEMM (int8 weight direct + on-the-fly MXINT8 activation, int dot) ---
@@ -512,17 +592,30 @@ torch::Tensor mxint8_gemm_cuda(
     return Y;
 }
 
+// W+A MXINT8 = STAGE 0 (shared quant) + STAGE 1 (int8 IMMA), matched to wa_gemm.
 torch::Tensor mxint8_wa_gemm_cuda(
         torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight,
         int64_t M, int64_t OUT, int64_t K, int64_t NB) {
     auto Y = torch::empty({M, OUT}, X.options());
+    const char* f = getenv("MS_WA_FOLD");
+    if (f && atoi(f) == 1) {        // legacy fused FP32-fold path (A/B reference)
 #define ARGS \
-    reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), \
-    scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), \
-    reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
-    (int)M, (int)OUT, (int)K, (int)NB
-    DISPATCH_TILE(mxint8_wa_gemm_tiled);   // matched IMMA/WMMA-pipe removed (MSAQ lost — P23/24)
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), \
+        scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), \
+        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
+        (int)M, (int)OUT, (int)K, (int)NB
+        DISPATCH_TILE(mxint8_wa_gemm_tiled);
 #undef ARGS
+        return Y;
+    }
+    auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
+    auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
+    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+                        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
+    mxint8_wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128>>>(
+        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+        qweight.data_ptr<int8_t>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, (int)K, (int)NB);
     return Y;
 }
 
