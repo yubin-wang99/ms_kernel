@@ -476,6 +476,177 @@ __global__ void kv_decode_wide_kernel(
     if (tid == 0) { part_m[h * S + s] = m_i; part_l[h * S + s] = l_i; }
 }
 
+// ---- GQA-BATCHED flash-decode (design A): one block per (kv_head, key-tile) ---
+//   Processes ALL G = Hq/Hkv query heads of this kv head TOGETHER. K and V are
+//   read+unpacked ONCE per key and reused across the G query rows -> the KV memory
+//   traffic is amortized G-fold (the per-q-head kernel re-read each kv head's V G
+//   times). Roofline: P.V at GQA G has AI = G*D / (V bytes/key) >> nothing, but
+//   far BELOW the BF16 ridge (~75 FLOP/byte) -> memory-bound, so MSAQ's 0.56x
+//   bytes reduce time ~0.56x once the (amortized) unpack hides. Pass-1 thread-per-
+//   key computes G in-thread dots from one unpacked K; V staged full-sector once,
+//   reused for G accumulators in Pass-2. Partials written at the G q-head slots so
+//   the existing per-q-head combine is reused. (change.md Phase 33.)
+constexpr int MAX_G = 8;
+template<bool U4>
+__global__ void kv_decode_gqa_kernel(
+        const __nv_bfloat16* __restrict__ q,    // [Hq, D]
+        const int8_t*  __restrict__ ks, const uint8_t* __restrict__ ku,
+        const uint8_t* __restrict__ kh,
+        const int8_t*  __restrict__ vs, const uint8_t* __restrict__ vu,
+        const uint8_t* __restrict__ vh,
+        float* __restrict__ part_o,             // [Hq, S, D]
+        float* __restrict__ part_m, float* __restrict__ part_l,   // [Hq, S]
+        int Hq, int Hkv, int G, int Lk, int Lcap, int D, int NB, int u, int gs,
+        int UB, int SB, int key_tile, int S, int chunk, float sm_scale) {
+    const int hk = blockIdx.x;                  // kv head (grid.x = Hkv)
+    const int s  = blockIdx.y;
+    const int tid = threadIdx.x, NT = blockDim.x;
+    const int gs_shift = __ffs(gs) - 1;
+    const bool active = tid < D;
+
+    extern __shared__ unsigned char smem_g[];
+    float* q_sh = (float*)smem_g;                       // [G][D]
+    float* sc   = q_sh + (long)G * D;                   // [G][chunk]
+    unsigned char* pVu = (unsigned char*)(sc + (long)G * chunk);  // [NB*chunk*UB]
+    unsigned char* pVh = pVu + (long)NB * chunk * UB;            // [NB*chunk*SB]
+
+    for (int g = 0; g < G; ++g)
+        if (active) q_sh[g * D + tid] = __bfloat162float(q[(hk * G + g) * D + tid]);
+    __syncthreads();
+
+    const int j0 = s * key_tile, j1 = min(j0 + key_tile, Lk);
+    float m_i[MAX_G], l_i[MAX_G], acc[MAX_G];
+    #pragma unroll
+    for (int g = 0; g < MAX_G; ++g) { m_i[g] = -INFINITY; l_i[g] = 0.0f; acc[g] = 0.0f; }
+
+    for (int cs = j0; cs < j1; cs += chunk) {
+        const int nC = min(chunk, j1 - cs);
+
+        // ---- Pass 1: thread-per-key; unpack K once, feed G in-thread dots ----
+        if (tid < nC) {
+            const int key = cs + tid;
+            float dot[MAX_G];
+            #pragma unroll
+            for (int g = 0; g < MAX_G; ++g) dot[g] = 0.0f;
+            for (int blk = 0; blk < NB; ++blk) {
+                const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lcap + key]);
+                const long kbase = (long)(hk * NB + blk) * Lcap + key;
+                uint8_t sb[8];
+                const long sbase = kbase * SB;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = kh[sbase + i];
+                if constexpr (U4) {
+                    const uint4 up4 = *reinterpret_cast<const uint4*>(ku + kbase * UB);
+                    const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+                    #pragma unroll
+                    for (int kd = 0; kd < BLOCK; ++kd) {
+                        const int up_code = ms::bfe_s32((int)uw[kd >> 3], (kd & 7) * 4, 4);
+                        const int gg = kd >> gs_shift;
+                        const int sh_code = ms::bfe_s32((int)sb[gg >> 1], (gg & 1) * 4, 4);
+                        const float w = (up_code * 16 + sh_code) * ksc;
+                        const int d = blk * BLOCK + kd;
+                        for (int g = 0; g < G; ++g) dot[g] += q_sh[g * D + d] * w;
+                    }
+                } else {
+                    uint32_t ureg[6];
+                    const uint32_t* src = reinterpret_cast<const uint32_t*>(ku + kbase * UB);
+                    #pragma unroll
+                    for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+                    uint32_t sreg[3] = {0u,0u,0u};
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) if (i < SB) sreg[i >> 2] |= (uint32_t)sb[i] << (8 * (i & 3));
+                    const int wbits = 8 - u, gsmask = gs - 1;
+                    const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+                    const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+                    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+                    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+                    for (int kd = 0; kd < BLOCK; ++kd) {
+                        if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+                        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+                        ubuf >>= wbits; unb -= wbits;
+                        if ((kd & gsmask) == 0) {
+                            if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+                            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+                            sbuf >>= u; snb -= u;
+                        }
+                        const float w = (up_code * (1 << u) + sh_code) * ksc;
+                        const int d = blk * BLOCK + kd;
+                        for (int g = 0; g < G; ++g) dot[g] += q_sh[g * D + d] * w;
+                    }
+                }
+            }
+            for (int g = 0; g < G; ++g) sc[g * chunk + tid] = dot[g] * sm_scale;
+        }
+
+        // ---- stage V full-sector (read 0.56x packed bytes once, reuse for G) ----
+        for (int blk = 0; blk < NB; ++blk) {
+            if constexpr (U4) {
+                const uint4* src4 = reinterpret_cast<const uint4*>(
+                        vu + ((long)(hk * NB + blk) * Lcap + cs) * UB);
+                uint4* dst4 = reinterpret_cast<uint4*>(pVu + (long)blk * chunk * UB);
+                for (int i = tid; i < nC; i += NT) dst4[i] = src4[i];
+            } else {
+                const uint32_t* s32 = reinterpret_cast<const uint32_t*>(
+                        vu + ((long)(hk * NB + blk) * Lcap + cs) * UB);
+                uint32_t* d32 = reinterpret_cast<uint32_t*>(pVu + (long)blk * chunk * UB);
+                const int nw = (nC * UB) >> 2;
+                for (int i = tid; i < nw; i += NT) d32[i] = s32[i];
+            }
+            const unsigned char* srch = vh + ((long)(hk * NB + blk) * Lcap + cs) * SB;
+            unsigned char* dsth = pVh + (long)blk * chunk * SB;
+            for (int i = tid; i < nC * SB; i += NT) dsth[i] = srch[i];
+        }
+        __syncthreads();
+
+        // ---- Pass 2: thread-per-d; per-query softmax rescale, then unpack each V
+        //   element ONCE and fan out to all G accumulators ----
+        const int blk = tid / BLOCK, kd = tid % BLOCK;
+        float m_new[MAX_G];
+        for (int g = 0; g < G; ++g) {
+            float m_chunk = -INFINITY;
+            for (int kk = 0; kk < nC; ++kk) m_chunk = fmaxf(m_chunk, sc[g * chunk + kk]);
+            m_new[g] = fmaxf(m_i[g], m_chunk);
+            const float alpha = expf(m_i[g] - m_new[g]);
+            acc[g] *= alpha; l_i[g] *= alpha; m_i[g] = m_new[g];
+        }
+        __syncthreads();
+        // convert scores -> probabilities IN-PLACE in shared: exp computed ONCE per
+        // (g,kk) (cooperative) instead of redundantly per thread-d -> kills the
+        // transcendental blow-up that made the naive GQA kernel compute-bound.
+        for (int idx = tid; idx < G * nC; idx += NT) {
+            const int g = idx / nC, kk = idx % nC;
+            sc[g * chunk + kk] = __expf(sc[g * chunk + kk] - m_new[g]);
+        }
+        __syncthreads();
+        for (int g = 0; g < G; ++g) {                 // l denom (d-independent sum, no exp)
+            float ls = 0.0f;
+            for (int kk = 0; kk < nC; ++kk) ls += sc[g * chunk + kk];
+            l_i[g] += ls;
+        }
+        // Pass-2: unpack each V element ONCE, fan out p (from shared) to G accumulators
+        for (int kk = 0; kk < nC; ++kk) {
+            if (!active) break;
+            const int j = cs + kk;
+            const float vsc = ms::e8m0_to_scale(vs[(hk * NB + blk) * Lcap + j]);
+            float vv;
+            if constexpr (U4)
+                vv = (float)ms::unpack_ms_kv_elem_u4(pVu, pVh,
+                    (long)blk * chunk * UB, (long)blk * chunk * SB, kk, kd, gs, UB, SB);
+            else
+                vv = (float)ms::unpack_ms_kv_elem(pVu, pVh,
+                    (long)blk * chunk * UB, (long)blk * chunk * SB, 0, kk, kd, u, gs, UB, SB);
+            vv *= vsc;
+            for (int g = 0; g < G; ++g) acc[g] += sc[g * chunk + kk] * vv;
+        }
+        __syncthreads();
+    }
+    for (int g = 0; g < G; ++g) {
+        const int qh = hk * G + g;
+        if (active) part_o[((long)qh * S + s) * D + tid] = acc[g];
+        if (tid == 0) { part_m[qh * S + s] = m_i[g]; part_l[qh * S + s] = l_i[g]; }
+    }
+}
+
 // ---- Phase 2: merge the S partials per head into the final output ----------
 //   Standard flash-decoding combine: global max m_g = max_s m_s, then each
 //   tile's contribution is rescaled by exp(m_s - m_g). One block per head;
@@ -599,6 +770,40 @@ torch::Tensor kv_decode_attention_cuda(
     const int threads = next_pow2((int)D);             // 1 thread / head_dim elem
     const size_t smem = (size_t)((int)D + KV_CHUNK) * sizeof(float);  // q_sh[D] + sc[CHUNK]
     const float sm_scale = 1.0f / sqrtf((float)D);
+
+    // ---- GQA-batched flash-decode (design A): default when G=H/Hkv >= 2 ----
+    //   One block per kv head processes all G queries -> KV read+unpacked once,
+    //   amortized G-fold. STATUS: structurally correct (gated) and the right lever,
+    //   but this scalar + full-chunk-staging form is occupancy/latency-bound (~25x
+    //   off the ~0.64x roofline) -> realizing the roofline needs cp.async double-
+    //   buffer + small MMA tiles. OPT-IN via MS_KV_GQA=1 (default off; wide wins for
+    //   now). Splits the key axis by the KV-head count (grid = Hkv x Sg).
+    const int Gq = (int)(H / Hkv);
+    if (const char* g0 = getenv("MS_KV_GQA"); Gq >= 2 && Gq <= 8 && (g0 && atoi(g0) == 1)) {
+        const int chunk = threads;
+        const int Sg = ms::kv_split_count((long)Lk, (int)Hkv);
+        const int key_tile_g = (int)((Lk + Sg - 1) / Sg);
+        auto fopt = q.options().dtype(torch::kFloat32);
+        auto p_o = torch::empty({H, (int64_t)Sg, D}, fopt);
+        auto p_m = torch::empty({H, (int64_t)Sg}, fopt);
+        auto p_l = torch::empty({H, (int64_t)Sg}, fopt);
+        const size_t smem_g = ((size_t)Gq * (int)D + (size_t)Gq * chunk) * sizeof(float)
+                            + (size_t)NB * chunk * (UB + SB);
+        auto launch = [&](auto U4tag) {
+            kv_decode_gqa_kernel<decltype(U4tag)::value><<<dim3((int)Hkv, Sg), threads, smem_g, at::cuda::getCurrentCUDAStream()>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+                ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
+                vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
+                p_o.data_ptr<float>(), p_m.data_ptr<float>(), p_l.data_ptr<float>(),
+                (int)H, (int)Hkv, Gq, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs,
+                UB, SB, key_tile_g, Sg, chunk, sm_scale);
+        };
+        if ((int)u == 4) launch(std::true_type{}); else launch(std::false_type{});
+        kv_decode_combine_kernel<<<(int)H, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            p_o.data_ptr<float>(), p_m.data_ptr<float>(), p_l.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), (int)H, (int)D, Sg);
+        return out;
+    }
 
     // split the key axis -> grid (H, S) sized from the live SM count so the block
     // count (H*S) lands at ~2-4x #SM and fills the machine (occupancy 방안1).

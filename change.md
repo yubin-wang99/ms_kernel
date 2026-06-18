@@ -1332,3 +1332,20 @@ FlashDecoding 재설계(미해결 과제). → **공정 최선(KV tie) 상태로
   S4는 **weight GEMV win이 KV tie 위에 얹혀 여전히 0.69 win**.
 - **공정 결론: MSAQ의 end-to-end 우위는 weight GEMV(W-only scope, 진짜 BW-bound)에서 오고,
   KV read는 현 스칼라 flash-decode에선 tie.** bf16 대비는 전부 win(S4 u4 0.44).
+
+# Phase 33 — GQA-batched FlashDecoding KV read 시도 (design A 핵심 lever)
+
+KV read 공정 win을 위해 design A(텐서코어 FlashDecoding + GQA 쿼리배칭 + cp.async) 착수. 먼저
+핵심 lever인 **GQA 쿼리배칭**(`kv_decode_gqa_kernel`)을 구현: 블록당 KV head 1개가 G=Hq/Hkv개
+쿼리를 함께 처리 → K/V를 한 번 읽고/언팩해 G개 쿼리 행에 재사용(V 트래픽 G배 amortize). Pass-2의
+exp는 (g,kk)별 1회만 계산해 shared에 저장(스레드-d별 중복 제거). GQA 게이트(Hq8 Hkv2) 통과(정확).
+
+**roofline 정정:** P·V는 AI = G·D/(V bytes/key)로 ridge(75) 한참 아래 → memory-bound. 정량(Lk=4680,
+Llama): MXINT8 9.6MB→~11µs, MSAQ 5.4MB→~6µs memory + ~5µs unpack → ~7µs → **roofline win ~0.64×
+(사용자 0.56×는 unpack 무시한 낙관, 0.64×가 실현치).**
+
+**그러나 현 스칼라+full-chunk-staging 구현은 ~25× off roofline**(172µs vs ~7µs): staging shared
+(~13KB)가 occupancy를 캡하고 chunk 단위 동기 staging이 load latency를 노출해 15 GB/s에 머문다(split
+늘려도 안 풀림 — wide와 같은 벽). → **roofline 실현엔 cp.async 더블버퍼 + 작은 MMA 타일(+텐서코어)
+파이프라인이 필요**(genuinely hard remaining work). GQA 커널은 구조적으로 옳고 **MS_KV_GQA=1 opt-in**
+으로 남겨 토대로 보존(default는 wide). 미해결: cp.async/텐서코어 pipeline.
