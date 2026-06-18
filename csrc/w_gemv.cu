@@ -284,6 +284,16 @@ __global__ void wa_gemv_wide_kernel(
     const int per = (NB + splitK - 1) / splitK;
     const int b0  = sp * per, b1 = min(b0 + per, NB);
     const int gs_shift = __ffs(gs) - 1;
+
+    // Stage this K-slice's activation into shared ONCE (the activation is the same
+    // for every output column in the block). Otherwise each of the 128 columns
+    // re-loads qx[k] from global, and those redundant loads contend with the weight
+    // stream that the unpack is already latency-bound on. All threads (incl. o>=OUT)
+    // cooperate, so the syncthreads precedes any return.
+    extern __shared__ int8_t qx_sh[];                    // [(b1-b0)*BLOCK]
+    const int slice = (b1 - b0) * BLOCK;
+    for (int i = threadIdx.x; i < slice; i += blockDim.x) qx_sh[i] = qx[b0 * BLOCK + i];
+    __syncthreads();
     float acc = 0.0f;
 
     if constexpr (U4) {
@@ -298,7 +308,7 @@ __global__ void wa_gemv_wide_kernel(
             const uint4 up4 = *reinterpret_cast<const uint4*>(
                                   upper_cm + ((long)blk * OUT + o) * UB);
             const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
-            const int8_t* qxb = qx + blk * BLOCK;
+            const int8_t* qxb = qx_sh + (blk - b0) * BLOCK;
             int idot = 0;
             #pragma unroll
             for (int k = 0; k < BLOCK; ++k) {
@@ -332,7 +342,7 @@ __global__ void wa_gemv_wide_kernel(
             uint64_t ubuf = 0; int unb = 0, uwi = 0;
             uint64_t sbuf = 0; int snb = 0, swi = 0;
             int sh_code = 0;
-            const int8_t* qxb = qx + blk * BLOCK;
+            const int8_t* qxb = qx_sh + (blk - b0) * BLOCK;
             int idot = 0;
             for (int k = 0; k < BLOCK; ++k) {
                 if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
@@ -458,9 +468,11 @@ torch::Tensor wa_gemv_cuda(
     const int blocks = (int)((OUT + threads - 1) / threads);
     const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
     auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
+    const int per = ((int)NB + splitK - 1) / splitK;
+    const size_t smem = (size_t)per * BLOCK;             // staged qx slice (int8)
 
     auto launch = [&](auto U4tag) {
-        wa_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        wa_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads, smem, at::cuda::getCurrentCUDAStream()>>>(
             qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
             upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
             partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);

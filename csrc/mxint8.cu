@@ -81,6 +81,10 @@ __global__ void mxint8_wa_gemv_kernel(
     if (o >= OUT) return;
     const int per = (NB + splitK - 1) / splitK;
     const int b0 = sp * per, b1 = min(b0 + per, NB);
+    // NOTE: qx shared-staging (used by the MSAQ wa_gemv) is NOT applied here — it
+    // HURT the MXINT8 baseline (39.6->54us): MXINT8 is not unpack-stalled, so it
+    // isn't bottlenecked on the redundant qx loads, and the staging barrier + shared
+    // occupancy cost just slows it. Each kernel runs its own optimum (best-vs-best).
     float acc = 0.0f;
     for (int blk = b0; blk < b1; ++blk) {
         const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
