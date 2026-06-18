@@ -88,10 +88,36 @@ def test_kv_write_then_decode_vs_oracle(rng, cfg):
     ks, ku, kh = torch.ops.msaq.kv_write(Kb, H, Lk, D, nb, u, gs)   # write cache via kernel
     vs, vu, vh = torch.ops.msaq.kv_write(Vb, H, Lk, D, nb, u, gs)
     got = torch.ops.msaq.kv_decode_attention(qt, ks, ku, kh, vs, vu, vh,
-                                             H, Lk, D, nb, u, gs).float().cpu().numpy()
+                                             H, H, Lk, D, nb, u, gs).float().cpu().numpy()
     pK = pack_kv(Kb.float().cpu().numpy(), u, gs)
     pV = pack_kv(Vb.float().cpu().numpy(), u, gs)
     ref = kv_attention(bf16np(Q)[:, None, :], pK, pV, causal=True)[:, 0, :]
+    assert rel_fro(got, ref) < REL_FRO_TOL
+
+
+# ---- 3b. GQA decode: Hq query heads attend to Hkv kv heads (q head h -> h//g) --
+@requires_kernel
+def test_kv_decode_gqa_vs_oracle(rng, cfg):
+    import torch
+    u, gs = cfg
+    Hq, Hkv, Lk, D = 8, 2, 96, 128                # group = 4
+    g = Hq // Hkv
+    K = (rng.standard_normal((Hkv, Lk, D)) * 0.5).astype(np.float32)
+    V = (rng.standard_normal((Hkv, Lk, D)) * 0.5).astype(np.float32)
+    Q = (rng.standard_normal((Hq, D)) * 0.5).astype(np.float32)
+    pK, pV = pack_kv(K, u, gs), pack_kv(V, u, gs)
+    ks, ku, kh = (torch.from_numpy(pK[k]).cuda() for k in ("scale_exp", "upper", "shared"))
+    vs, vu, vh = (torch.from_numpy(pV[k]).cuda() for k in ("scale_exp", "upper", "shared"))
+    qt, nb = torch.from_numpy(Q).to(torch.bfloat16).cuda(), D // 32
+    got = torch.ops.msaq.kv_decode_attention(qt, ks, ku, kh, vs, vu, vh,
+                                             Hq, Hkv, Lk, D, nb, u, gs).float().cpu().numpy()
+    # reference: each q head h attends to kv head h//g (single-query causal == full)
+    ref = np.zeros((Hq, D), np.float64)
+    for h in range(Hq):
+        Kd, Vd = dequant_weight(pK["_per"][h // g]), dequant_weight(pV["_per"][h // g])
+        sc = (bf16np(Q[h]).astype(np.float64) @ Kd.T) / math.sqrt(D)
+        p = np.exp(sc - sc.max()); p /= p.sum()
+        ref[h] = p @ Vd
     assert rel_fro(got, ref) < REL_FRO_TOL
 
 
@@ -138,7 +164,7 @@ def test_kv_append_then_decode_vs_oracle(rng, cfg):
         torch.ops.msaq.kv_append(Kb[:, pos, :].contiguous(), ks, ku, kh, H, D, nb, pos, Lk, u, gs)
         torch.ops.msaq.kv_append(Vb[:, pos, :].contiguous(), vs, vu, vh, H, D, nb, pos, Lk, u, gs)
     got = torch.ops.msaq.kv_decode_attention(qt, ks, ku, kh, vs, vu, vh,
-                                             H, Lk, D, nb, u, gs).float().cpu().numpy()
+                                             H, H, Lk, D, nb, u, gs).float().cpu().numpy()
     pK = pack_kv(Kb.float().cpu().numpy(), u, gs)
     pV = pack_kv(Vb.float().cpu().numpy(), u, gs)
     ref = kv_attention(bf16np(Q)[:, None, :], pK, pV, causal=True)[:, 0, :]

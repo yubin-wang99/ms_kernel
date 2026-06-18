@@ -119,7 +119,7 @@ def kv_decode_attention(q_bf16, pK, pV):
     ks, ku, kh = _kv_planes(pK, dev)
     vs, vu, vh = _kv_planes(pV, dev)
     return _OPS.kv_decode_attention(q_bf16, ks, ku, kh, vs, vu, vh,
-                                    int(pK["H"]), int(pK["L"]), int(pK["D"]),
+                                    int(q_bf16.shape[0]), int(pK["H"]), int(pK["L"]), int(pK["D"]),
                                     int(pK["nb"]), int(pK["u"]), int(pK["gs"]))
 
 
@@ -163,4 +163,4 @@ def mxint8_kv_decode(q_bf16, pK, pV):
     vs = torch.from_numpy(pV["scale_exp"]).to(dev)
     vq = torch.from_numpy(pV["qweight"]).to(dev)
     return _OPS.mxint8_kv_decode(q_bf16, ks, kq, vs, vq,
-                                 int(pK["H"]), int(pK["L"]), int(pK["D"]), int(pK["nb"]))
+                                 int(q_bf16.shape[0]), int(pK["H"]), int(pK["L"]), int(pK["D"]), int(pK["nb"]))

@@ -35,7 +35,7 @@ def run(u=4, gs=8, H=8, Lk=4096, D=128):
     vxs,vxq = _cuda(pxV["scale_exp"]),_cuda(pxV["qweight"])
     qt = torch.from_numpy(q).to(torch.bfloat16).cuda()
     nb, nbx = pmK["nb"], pxK["nb"]
-    msaq = lambda: torch.ops.msaq.kv_decode_attention(qt,ks,ku,kh,vs,vu,vh,H,Lk,D,nb,u,gs)
+    msaq = lambda: torch.ops.msaq.kv_decode_attention(qt,ks,ku,kh,vs,vu,vh,H,H,Lk,D,nb,u,gs)
     mx   = lambda: torch.ops.msaq.mxint8_kv_decode(qt,kxs,kxq,vxs,vxq,H,Lk,D,nbx)
 
     UB = 32*(8-u)//8; SB = ((32//gs)*u+7)//8

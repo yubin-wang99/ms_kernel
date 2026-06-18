@@ -132,9 +132,9 @@ def bench_kv_decode(u=3, gs=8, H=8, Lk=4096, D=128):
     Vbf = torch.from_numpy(V).to(torch.bfloat16).cuda()
     q4 = qt.unsqueeze(1)
     t_msaq = measure_latency(lambda: torch.ops.msaq.kv_decode_attention(
-        qt, ks, ku, kh, vs, vu, vh, H, Lk, D, pmK["nb"], u, gs))
+        qt, ks, ku, kh, vs, vu, vh, H, H, Lk, D, pmK["nb"], u, gs))
     t_mx = measure_latency(lambda: torch.ops.msaq.mxint8_kv_decode(
-        qt, kxs, kxq, vxs, vxq, H, Lk, D, pxK["nb"]))
+        qt, kxs, kxq, vxs, vxq, H, H, Lk, D, pxK["nb"]))
     t_bl = measure_latency(lambda: F.scaled_dot_product_attention(q4, Kbf, Vbf))
     _row(f"KV decode    (H={H}, Lk={Lk}, D={D}, MSAQ u{u}gs{gs})", t_msaq, t_mx, t_bl, "SDPA")
 

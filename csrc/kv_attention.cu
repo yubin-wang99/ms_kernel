@@ -102,10 +102,11 @@ __global__ void kv_decode_split_kernel(
         float* __restrict__ part_o,             // [H, S, D]  partial acc
         float* __restrict__ part_m,             // [H, S]     partial max
         float* __restrict__ part_l,             // [H, S]     partial denom
-        int H, int Lk, int D, int NB, int u, int gs, int UB, int SB,
+        int H, int Hkv, int Lk, int D, int NB, int u, int gs, int UB, int SB,
         int key_tile, int S, float sm_scale) {
 
-    const int h = blockIdx.x;
+    const int h = blockIdx.x;                   // q head (grid.x == Hq)
+    const int hk = h / (H / Hkv);               // GQA: q head -> kv head (group=Hq/Hkv)
     const int s = blockIdx.y;                   // key-tile index
     const int tid = threadIdx.x;
     const int lane = tid & 31, warpId = tid >> 5, nWarps = blockDim.x >> 5;
@@ -130,9 +131,9 @@ __global__ void kv_decode_split_kernel(
             float part = 0.0f;
             for (int d = lane; d < D; d += 32) {     // this warp's lanes cover head_dim
                 const int blk = d / BLOCK, kd = d % BLOCK;
-                const long base_u = (long)(h * NB + blk) * UB * Lk;
-                const long base_h = (long)(h * NB + blk) * SB * Lk;
-                const float ksc = ms::e8m0_to_scale(ks[(h * NB + blk) * Lk + j]);
+                const long base_u = (long)(hk * NB + blk) * UB * Lk;
+                const long base_h = (long)(hk * NB + blk) * SB * Lk;
+                const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lk + j]);
                 part += q_sh[d] * (float)ms::unpack_ms_kv_elem(ku, kh, base_u, base_h,
                                                 Lk, j, kd, u, gs, UB, SB) * ksc;
             }
@@ -149,15 +150,15 @@ __global__ void kv_decode_split_kernel(
 
         // ---- Pass 2: out[d] += Σ_kk p_kk·V[d,kk]  (thread d; no block barrier) ----
         const int blk = tid / BLOCK, kd = tid % BLOCK;       // d = tid
-        const long base_u = (long)(h * NB + blk) * UB * Lk;
-        const long base_h = (long)(h * NB + blk) * SB * Lk;
+        const long base_u = (long)(hk * NB + blk) * UB * Lk;
+        const long base_h = (long)(hk * NB + blk) * SB * Lk;
         float lsum = 0.0f, a = 0.0f;
         for (int kk = 0; kk < nC; ++kk) {
             const float p = expf(sc[kk] - m_new);
             lsum += p;                            // identical across threads -> l_i
             if (active) {
                 const int j = cs + kk;
-                const float vsc = ms::e8m0_to_scale(vs[(h * NB + blk) * Lk + j]);
+                const float vsc = ms::e8m0_to_scale(vs[(hk * NB + blk) * Lk + j]);
                 a += p * (float)ms::unpack_ms_kv_elem(vu, vh, base_u, base_h,
                                                 Lk, j, kd, u, gs, UB, SB) * vsc;
             }
@@ -186,9 +187,10 @@ __global__ void kv_decode_cpasync_kernel(
         const int8_t*  __restrict__ vs, const uint8_t* __restrict__ vu,
         const uint8_t* __restrict__ vh,
         float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
-        int H, int Lk, int D, int NB, int u, int gs, int UB, int SB,
+        int H, int Hkv, int Lk, int D, int NB, int u, int gs, int UB, int SB,
         int key_tile, int S, float sm_scale, int diag) {
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x;
+    const int hk = h / (H / Hkv);                  // GQA: q head -> kv head
     const int lane = tid & 31, warpId = tid >> 5, nWarps = blockDim.x >> 5, NT = blockDim.x;
     const bool active = tid < D;
     const int wbits = 8 - u;                       // diag: raw-byte index for memory ceiling
@@ -205,8 +207,8 @@ __global__ void kv_decode_cpasync_kernel(
     auto stage = [&](int cs, int nC, unsigned char* b) {
         unsigned char* pKu = b, *pKh = b + kuB, *pVu = b + kuB + khB, *pVh = b + 2*kuB + khB;
         for (int blk = 0; blk < NB; ++blk) {
-            const long bu = (long)(h * NB + blk) * Lk * UB + (long)cs * UB;
-            const long bh = (long)(h * NB + blk) * Lk * SB + (long)cs * SB;
+            const long bu = (long)(hk * NB + blk) * Lk * UB + (long)cs * UB;
+            const long bh = (long)(hk * NB + blk) * Lk * SB + (long)cs * SB;
             cpa(pKu + blk*CP_CHUNK*UB, ku + bu, nC*UB, tid, NT);       // big: async
             cpa(pVu + blk*CP_CHUNK*UB, vu + bu, nC*UB, tid, NT);
             if (diag != 3) {  // diag3: skip shared-plane sync_copy to isolate its cost
@@ -242,7 +244,7 @@ __global__ void kv_decode_cpasync_kernel(
             float part = 0.0f;
             for (int d = lane; d < D; d += 32) {
                 const int blk = d / BLOCK, kd = d % BLOCK;
-                const float ksc = ms::e8m0_to_scale(ks[(h * NB + blk) * Lk + j]);
+                const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lk + j]);
                 // diag==1: memory ceiling -> read 1 staged upper byte, skip unpack
                 float kv;
                 if (diag == 1 || diag == 3)  // memory ceiling: 1 staged upper byte, no unpack
@@ -274,7 +276,7 @@ __global__ void kv_decode_cpasync_kernel(
             lsum += p;
             if (active) {
                 const int j = cs + kk;
-                const float vsc = ms::e8m0_to_scale(vs[(h * NB + blk) * Lk + j]);
+                const float vsc = ms::e8m0_to_scale(vs[(hk * NB + blk) * Lk + j]);
                 float vv;
                 if (diag == 1)
                     vv = (float)pVu[(long)blk*CP_CHUNK*UB + (long)kk*UB + ((kd*wbits)>>3)];
@@ -334,9 +336,10 @@ __global__ void kv_decode_wide_kernel(
         const int8_t*  __restrict__ vs, const uint8_t* __restrict__ vu,
         const uint8_t* __restrict__ vh,
         float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
-        int H, int Lk, int D, int NB, int u, int gs, int UB, int SB,
+        int H, int Hkv, int Lk, int D, int NB, int u, int gs, int UB, int SB,
         int key_tile, int S, int chunk, float sm_scale) {
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
+    const int hk = h / (H / Hkv);                  // GQA: q head -> kv head
     const int gs_shift = __ffs(gs) - 1;            // gs is pow2: k/gs == k>>shift
     const bool active = tid < D;                   // pass-2 owns head_dim d=tid
 
@@ -364,8 +367,8 @@ __global__ void kv_decode_wide_kernel(
             const int key = cs + tid;
             float dot = 0.0f;
             for (int blk = 0; blk < NB; ++blk) {
-                const float ksc = ms::e8m0_to_scale(ks[(h * NB + blk) * Lk + key]);
-                const long kbase = (long)(h * NB + blk) * Lk + key;
+                const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lk + key]);
+                const long kbase = (long)(hk * NB + blk) * Lk + key;
                 uint8_t sb[8];                              // SB <= 8 shared-code bytes
                 const long sbase = kbase * SB;
                 #pragma unroll
@@ -402,17 +405,17 @@ __global__ void kv_decode_wide_kernel(
         for (int blk = 0; blk < NB; ++blk) {
             if constexpr (U4) {
                 const uint4* src4 = reinterpret_cast<const uint4*>(
-                        vu + ((long)(h * NB + blk) * Lk + cs) * UB);
+                        vu + ((long)(hk * NB + blk) * Lk + cs) * UB);
                 uint4* dst4 = reinterpret_cast<uint4*>(pVu + (long)blk * chunk * UB);
                 for (int i = tid; i < nC; i += NT) dst4[i] = src4[i];
             } else {
                 const uint32_t* s32 = reinterpret_cast<const uint32_t*>(
-                        vu + ((long)(h * NB + blk) * Lk + cs) * UB);
+                        vu + ((long)(hk * NB + blk) * Lk + cs) * UB);
                 uint32_t* d32 = reinterpret_cast<uint32_t*>(pVu + (long)blk * chunk * UB);
                 const int nw = (nC * UB) >> 2;
                 for (int i = tid; i < nw; i += NT) d32[i] = s32[i];
             }
-            const unsigned char* srch = vh + ((long)(h * NB + blk) * Lk + cs) * SB;
+            const unsigned char* srch = vh + ((long)(hk * NB + blk) * Lk + cs) * SB;
             unsigned char* dsth = pVh + (long)blk * chunk * SB;
             for (int i = tid; i < nC * SB; i += NT) dsth[i] = srch[i];  // tiny shared plane
         }
@@ -432,7 +435,7 @@ __global__ void kv_decode_wide_kernel(
             lsum += p;
             if (active) {
                 const int j = cs + kk;
-                const float vsc = ms::e8m0_to_scale(vs[(h * NB + blk) * Lk + j]);
+                const float vsc = ms::e8m0_to_scale(vs[(hk * NB + blk) * Lk + j]);
                 float vv;
                 if constexpr (U4)
                     vv = (float)ms::unpack_ms_kv_elem_u4(pVu, pVh,
@@ -557,7 +560,7 @@ torch::Tensor kv_decode_attention_cuda(
         torch::Tensor q,                                   // bf16 [H, D]
         torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
         torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
-        int64_t H, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs) {
+        int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs) {
     TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
     TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "q must be bf16");
     const int wbits = 8 - (int)u;
@@ -598,7 +601,7 @@ torch::Tensor kv_decode_attention_cuda(
                 ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
                 vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
                 part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-                (int)H, (int)Lk, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale);
+                (int)H, (int)Hkv, (int)Lk, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale);
         };
         if ((int)u == 4) launch(std::true_type{});
         else             launch(std::false_type{});
@@ -610,14 +613,14 @@ torch::Tensor kv_decode_attention_cuda(
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
             part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            (int)H, (int)Lk, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, sm_scale, diag);
+            (int)H, (int)Hkv, (int)Lk, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, sm_scale, diag);
     } else {
         kv_decode_split_kernel<<<dim3((int)H, S), threads, smem>>>(
             reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
             part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            (int)H, (int)Lk, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, sm_scale);
+            (int)H, (int)Hkv, (int)Lk, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, sm_scale);
     }
 
     kv_decode_combine_kernel<<<(int)H, threads>>>(
