@@ -83,6 +83,22 @@ P·V) 커널이면 BW-bound가 되고, 거기서 MSAQ u4는 바이트 비율 그
 스칼라 커널은 66 GB/s(BW의 7~8× 부족)라 그 국면에 도달하지 못한다. → **공정한 MSAQ KV 우위는
 BW-bound(텐서코어) flash-decode 재작성이 전제**이며, 이는 양 포맷 모두에 대한 대규모 작업이다.
 
+**BW-bound 재작성 시도와 근본 장애물(시도 결과).** "MSAQ가 이기는 국면 = BW-bound" 가설로
+flash-decode를 BW-bound로 끌어올리려 했으나 다음 장애물을 확인:
+- 커널은 BW 시간의 **~20×** 느리게 돈다(MSAQ V 2.7MB는 500GB/s면 ~5µs인데 커널은 100+µs).
+  즉 per-key 스칼라 compute + V-staging copy + softmax + combine **오버헤드가 지배**하고, 전역
+  BW는 병목이 아니다 → 바이트를 덜 읽어도 시간이 안 준다.
+- **근본: sub-byte V의 Pass-2(per-d, 키들에 대한 reduction).** thread-per-d로 V를 직접 읽으면 한
+  워프가 한 키의 32 nibble=16B만 만져 **half-sector**(바이트 이점 0). 이를 피하려 **staging**(전역
+  V를 coalesced로 shared에 복사)하면 full-sector·0.56× 바이트지만 **shared(~10KB)가 occupancy를
+  캡**하고 staging copy+sync 오버헤드가 split-K 확장을 막는다(mult>12서 MSAQ가 *더 느려짐*). 실제로
+  staging 제거(direct-V) 실험은 MSAQ를 **tie→1.40 손해**로 악화시켰다(half-sector V). 텐서코어 P·V
+  도 V를 shared에 unpack해야 해(=staging) 이 장애물을 못 피한다.
+- **결론(시도 후):** 현 구조에서 MSAQ KV read의 공정 최선은 **tie(u4 ~1.0)**. 깨끗한 win은 오버헤드를
+  전부 걷어낸 **완전한 FlashDecoding 재설계**(BW 포화)를 요구하며 — sub-byte V의 per-d reduction
+  특성상 그조차 V 바이트 이점을 보장하지 못한다. → 본 라운드에선 **공정 최선(tie) 상태로 end-to-end
+  재측정**(아래)하고, KV read의 win은 미해결 과제로 명시.
+
 <details><summary>(원래 적출된 비대칭 — 기록용)</summary>
 
 원래 문제: MSAQ는 thread-per-key(wide, Phase 18)인데 MXINT8 KV read만 구버전 warp-per-key+
