@@ -384,15 +384,35 @@ __global__ void kv_decode_wide_kernel(
                         const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
                         dot += q_sh[blk * BLOCK + kd] * ((up_code * 16 + sh_code) * ksc);
                     }
-                } else {                                    // u2/u3: word-load + general
+                } else {                                    // u2/u3: STREAMING bit-buffer unpack
+                    // thread-per-key unpacks ALL 32 codes of its key sequentially, so the
+                    // rolling 64-bit buffer (one shift+mask per code, refill a word only when
+                    // low) replaces the per-code straddle funnel-shift -> ~the W-only GEMV
+                    // Phase-20 win ported to the KV read (the u2/u3 path was left on the heavy
+                    // general unpack). Bit-exact (same codes). MXINT8 reads int8 directly so
+                    // no matched change -> this is a mantissa-sharing-only optimization.
                     uint32_t ureg[6];                       // UB/4 <= 6 words (u2: 24B)
                     const uint32_t* src = reinterpret_cast<const uint32_t*>(ku + kbase * UB);
                     #pragma unroll
                     for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
-                    const uint8_t* ublk = reinterpret_cast<const uint8_t*>(ureg);
+                    uint32_t sreg[3] = {0u,0u,0u};
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) if (i < SB) sreg[i >> 2] |= (uint32_t)sb[i] << (8 * (i & 3));
+                    const int wbits = 8 - u, gsmask = gs - 1;
+                    const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+                    const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+                    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+                    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
                     for (int kd = 0; kd < BLOCK; ++kd) {
-                        const int w = ms::unpack_ms_kv_elem(ublk, sb, 0, 0, 0, 0, kd,
-                                                            u, gs, UB, SB);
+                        if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+                        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+                        ubuf >>= wbits; unb -= wbits;
+                        if ((kd & gsmask) == 0) {
+                            if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+                            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+                            sbuf >>= u; snb -= u;
+                        }
+                        const int w = up_code * (1 << u) + sh_code;
                         dot += q_sh[blk * BLOCK + kd] * (w * ksc);
                     }
                 }
