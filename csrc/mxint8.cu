@@ -521,7 +521,7 @@ torch::Tensor mxint8_wa_gemm_cuda(
     scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), \
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB
-    DISPATCH_TILE(mxint8_wa_gemm_tiled);   // matched W+A WMMA-pipe removed (MSAQ lost — P23)
+    DISPATCH_TILE(mxint8_wa_gemm_tiled);   // matched IMMA/WMMA-pipe removed (MSAQ lost — P23/24)
 #undef ARGS
     return Y;
 }

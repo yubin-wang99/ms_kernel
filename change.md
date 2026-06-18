@@ -1013,3 +1013,41 @@ stage↔MMA overlap**으로 같은 효과.)
 - **이제 GEMV·KV·W-only GEMM이 전 u에서 MXINT8 추월.** 남은 건 W+A u2/u3(1.02~1.04, near-parity)
   뿐 — activation quant가 stage를 점유해 unpack을 못 숨김. INT8 IMMA(quant를 epilogue scale로
   빼서 stage를 비움)가 다음 후보.
+
+---
+
+# Phase 24 — INT8 IMMA로 W+A u2/u3 crossover 시도 ❌ (per-block epilogue가 발목, revert)
+
+P23이 가리킨 W+A의 마지막 레버: scale을 stage에서 빼 epilogue로 보내고 INT8 tensor core 사용.
+`wa_gemm_imma`(+matched `mxint8_wa_gemm_imma`, cfg=12): stage가 **raw int8**(qx, qw) 생산
+(scale fold 없음) → INT8 IMMA가 블록당 int32 dot → **per-block epilogue**에서 sa*sw 적용·fp32 누적.
+
+## 결과 (M=512, clean 측정) — FP32보다 느림
+| u | FP32 | **IMMA** | IMMA 절대(MSAQ) |
+|---|------|----------|------------------|
+| u2 | 1.05 | **1.10 ❌** | 4146us (FP32 ~3700보다 느림) |
+| u3 | 1.02 | **1.07 ❌** | 4064us |
+| u4 | 0.93 | **0.95 ❌** | 3604us |
+
+(재인증 `test_wa`(cfg=12) 통과 — int dot이라 오히려 정확. 단 느림.)
+
+## 왜 실패했나 — per-block scaling epilogue 오버헤드
+- MXINT8 scale은 **블록(32-key)당**이라 int32 dot을 **블록마다** sa·sw로 스케일해야 함 →
+  블록간 int32 누적 불가 → 블록마다 `store_matrix_sync`(Cs 16KB) + `__syncthreads` ×2 +
+  thread-per-output 스케일-누적. 이게 **NB=128번** 반복 → int8 matmul 이득을 다 잡아먹음.
+- 그래서 IMMA가 matmul을 빠르게 해도 **kernel 전체는 epilogue-bound**라 FP32보다 느림. unpack
+  노출(P22/23)에 더해 epilogue 오버헤드까지 → MSAQ 비율도 악화.
+- sw를 블록당 precompute(`sw_s`)해 epilogue의 exp2f 제거도 시도 → 무효(병목은 exp2f가 아니라
+  store+sync 구조).
+
+## 결론 — W+A crossover는 CUTLASS fused epilogue가 필요
+hand-written으로는 per-block scale을 `store_matrix_sync`로밖에 못 빼는데 그 오버헤드가 치명적.
+진짜 해법은 **fragment를 레지스터에서 직접 sa·sw로 스케일하는 fused epilogue**(CUTLASS의
+EpilogueWithBroadcast류) — 정의되지 않은 fragment 레이아웃을 다뤄야 해 hand-write 영역 밖.
+→ IMMA 커널 전부 revert. W+A는 **FP32 tiled(1.02~1.05, near-parity)** 유지.
+
+## 최종 GEMM/W+A 정리
+- **W-only GEMM: WMMA-pipe로 전 u crossover**(0.93~0.98, cfg=11 opt-in) ✅ (P23)
+- **W+A GEMM: u4만 crossover(0.93), u2/u3 near-parity(1.02~1.05)** — BF16 pipe(P23)·INT8 IMMA(P24)
+  둘 다 hand-write로는 못 넘김. activation quant(stage 점유) + per-block scale(epilogue 오버헤드)이
+  근본 원인. CUTLASS 급 fused 파이프라인이 유일한 잔여 레버.

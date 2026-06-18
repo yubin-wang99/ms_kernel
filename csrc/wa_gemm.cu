@@ -460,7 +460,7 @@ torch::Tensor wa_gemm_cuda(
     scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(), \
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
-    DISPATCH_TILE(wa_gemm_tiled);   // W+A WMMA-pipe was tried; lost (see change.md P23)
+    DISPATCH_TILE(wa_gemm_tiled);   // WMMA-pipe (P23) and INT8-IMMA (P24) were tried; both lost
 #undef ARGS
     return Y;
 }
