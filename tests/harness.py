@@ -12,7 +12,7 @@ for every path); the ratio is what isolates the kernels.
 Usage:  python harness.py [--prefill 800] [--decode 3880] [--layers 32]
                           [--paths bf16,mxint8_wonly,...] [--us 2,3,4]
 """
-import argparse, time, sys, gc
+import argparse, time, sys, gc, os, json, subprocess
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -95,6 +95,13 @@ def rope(x, cos, sin):                                   # x [L, H, hd], cos/sin
     return torch.stack([x1 * c - x2 * s, x1 * s + x2 * c], -1).flatten(-2).to(x.dtype)
 
 
+def rope_pos(pos, dev):                                  # cos/sin [1, hd/2] for one position
+    hd = Cfg.head_dim
+    inv = 1.0 / (Cfg.theta ** (torch.arange(0, hd, 2, device=dev).float() / hd))
+    f = torch.outer(torch.tensor([float(pos)], device=dev), inv)
+    return torch.cos(f), torch.sin(f)
+
+
 def silu_mlp(gate, up):
     return (F.silu(gate.float()) * up.float()).to(gate.dtype)
 
@@ -161,10 +168,10 @@ class KVCache:
 
 # ---- the model (weights reused across layers) -------------------------------
 class Model:
-    def __init__(self, path, u, gs):
+    def __init__(self, w_path, u, gs):
         C = Cfg
-        self.path = path
-        L = lambda OUT, K, sd: QLinear(OUT, K, path, u, gs, sd)
+        self.w_path = w_path                         # weight quant: bf16/{mx,msaq}_{wonly,wa}
+        L = lambda OUT, K, sd: QLinear(OUT, K, w_path, u, gs, sd)
         self.wq = L(C.n_head * C.head_dim, C.hidden, 1)
         self.wk = L(C.n_kv * C.head_dim, C.hidden, 2)
         self.wv = L(C.n_kv * C.head_dim, C.hidden, 3)
@@ -203,13 +210,9 @@ class Model:
         logits = rmsnorm(x[-1:]) @ self.lm_head          # last token -> [1, vocab]
         return x[-1]                                     # [hidden] (next decode input)
 
-    # ---- one decode step: a single token through `layers` layers ------------
-    def decode_step(self, x, pos, layers, caches):
+    # ---- one decode step (cos/sin precomputed -> graph-capturable) ----------
+    def decode_step(self, x, cos, sin, pos, layers, caches):
         C = Cfg
-        cos = torch.cos(torch.outer(torch.tensor([float(pos)], device=x.device),
-                                    1.0 / (C.theta ** (torch.arange(0, C.head_dim, 2, device=x.device).float() / C.head_dim))))
-        sin = torch.sin(torch.outer(torch.tensor([float(pos)], device=x.device),
-                                    1.0 / (C.theta ** (torch.arange(0, C.head_dim, 2, device=x.device).float() / C.head_dim))))
         for li in range(layers):
             h = rmsnorm(x)
             q = self.wq.gemv(h).view(C.n_head, C.head_dim)
@@ -226,83 +229,140 @@ class Model:
         return x
 
 
-def run_path(path, u, gs, prefill, decode, layers, tag):
+def run_scenario(w_path, kv_path, u, gs, prefill, decode, layers, tag, reps=50):
+    """CUDA-graph decode timing: capture one decode step per context checkpoint
+    (dispatch-free), replay it, then integrate over the decode trajectory."""
     torch.cuda.synchronize(); torch.cuda.empty_cache()
-    m = Model(path, u, gs)
+    m = Model(w_path, u, gs)
     Lcap = prefill + decode
-    caches = [KVCache(path, Lcap, u, gs) for _ in range(layers)]
+    caches = [KVCache(kv_path, Lcap, u, gs) for _ in range(layers)]
     ids = torch.randint(0, Cfg.vocab, (prefill,), device="cuda")
 
-    # warmup INTO the real caches (prefill+decode overwrite them) — saves the
-    # peak memory of a second 32-layer cache set.
-    xw = m.prefill(ids, layers, caches)
-    for p in range(prefill, prefill + 4):
-        xw = m.decode_step(xw, p, layers, caches)
-    torch.cuda.synchronize()
-
-    # ---- TTFT ----
+    # prefill twice (warm + timed). Fills caches[:prefill]; slots >= prefill stay 0
+    # (zeros are valid bytes -> attend cost is content-independent, so no fill needed).
+    m.prefill(ids, layers, caches); torch.cuda.synchronize()
     t0 = torch.cuda.Event(True); t1 = torch.cuda.Event(True)
-    t0.record(); x = m.prefill(ids, layers, caches); t1.record()
-    torch.cuda.synchronize(); ttft = t0.elapsed_time(t1)  # ms
+    t0.record(); m.prefill(ids, layers, caches); t1.record()
+    torch.cuda.synchronize(); ttft = t0.elapsed_time(t1)
 
-    # ---- decode: full loop, sampled growth curve ----
-    marks = {1, 256, 1024, 2048, decode}
-    curve = {}
-    torch.cuda.synchronize(); ds = time.perf_counter()
-    e0 = torch.cuda.Event(True); e1 = torch.cuda.Event(True)
-    for i in range(decode):
-        pos = prefill + i
-        if (i + 1) in marks:
-            torch.cuda.synchronize(); e0.record()
-            x = m.decode_step(x, pos, layers, caches)
-            e1.record(); torch.cuda.synchronize()
-            curve[i + 1] = e0.elapsed_time(e1)
-        else:
-            x = m.decode_step(x, pos, layers, caches)
-    torch.cuda.synchronize(); dtot = (time.perf_counter() - ds) * 1e3  # ms
+    # ---- decode TPOT via CUDA graph at each context checkpoint ----
+    ctxs = sorted({prefill + 1, prefill + 256, prefill + 1024,
+                   prefill + 2048, prefill + decode})
+    x_static = torch.zeros(Cfg.hidden, dtype=torch.bfloat16, device="cuda")
+    gtpot = {}
+    for ctx in ctxs:
+        pos = min(ctx, Lcap - 1)
+        cos, sin = rope_pos(pos, "cuda")
+        for c in caches:
+            c.pos = pos
+        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):                    # prime allocator / autotune on side stream
+            for _ in range(3):
+                m.decode_step(x_static, cos, sin, pos, layers, caches)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            m.decode_step(x_static, cos, sin, pos, layers, caches)
+        torch.cuda.synchronize()
+        e0 = torch.cuda.Event(True); e1 = torch.cuda.Event(True)
+        e0.record()
+        for _ in range(reps):
+            g.replay()
+        e1.record(); torch.cuda.synchronize()
+        gtpot[ctx] = e0.elapsed_time(e1) / reps       # dispatch-free per-step ms at this context
+        del g
+
+    # integrate per-step cost over the decode trajectory (ctx = prefill+1 .. prefill+decode)
+    cks = sorted(gtpot); vals = [gtpot[c] for c in cks]
+    traj = np.interp(np.arange(prefill + 1, prefill + 1 + decode), cks, vals)
+    dtot = float(traj.sum())                          # ms
     tpot = dtot / decode
     total = ttft + dtot
     del m, caches; gc.collect(); torch.cuda.empty_cache()
+    curve = [[c, gtpot[c]] for c in sorted(gtpot)]    # json-safe (list, not int-keyed dict)
     return dict(tag=tag, ttft=ttft, tpot=tpot, total=total, curve=curve)
 
 
-def main():
+# the four decoupled quantization scenarios (weight knob x KV knob).
+#   w_style: None -> bf16 weights;  kv: True -> quantized KV cache.
+SCENARIOS = [
+    ("S1 W-only",    "wonly", False),
+    ("S2 W+A",       "wa",    False),
+    ("S3 KV-only",   None,    True),
+    ("S4 W-only+KV", "wonly", True),
+]
+
+
+def build_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefill", type=int, default=800)
     ap.add_argument("--decode", type=int, default=3880)
     ap.add_argument("--layers", type=int, default=32)
-    ap.add_argument("--paths", default="bf16,mxint8_wonly,mxint8_wa,msaq_wonly,msaq_wa")
-    ap.add_argument("--us", default="2,3,4")
-    args = ap.parse_args()
+    ap.add_argument("--us", default="4")
+    ap.add_argument("--reps", type=int, default=50)
+    # worker mode (one scenario per fresh process — repeated CUDA-graph capture in
+    # one process wedges the next eager prefill, so each scenario is isolated).
+    ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--wpath"); ap.add_argument("--kvpath")
+    ap.add_argument("--u", type=int, default=4); ap.add_argument("--tag", default="")
+    return ap.parse_args()
+
+
+def worker(args):
+    r = run_scenario(args.wpath, args.kvpath, args.u, 8, args.prefill, args.decode,
+                     args.layers, args.tag, args.reps)
+    print("RESULT " + json.dumps(r), flush=True)
+
+
+def spawn(args, w, kv, u, tag):
+    cmd = [sys.executable, "-u", os.path.abspath(__file__), "--worker",
+           "--wpath", w, "--kvpath", kv, "--u", str(u), "--tag", tag,
+           "--prefill", str(args.prefill), "--decode", str(args.decode),
+           "--layers", str(args.layers), "--reps", str(args.reps)]
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    for line in out.stdout.splitlines():
+        if line.startswith("RESULT "):
+            return json.loads(line[len("RESULT "):])
+    raise RuntimeError(f"worker failed [{tag}]:\nSTDOUT:{out.stdout[-800:]}\nSTDERR:{out.stderr[-800:]}")
+
+
+def main():
+    args = build_args()
+    if args.worker:
+        worker(args); return
+    us = [int(x) for x in args.us.split(",")]
     print(f"[harness] {torch.cuda.get_device_name(0)} | Llama-3.1-8B | "
-          f"prefill={args.prefill} decode={args.decode} layers={args.layers}")
-    print(f"          (random reused weights; glue bf16; ms; lower better)\n")
+          f"prefill={args.prefill} decode={args.decode} layers={args.layers} | CUDA-graph decode")
+    print(f"          (random reused weights; glue bf16; per-scenario subprocess; ms; lower better)\n")
 
-    jobs = []
-    for p in args.paths.split(","):
-        if p.startswith("msaq"):
-            for u in [int(x) for x in args.us.split(",")]:
-                jobs.append((p, u, 8, f"{p}-u{u}"))
-        else:
-            jobs.append((p, 4, 8, p))
+    bf = spawn(args, "bf16", "bf16", 4, "bf16 baseline")
+    print(f"  {bf['tag']:22s} TTFT {bf['ttft']:7.1f}  TPOT {bf['tpot']:6.3f}  total {bf['total']/1e3:6.2f}s",
+          flush=True)
 
-    rows = []
-    for path, u, gs, tag in jobs:
-        r = run_path(path, u, gs, args.prefill, args.decode, args.layers, tag)
-        rows.append(r)
-        cur = "  ".join(f"t{k}:{v:.1f}" for k, v in sorted(r["curve"].items()))
-        print(f"  {tag:16s} TTFT {r['ttft']:8.1f}  TPOT {r['tpot']:6.3f}  total {r['total']/1e3:7.2f}s | TPOT@ {cur}")
+    rows = [bf]
+    for sname, wstyle, kvq in SCENARIOS:
+        print(f"\n  === {sname} ===", flush=True)
+        variants = [("mxint8", 4)] + [("msaq", u) for u in us]   # non-quant side stays bf16
+        scen_rows = []
+        for fmt, u in variants:
+            w = "bf16" if wstyle is None else f"{fmt}_{wstyle}"
+            kv = fmt if kvq else "bf16"
+            usuf = f"-u{u}" if fmt == "msaq" else ""
+            r = spawn(args, w, kv, u, f"{sname} [{fmt}{usuf}]")
+            scen_rows.append(r); rows.append(r)
+            print(f"  {r['tag']:22s} TTFT {r['ttft']:7.1f}  TPOT {r['tpot']:6.3f}  "
+                  f"total {r['total']/1e3:6.2f}s  /bf16 {r['total']/bf['total']:.2f}", flush=True)
+        mx = scen_rows[0]
+        for r in scen_rows[1:]:
+            print(f"       {r['tag']:28s} /mxint8 {r['total']/mx['total']:.2f}", flush=True)
 
-    # ratios vs bf16 and vs matched mxint8
-    base = {r["tag"]: r for r in rows}
-    print("\n  ratios (total inference time):")
-    bf = base.get("bf16")
+    # growth curves (dispatch-free per-step ms at each context)
+    print("\n  TPOT growth (graph, ms) by context length:")
+    cks = [c for c, _ in rows[0]["curve"]]
+    print("    " + "ctx:".ljust(26) + "  ".join(f"{c:>6d}" for c in cks))
     for r in rows:
-        ref = ""
-        if bf: ref += f" /bf16 {r['total']/bf['total']:.2f}"
-        mx = base.get("mxint8_wa" if "wa" in r["tag"] else "mxint8_wonly")
-        if mx and r["tag"].startswith("msaq"): ref += f"  /mxint8 {r['total']/mx['total']:.2f}"
-        print(f"  {r['tag']:16s}{ref}")
+        d = dict(r["curve"])
+        print("    " + r["tag"].ljust(26) + "  ".join(f"{d[c]:6.2f}" for c in cks))
 
 
 if __name__ == "__main__":
