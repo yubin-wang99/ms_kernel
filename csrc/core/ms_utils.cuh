@@ -195,6 +195,59 @@ __device__ __forceinline__ int unpack_ms_kv_elem_u4(
     return up_code * 16 + sh_code;
 }
 
+// =============================================================================
+//  PACK / QUANTIZE primitives (device counterpart of ms_lib.pack.decompose) —
+//  shared by the KV write/append kernels (bit-pack tail) and the W+A activation
+//  pre-pass (int8-word combine tail). New numerics: none — bit-exact to
+//  pack.decompose / reference.quant_act(share=True). (change.md Phase 28.)
+// =============================================================================
+
+// E8M0 exponent for a block's max-abs:  clamp(floor(log2 amax) - E_MAX, +-127).
+__device__ __forceinline__ int e8m0_exp_from_amax(float amax) {
+    int e = (int)floorf(log2f(fmaxf(amax, 1e-30f))) - E_MAX;
+    return max(-127, min(127, e));
+}
+
+// Decompose one 32-element block (thread holds x[32]) -> (8-u)-bit q_upper[32] +
+// u-bit r_shared[32/gs] (one per gs-group) + E8M0 exponent (return). Identical to
+// pack.decompose: q_upper = clip(round(x/(sa*2^u))); r_shared from the group-mean
+// residual. gs is a power of two. q_upper/r_shared buffers sized 32 / 32/gs.
+__device__ __forceinline__ int decompose_ms_block(
+        const float* __restrict__ x, int u, int gs, int* q_upper, int* r_shared) {
+    float amax = 1e-30f;
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) amax = fmaxf(amax, fabsf(x[k]));
+    const int ea = e8m0_exp_from_amax(amax);
+    const float sa = exp2f((float)ea), s_unshared = sa * exp2f((float)u);
+    const int qmax = (1 << (7 - u)) - 1, smin = -(1 << (u - 1)), smax = (1 << (u - 1)) - 1;
+    const int ng = 32 / gs;
+    for (int g = 0; g < ng; ++g) {
+        float ravg = 0.0f;
+        for (int kk = 0; kk < gs; ++kk) {
+            const int k = g * gs + kk;
+            q_upper[k] = max(-qmax, min(qmax, (int)rintf(x[k] / s_unshared)));
+            ravg += x[k] - (float)q_upper[k] * s_unshared;
+        }
+        r_shared[g] = max(smin, min(smax, (int)rintf(ravg / (float)gs / sa)));
+    }
+    return ea;
+}
+
+// Dense LSB bit-pack tail (inverse of extract_code): n codes of `width` bits,
+// LSB-first, into a contiguous `nbytes`-byte buffer. A code straddles at most two
+// bytes (width<=7). Used by the KV write/append kernels to produce the certified
+// token-major planes that kv_decode_* reads back.
+__device__ __forceinline__ void pack_codes_lsb(
+        const int* __restrict__ codes, int n, int width, uint8_t* __restrict__ buf, int nbytes) {
+    for (int i = 0; i < nbytes; ++i) buf[i] = 0;
+    for (int i = 0; i < n; ++i) {
+        const uint32_t code = (uint32_t)codes[i] & ((1u << width) - 1u);
+        const int bit = i * width, by = bit >> 3, off = bit & 7;
+        buf[by] |= (uint8_t)(code << off);
+        if (off + width > 8 && by + 1 < nbytes) buf[by + 1] |= (uint8_t)(code >> (8 - off));
+    }
+}
+
 }  // namespace ms
 
 // =============================================================================

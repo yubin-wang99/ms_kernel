@@ -552,6 +552,34 @@ __global__ void mxint8_kv_combine_kernel(
 }
 
 inline int next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
+
+// ---- KV WRITE (MXINT8 baseline), matched to kv_write_kernel ------------------
+//   Same thread-per-token structure; quantize 32 head_dim to int8 directly (no
+//   bit-pack), store to qweight [H,nb,L,32]. (change.md Phase 28.)
+__global__ void mxint8_kv_write_kernel(
+        const __nv_bfloat16* __restrict__ X,    // [H, L, D]
+        int8_t* __restrict__ scale_exp,          // [H, nb, L]
+        int8_t* __restrict__ qweight,            // [H, nb, L, 32]
+        int H, int L, int D, int NB) {
+    const int h = blockIdx.x;
+    const int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j >= L) return;
+    for (int blk = 0; blk < NB; ++blk) {
+        const long xb = ((long)h * L + j) * D + (long)blk * BLOCK;
+        float amax = 1e-30f;
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) amax = fmaxf(amax, fabsf(__bfloat162float(X[xb + k])));
+        const int ea = ms::e8m0_exp_from_amax(amax);
+        const float s = exp2f((float)ea);
+        const long tok = (long)(h * NB + blk) * L + j;
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            int q = (int)rintf(__bfloat162float(X[xb + k]) / s);
+            qweight[tok * BLOCK + k] = (int8_t)max(-127, min(127, q));
+        }
+        scale_exp[tok] = (int8_t)ea;
+    }
+}
 } // namespace
 
 // ---- host launchers ---------------------------------------------------------
@@ -647,4 +675,18 @@ torch::Tensor mxint8_kv_decode_cuda(
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         (int)H, (int)D, S);
     return out;
+}
+
+// MXINT8 KV write launcher -> (scale_exp [H,nb,L], qweight [H,nb,L,32]).
+std::vector<torch::Tensor> mxint8_kv_write_cuda(
+        torch::Tensor X, int64_t H, int64_t L, int64_t D, int64_t NB) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    auto i8 = X.options().dtype(torch::kInt8);
+    auto scale_exp = torch::empty({H, NB, L}, i8);
+    auto qweight   = torch::empty({H, NB, L, BLOCK}, i8);
+    const int TPB = 256;
+    mxint8_kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB), TPB>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(), (int)H, (int)L, (int)D, (int)NB);
+    return {scale_exp, qweight};
 }

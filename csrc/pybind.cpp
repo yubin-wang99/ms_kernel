@@ -31,6 +31,8 @@ torch::Tensor kv_decode_attention_cuda(
     torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
     torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
     int64_t H, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs);
+std::vector<torch::Tensor> kv_write_cuda(
+    torch::Tensor X, int64_t H, int64_t L, int64_t D, int64_t NB, int64_t u, int64_t gs);
 
 // defined in mxint8.cu (baseline)
 torch::Tensor mxint8_gemv_cuda(
@@ -46,6 +48,8 @@ torch::Tensor mxint8_kv_decode_cuda(
     torch::Tensor q, torch::Tensor ks, torch::Tensor kq,
     torch::Tensor vs, torch::Tensor vq,
     int64_t H, int64_t Lk, int64_t D, int64_t NB);
+std::vector<torch::Tensor> mxint8_kv_write_cuda(
+    torch::Tensor X, int64_t H, int64_t L, int64_t D, int64_t NB);
 
 TORCH_LIBRARY(msaq, m) {
     m.def("wonly_gemv(Tensor x, Tensor scale_exp, Tensor upper, Tensor shared, "
@@ -53,6 +57,7 @@ TORCH_LIBRARY(msaq, m) {
     m.def("wonly_gemv_wide(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
           "int OUT, int NB, int u, int gs) -> Tensor", &wonly_gemv_wide_cuda);
     m.def("quant_act(Tensor X, int M, int K, int NB, int u, int gs) -> Tensor[]", &quant_act_cuda);
+    m.def("kv_write(Tensor X, int H, int L, int D, int NB, int u, int gs) -> Tensor[]", &kv_write_cuda);
     m.def("wonly_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wonly_gemm_cuda);
     m.def("wa_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "
@@ -71,5 +76,6 @@ TORCH_LIBRARY(msaq, m) {
     m.def("mxint8_kv_decode(Tensor q, Tensor ks, Tensor kq, "
           "Tensor vs, Tensor vq, int H, int Lk, int D, int NB) -> Tensor",
           &mxint8_kv_decode_cuda);
+    m.def("mxint8_kv_write(Tensor X, int H, int L, int D, int NB) -> Tensor[]", &mxint8_kv_write_cuda);
 }
 PYBIND11_MODULE(ms_cuda, m) {}

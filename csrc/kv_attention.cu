@@ -481,6 +481,44 @@ __global__ void kv_decode_combine_kernel(
 
 inline int next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 
+// ---- KV WRITE (prefill): pack_kv as a CUDA kernel ---------------------------
+//   bf16 X [H,L,D] (post-projection+RoPE) -> token-major MSAQ planes that
+//   kv_decode_* reads back unchanged. THREAD-PER-TOKEN (the write mirror of the
+//   Phase-18 read): thread (h,j) loops the nb head_dim blocks; for a fixed
+//   (h,blk) consecutive threads = consecutive tokens write UB-contiguous bytes
+//   -> coalesced store (u4: 512 B/warp). Blocks = H*ceil(L/TPB), occupancy free
+//   (no split needed). decompose_ms_block + dense LSB bit-pack (ms_utils). One
+//   plane set (K or V) per call. (change.md Phase 28.)
+__global__ void kv_write_kernel(
+        const __nv_bfloat16* __restrict__ X,    // [H, L, D]
+        int8_t*  __restrict__ scale_exp,         // [H, nb, L]
+        uint8_t* __restrict__ upper,             // [H, nb, L, UB]
+        uint8_t* __restrict__ shared,            // [H, nb, L, SB]
+        int H, int L, int D, int NB, int u, int gs, int UB, int SB) {
+    const int h = blockIdx.x;
+    const int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j >= L) return;
+    const int ng = 32 / gs, wbits = 8 - u;
+    for (int blk = 0; blk < NB; ++blk) {
+        float x[32];
+        const long xb = ((long)h * L + j) * D + (long)blk * 32;
+        #pragma unroll
+        for (int k = 0; k < 32; ++k) x[k] = __bfloat162float(X[xb + k]);
+        int q_upper[32], r_shared[16];
+        const int ea = ms::decompose_ms_block(x, u, gs, q_upper, r_shared);
+        const long tok = (long)(h * NB + blk) * L + j;
+        uint32_t ureg[8] = {0u,0u,0u,0u,0u,0u,0u,0u};   // <=24 packed upper bytes
+        ms::pack_codes_lsb(q_upper, 32, wbits, (uint8_t*)ureg, UB);
+        uint32_t* dU = reinterpret_cast<uint32_t*>(upper + tok * UB);  // UB,tok*UB 4-aligned
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) if (w < (UB >> 2)) dU[w] = ureg[w];
+        uint8_t sbuf[8];
+        ms::pack_codes_lsb(r_shared, ng, u, sbuf, SB);
+        for (int bi = 0; bi < SB; ++bi) shared[tok * SB + bi] = sbuf[bi];
+        scale_exp[tok] = (int8_t)ea;
+    }
+}
+
 } // namespace
 
 // Host launcher. Signature matches ms_lib.ops.kv_decode_attention / the schema.
@@ -556,4 +594,24 @@ torch::Tensor kv_decode_attention_cuda(
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         (int)H, (int)D, S);
     return out;
+}
+// KV write launcher: bf16 X [H,L,D] -> (scale_exp [H,nb,L], upper [H,nb,L,UB],
+// shared [H,nb,L,SB]) — the certified token-major planes. UB/SB from u,gs.
+std::vector<torch::Tensor> kv_write_cuda(
+        torch::Tensor X, int64_t H, int64_t L, int64_t D, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    const int wbits = 8 - (int)u;
+    const int UB = BLOCK * wbits / 8;
+    const int SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
+    auto i8 = X.options().dtype(torch::kInt8);
+    auto u8 = X.options().dtype(torch::kUInt8);
+    auto scale_exp = torch::empty({H, NB, L}, i8);
+    auto upper     = torch::empty({H, NB, L, UB}, u8);
+    auto shared    = torch::empty({H, NB, L, SB}, u8);
+    const int TPB = 256;
+    kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB), TPB>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
+        (int)H, (int)L, (int)D, (int)NB, (int)u, (int)gs, UB, SB);
+    return {scale_exp, upper, shared};
 }
