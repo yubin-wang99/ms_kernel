@@ -24,16 +24,36 @@ from ms_lib.pack import pack_weight, pack_weight_mxint8
 OPS = torch.ops.msaq
 
 
-# ---- Llama-3.1-8B config ----------------------------------------------------
-class Cfg:
+# ---- model configs (timing-only: dims matter, glue/theta/eps are value-indep) --
+#   Cfg is a mutable holder set by set_model(); all kernels read Cfg.* as before.
+MODELS = {
+    "llama31_8b": dict(hidden=4096, n_head=32, n_kv=8,  head_dim=128, inter=14336,
+                       vocab=128256, eps=1e-5, theta=500000.0, layers=32),
+    "gemma2_9b":  dict(hidden=3584, n_head=16, n_kv=8,  head_dim=256, inter=14336,
+                       vocab=256000, eps=1e-6, theta=10000.0,  layers=42),
+    "mistral_7b": dict(hidden=4096, n_head=32, n_kv=8,  head_dim=128, inter=14336,
+                       vocab=32000,  eps=1e-5, theta=1000000.0, layers=32),
+}
+
+
+class Cfg:                         # default = Llama-3.1-8B; set_model() overrides
     hidden = 4096
     n_head = 32
-    n_kv = 8                      # GQA group = 4
+    n_kv = 8                       # GQA group = n_head/n_kv
     head_dim = 128
     inter = 14336
     vocab = 128256
     eps = 1e-5
     theta = 500000.0
+    layers = 32
+    name = "llama31_8b"
+
+
+def set_model(name):
+    c = MODELS[name]
+    for k, v in c.items():
+        setattr(Cfg, k, v)
+    Cfg.name = name
 
 
 def cuda(a):
@@ -297,26 +317,34 @@ def build_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefill", type=int, default=800)
     ap.add_argument("--decode", type=int, default=3880)
-    ap.add_argument("--layers", type=int, default=32)
-    ap.add_argument("--us", default="4")
+    ap.add_argument("--layers", type=int, default=0)   # 0 -> per-model default
+    ap.add_argument("--us", default="2,3,4")
+    ap.add_argument("--gss", default="2,8,32")         # MSAQ group size sweep
+    ap.add_argument("--models", default="llama31_8b,gemma2_9b,mistral_7b")
+    ap.add_argument("--scopes", default="")    # e.g. "S1,S3"; empty = all scopes
     ap.add_argument("--reps", type=int, default=50)
     # worker mode (one scenario per fresh process — repeated CUDA-graph capture in
     # one process wedges the next eager prefill, so each scenario is isolated).
     ap.add_argument("--worker", action="store_true")
     ap.add_argument("--wpath"); ap.add_argument("--kvpath")
-    ap.add_argument("--u", type=int, default=4); ap.add_argument("--tag", default="")
+    ap.add_argument("--u", type=int, default=4); ap.add_argument("--gs", type=int, default=8)
+    ap.add_argument("--model", default="llama31_8b"); ap.add_argument("--tag", default="")
+    ap.add_argument("--out", default="harness_sweep_results.jsonl")
     return ap.parse_args()
 
 
 def worker(args):
-    r = run_scenario(args.wpath, args.kvpath, args.u, 8, args.prefill, args.decode,
-                     args.layers, args.tag, args.reps)
+    set_model(args.model)
+    layers = args.layers if args.layers > 0 else Cfg.layers
+    r = run_scenario(args.wpath, args.kvpath, args.u, args.gs, args.prefill, args.decode,
+                     layers, args.tag, args.reps)
     print("RESULT " + json.dumps(r), flush=True)
 
 
-def spawn(args, w, kv, u, tag):
+def spawn(args, w, kv, u, gs, model, tag):
     cmd = [sys.executable, "-u", os.path.abspath(__file__), "--worker",
-           "--wpath", w, "--kvpath", kv, "--u", str(u), "--tag", tag,
+           "--wpath", w, "--kvpath", kv, "--u", str(u), "--gs", str(gs),
+           "--model", model, "--tag", tag,
            "--prefill", str(args.prefill), "--decode", str(args.decode),
            "--layers", str(args.layers), "--reps", str(args.reps)]
     out = subprocess.run(cmd, capture_output=True, text=True)
@@ -326,43 +354,58 @@ def spawn(args, w, kv, u, tag):
     raise RuntimeError(f"worker failed [{tag}]:\nSTDOUT:{out.stdout[-800:]}\nSTDERR:{out.stderr[-800:]}")
 
 
+def run_model(args, model, us, gss, jf):
+    """Sweep one model over all scopes × {bf16, mxint8, msaq(u×gs)}; append json rows."""
+    set_model(model)
+    print(f"\n{'='*78}\n[{model}] hidden={Cfg.hidden} n_head={Cfg.n_head} n_kv={Cfg.n_kv} "
+          f"head_dim={Cfg.head_dim} inter={Cfg.inter} layers={Cfg.layers}\n{'='*78}", flush=True)
+
+    bf = spawn(args, "bf16", "bf16", 4, 8, model, "bf16 baseline")
+    bf["model"] = model; bf["fmt"] = "bf16"; bf["scope"] = "baseline"
+    jf.write(json.dumps(bf) + "\n"); jf.flush()
+    print(f"  {bf['tag']:22s} TTFT {bf['ttft']:7.1f}  TPOT {bf['tpot']:6.3f}  total {bf['total']/1e3:6.2f}s",
+          flush=True)
+
+    scopes = [s.strip() for s in args.scopes.split(",") if s.strip()]
+    for sname, wstyle, kvq in SCENARIOS:
+        if scopes and not any(sname.startswith(s) for s in scopes):
+            continue
+        print(f"\n  === {model} / {sname} ===", flush=True)
+        # build (fmt,u,gs) variant list: mxint8 once (u/gs N/A), then msaq over u×gs
+        variants = [("mxint8", 4, 8)] + [("msaq", u, gs) for u in us for gs in gss]
+        mx = None
+        for fmt, u, gs in variants:
+            w = "bf16" if wstyle is None else f"{fmt}_{wstyle}"
+            kv = fmt if kvq else "bf16"
+            suf = f"-u{u}g{gs}" if fmt == "msaq" else ""
+            r = spawn(args, w, kv, u, gs, model, f"{sname} [{fmt}{suf}]")
+            r.update(model=model, fmt=fmt, scope=sname, u=(u if fmt == "msaq" else None),
+                     gs=(gs if fmt == "msaq" else None))
+            jf.write(json.dumps(r) + "\n"); jf.flush()
+            if fmt == "mxint8":
+                mx = r
+            rel = f"/bf16 {r['total']/bf['total']:.2f}" + (f"  /mx {r['total']/mx['total']:.2f}" if mx else "")
+            print(f"  {r['tag']:24s} TTFT {r['ttft']:7.1f}  TPOT {r['tpot']:6.3f}  "
+                  f"total {r['total']/1e3:6.2f}s  {rel}", flush=True)
+
+
 def main():
     args = build_args()
     if args.worker:
         worker(args); return
     us = [int(x) for x in args.us.split(",")]
-    print(f"[harness] {torch.cuda.get_device_name(0)} | Llama-3.1-8B | "
-          f"prefill={args.prefill} decode={args.decode} layers={args.layers} | CUDA-graph decode")
-    print(f"          (random reused weights; glue bf16; per-scenario subprocess; ms; lower better)\n")
-
-    bf = spawn(args, "bf16", "bf16", 4, "bf16 baseline")
-    print(f"  {bf['tag']:22s} TTFT {bf['ttft']:7.1f}  TPOT {bf['tpot']:6.3f}  total {bf['total']/1e3:6.2f}s",
-          flush=True)
-
-    rows = [bf]
-    for sname, wstyle, kvq in SCENARIOS:
-        print(f"\n  === {sname} ===", flush=True)
-        variants = [("mxint8", 4)] + [("msaq", u) for u in us]   # non-quant side stays bf16
-        scen_rows = []
-        for fmt, u in variants:
-            w = "bf16" if wstyle is None else f"{fmt}_{wstyle}"
-            kv = fmt if kvq else "bf16"
-            usuf = f"-u{u}" if fmt == "msaq" else ""
-            r = spawn(args, w, kv, u, f"{sname} [{fmt}{usuf}]")
-            scen_rows.append(r); rows.append(r)
-            print(f"  {r['tag']:22s} TTFT {r['ttft']:7.1f}  TPOT {r['tpot']:6.3f}  "
-                  f"total {r['total']/1e3:6.2f}s  /bf16 {r['total']/bf['total']:.2f}", flush=True)
-        mx = scen_rows[0]
-        for r in scen_rows[1:]:
-            print(f"       {r['tag']:28s} /mxint8 {r['total']/mx['total']:.2f}", flush=True)
-
-    # growth curves (dispatch-free per-step ms at each context)
-    print("\n  TPOT growth (graph, ms) by context length:")
-    cks = [c for c, _ in rows[0]["curve"]]
-    print("    " + "ctx:".ljust(26) + "  ".join(f"{c:>6d}" for c in cks))
-    for r in rows:
-        d = dict(r["curve"])
-        print("    " + r["tag"].ljust(26) + "  ".join(f"{d[c]:6.2f}" for c in cks))
+    gss = [int(x) for x in args.gss.split(",")]
+    models = [m for m in args.models.split(",") if m]
+    n = len(models) * (1 + len(SCENARIOS) * (1 + len(us) * len(gss)))
+    print(f"[harness] {torch.cuda.get_device_name(0)} | models={models} | "
+          f"u={us} gs={gss} | prefill={args.prefill} decode={args.decode} | "
+          f"{n} worker runs | CUDA-graph decode (random weights; glue bf16; lower better)")
+    outp = args.out if os.path.isabs(args.out) else \
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), args.out)
+    with open(outp, "w") as jf:
+        for model in models:
+            run_model(args, model, us, gss, jf)
+    print(f"\n[harness] wrote {outp}", flush=True)
 
 
 if __name__ == "__main__":

@@ -99,6 +99,44 @@ flash-decode를 BW-bound로 끌어올리려 했으나 다음 장애물을 확인
   특성상 그조차 V 바이트 이점을 보장하지 못한다. → 본 라운드에선 **공정 최선(tie) 상태로 end-to-end
   재측정**(아래)하고, KV read의 win은 미해결 과제로 명시.
 
+### Phase 34 — design B(warp-transpose) + 점유율 lever 시도, tie 재확인 (2026-06-19)
+이전 절의 "66 GB/s, BW 미포화" 수치는 **stale**다. MXINT8 KV read를 thread-per-key로 올린 뒤
+다시 측정하니 MXINT8는 **이미 memory-bound**로 **~300–480 GB/s**(Lk↑일수록 peak 936의 51%까지)
+스케일한다. MSAQ wide는 **~140–220 GB/s**에서 saturate. 둘 다 점유율 ~23–24%.
+
+**ncu 병목 확정(MS_KV_WIDE=1, u4, Lk4680):** DRAM 14% / **L1TEX 41%(MSAQ 최상위 자원)** /
+sectors 0.73× MXINT8 / **regs 121 → 4 blk/SM** / **waves 0.76**(머신을 한 wave도 못 채움) /
+지배 stall = long_scoreboard(메모리 latency)+barrier 15%, **math_pipe 3.9%(=ALU bound 아님)**.
+→ MSAQ는 *바이트가 아니라* (a) sub-byte-V의 staging 오버헤드(L1TEX)와 (b) one-wave 저점유율
+latency에 묶여 있다. "MSAQ tie면 바이트만 0.58×니까 점유율만 올리면 0.58××480=278 GB/s로 win"
+가설로 다음을 모두 시도:
+
+- **design B (warp-transpose P·V, staging 완전 제거).** 신규 `kv_decode_warpT_kernel`(u4·D128,
+  opt-in `MS_KV_WARPT`). V를 thread-per-key coalesced 적재 → 레지스터 unpack → 32-lane
+  broadcast all-reduce로 key→d 전치(스칼라 누적기, row[] 배열 회피). **bit-exact**(wide 대비
+  rel_fro 0~6e-5). 결과: shared 11→2 KB로 줄었지만 **점유율 그대로 ~23%**(grid가 0.5 wave로
+  *더* 작아짐 — per-SM block 캡이 한계가 아니었음), shfl issue가 L1TEX 57%로 상승 → **wide보다
+  ~5–10% 느림**(Lk4680 39.5 vs 35.9µs). 즉 병목은 staging tax 단독이 아니다.
+- **점유율 lever.** split mult 3→24 sweep: MSAQ는 flat(combine 오버헤드가 상쇄), **MXINT8만
+  38.7→32.7µs로 개선**(per-block 일이 적어 split 이득이 큼) → 격차 *확대*. `__launch_bounds__`로
+  regs 121→80 강제: spill로 **오히려 느려짐**(35.6→41.2µs), 점유율은 grid 부족(0.5 wave)이라 불변.
+  기존 cp.async 커널: 2× 느림.
+- **per-kernel 분해(ncu, Lk4680 mult3):** decode MSAQ 48.5µs vs MXINT8 45.6µs(**6% 차, 사실상
+  tie**), combine 8.2µs(포맷 무관·동일). MSAQ가 0.58× 바이트를 읽고도 decode가 tie인 것이 핵심.
+
+**근본 원인(정밀화).** P·V는 *키에 대한 reduction*이라 출력은 thread-per-d로 잡힌다. **int8 V는 이
+매핑에서 자연히 full-sector**(워프 32 d-lane = 32 contiguous int8 = 정확히 1 섹터, staging 불필요).
+**sub-byte V는 half-sector**(32 nibble=16 B)라 MSAQ는 staging(→L1TEX) 또는 transpose(→shfl)
+오버헤드를 *반드시* 지불하고, 그 비용이 0.58× 바이트 절감을 거의 정확히 상쇄한다 — one-wave 저점유율
+에서 latency로 숨길 여지도 없다. 이것이 int8 대비 sub-byte의 **구조적 비대칭**이다.
+
+**남은 유일한 정공법 = GQA amortization.** staging/unpack 비용을 G개 query에 분산하면(KV 1회 read,
+G개 출력 재사용) per-output 오버헤드가 1/G로 줄어 memory-bound 진입 → 그때 0.58× 바이트가 시간으로
+환원. 단 **공정하려면 MXINT8에도 동일한 GQA 커널**이 필요하고(MX도 per-head 커널은 KV를 G회 재독),
+GQA-MX 역시 memory win을 받으므로 **win이 보장되진 않는다.** 기존 `kv_decode_gqa_kernel`은
+점유율 붕괴(40 GB/s)로 미달 — 제대로 된 재작성은 별도 대규모 작업. **현 라운드 공정 결론: u4 KV read는
+tie(best-vs-best에서 MX로 미세하게 기움), design B/C/D로는 못 뒤집음. (change.md Phase 34.)**
+
 <details><summary>(원래 적출된 비대칭 — 기록용)</summary>
 
 원래 문제: MSAQ는 thread-per-key(wide, Phase 18)인데 MXINT8 KV read만 구버전 warp-per-key+

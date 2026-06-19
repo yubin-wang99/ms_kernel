@@ -476,6 +476,141 @@ __global__ void kv_decode_wide_kernel(
     if (tid == 0) { part_m[h * S + s] = m_i; part_l[h * S + s] = l_i; }
 }
 
+// ---- WARP-TRANSPOSE P·V kernel (design B) — staging removed entirely --------
+//   PROBLEM the wide kernel hit (for_fair_comparison.md): Pass-2 wants out[d] =
+//   Σ_k p_k·V[k,d] with a thread PER head-dim d, but a coalesced V read is
+//   thread PER key (a key's UB=16 B are contiguous, consecutive keys 16 B
+//   apart). The wide kernel bridged the two mappings by STAGING V into shared
+//   (full-sector global read), but that staging is what neutralized MSAQ:
+//   ncu shows it caps occupancy (11 KB smem), adds a __syncthreads barrier
+//   (~15% issue stall) and turns MSAQ's lower DRAM traffic (14% vs MXINT8 24%)
+//   into L1TEX/shared traffic (41% — MSAQ's top resource). So MSAQ reads fewer
+//   sectors (0.73×) yet ties on time.
+//   FIX (design B): never touch shared for V. Read V thread-per-key (coalesced,
+//   full-sector, 0.56× DRAM bytes), unpack in registers, then do the
+//   key→head-dim transpose IN REGISTERS with a 32-lane warp all-reduce. One
+//   warp owns one block (NB warps == D/32): lane k loads key (sub*32+k)'s 16 B
+//   record for that block, forms row[kd] = p_k·vsc_k·V[k,kd] (kd = 0..31), and a
+//   __shfl_xor butterfly all-reduces across the 32 lanes so lane d ends up with
+//   Σ_k row_k[d] = the contribution to out[(warp,d)]. No staged V, no barrier in
+//   the chunk loop, smem = q_sh[D]+sc[chunk] (~1 KB) → occupancy is freed and
+//   MSAQ's fewer-bytes/-sectors advantage finally converts to time.
+//   Bit-exact with the wide path (same codes, same up·16+sh arithmetic). U4 only
+//   (the 0.56× target); D must be 128 so NB(=4) warps == D/32. Other u / D fall
+//   back to the wide kernel. (change.md Phase 34.)
+//   MEASURED RESULT (kept as a documented negative, opt-in MS_KV_WARPT): removing
+//   the staging barrier/shared did NOT beat the wide kernel — it was ~5-10% SLOWER
+//   (Lk4680: 39.5µs vs wide 35.9µs). ncu: shared dropped 11→2 KB but occupancy
+//   stayed ~23% because the grid is only ~0.5-0.76 waves (too few blocks to fill
+//   the SMs, and the per-SM block cap was never the limiter), while the broadcast
+//   transpose's ~192 shfl/subchunk add issue pressure (L1TEX 57%). The wide
+//   kernel's bottleneck is not the staging tax alone but the irreducible sub-byte-V
+//   half-sector reduction at one-wave occupancy — see for_fair_comparison.md.
+template<bool U4>
+__global__ void kv_decode_warpT_kernel(
+        const __nv_bfloat16* __restrict__ q,
+        const int8_t*  __restrict__ ks, const uint8_t* __restrict__ ku,
+        const uint8_t* __restrict__ kh,
+        const int8_t*  __restrict__ vs, const uint8_t* __restrict__ vu,
+        const uint8_t* __restrict__ vh,
+        float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
+        int H, int Hkv, int Lk, int Lcap, int D, int NB, int u, int gs, int UB, int SB,
+        int key_tile, int S, int chunk, float sm_scale) {
+    const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x;
+    const int hk = h / (H / Hkv);
+    const int gs_shift = __ffs(gs) - 1;
+    const int warp = tid >> 5, lane = tid & 31;    // warp == block (0..NB-1); lane owns out-dim
+    const int d_out = warp * BLOCK + lane;         // this thread's head-dim output index
+
+    extern __shared__ unsigned char smem_t[];
+    float* q_sh = (float*)smem_t;                  // [D]
+    float* sc   = q_sh + D;                        // [chunk] scores
+    if (tid < D) q_sh[tid] = __bfloat162float(q[h * D + tid]);
+    __syncthreads();
+
+    const int j0 = s * key_tile, j1 = min(j0 + key_tile, Lk);
+    float m_i = -INFINITY, l_i = 0.0f, acc = 0.0f;
+
+    for (int cs = j0; cs < j1; cs += chunk) {
+        const int nC = min(chunk, j1 - cs);
+
+        // ---- Pass 1: thread-per-key full q·K dot -> sc[tid] (identical to wide) ----
+        if (tid < nC) {
+            const int key = cs + tid;
+            float dot = 0.0f;
+            for (int blk = 0; blk < NB; ++blk) {
+                const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lcap + key]);
+                const long kbase = (long)(hk * NB + blk) * Lcap + key;
+                uint8_t sb[8];
+                const long sbase = kbase * SB;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = kh[sbase + i];
+                const uint4 up4 = *reinterpret_cast<const uint4*>(ku + kbase * UB);
+                const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+                #pragma unroll
+                for (int kd = 0; kd < BLOCK; ++kd) {
+                    const int up_code = ms::bfe_s32((int)uw[kd >> 3], (kd & 7) * 4, 4);
+                    const int g       = kd >> gs_shift;
+                    const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                    dot += q_sh[blk * BLOCK + kd] * ((up_code * 16 + sh_code) * ksc);
+                }
+            }
+            sc[tid] = dot * sm_scale;
+        }
+        __syncthreads();   // sc[] visible to all lanes before Pass-2
+
+        // ---- online-softmax max + rescale (each thread, all see same sc[]) ----
+        float m_chunk = -INFINITY;
+        for (int kk = 0; kk < nC; ++kk) m_chunk = fmaxf(m_chunk, sc[kk]);
+        const float m_new = fmaxf(m_i, m_chunk);
+        const float alpha = expf(m_i - m_new);
+        float lsum = 0.0f;
+        for (int kk = 0; kk < nC; ++kk) lsum += expf(sc[kk] - m_new);
+
+        // ---- Pass 2: broadcast-transpose P·V. warp owns block 'warp'; 32 keys per
+        //   subchunk. Lane k holds key (sub*32+k)'s 16 B record + p·vsc. For each
+        //   source key k, its record/scalar are broadcast (__shfl) and THIS lane
+        //   extracts only ITS OWN out-dim d=lane → scalar accumulator (no 32-reg
+        //   row[] array → no spill → occupancy freed). a[lane] = Σ_k p_k·vsc_k·V[k][lane].
+        float a = 0.0f;
+        for (int sub = 0; sub * BLOCK < nC; ++sub) {
+            const int koff = sub * BLOCK + lane;       // key this lane loads
+            float pv = 0.0f; uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0, shw = 0;
+            if (koff < nC) {
+                const int key = cs + koff;
+                const float vsc = ms::e8m0_to_scale(vs[(hk * NB + warp) * Lcap + key]);
+                pv = expf(sc[koff] - m_new) * vsc;
+                const long vbase = (long)(hk * NB + warp) * Lcap + key;
+                const uint4 up4 = *reinterpret_cast<const uint4*>(vu + vbase * UB);
+                w0 = up4.x; w1 = up4.y; w2 = up4.z; w3 = up4.w;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) if (i < SB) shw |= (uint32_t)vh[vbase * SB + i] << (8 * i);
+            }
+            const int g = lane >> gs_shift;            // this lane's shared-code group
+            #pragma unroll
+            for (int k = 0; k < BLOCK; ++k) {
+                const float    pvk = __shfl_sync(0xffffffffu, pv, k);
+                const uint32_t b0  = __shfl_sync(0xffffffffu, w0, k);
+                const uint32_t b1  = __shfl_sync(0xffffffffu, w1, k);
+                const uint32_t b2  = __shfl_sync(0xffffffffu, w2, k);
+                const uint32_t b3  = __shfl_sync(0xffffffffu, w3, k);
+                const uint32_t bs  = __shfl_sync(0xffffffffu, shw, k);
+                const uint32_t wd  = (lane < 8) ? b0 : (lane < 16) ? b1 : (lane < 24) ? b2 : b3;
+                const int up_code  = ms::bfe_s32((int)wd, (lane & 7) * 4, 4);
+                const int sh_code  = ms::bfe_s32((int)((bs >> (8 * (g >> 1))) & 0xff), (g & 1) * 4, 4);
+                a += pvk * (float)(up_code * 16 + sh_code);
+            }
+        }
+        acc = acc * alpha + a;
+        l_i = l_i * alpha + lsum;
+        m_i = m_new;
+        // no per-chunk barrier needed: sc[] is re-synced at the top of Pass-1.
+        __syncthreads();   // protect sc[] before next chunk overwrites it
+    }
+    if (d_out < D) part_o[((long)h * S + s) * D + d_out] = acc;
+    if (tid == 0) { part_m[h * S + s] = m_i; part_l[h * S + s] = l_i; }
+}
+
 // ---- GQA-BATCHED flash-decode (design A): one block per (kv_head, key-tile) ---
 //   Processes ALL G = Hq/Hkv query heads of this kv head TOGETHER. K and V are
 //   read+unpacked ONCE per key and reused across the G query rows -> the KV memory
@@ -790,7 +925,10 @@ torch::Tensor kv_decode_attention_cuda(
         const size_t smem_g = ((size_t)Gq * (int)D + (size_t)Gq * chunk) * sizeof(float)
                             + (size_t)NB * chunk * (UB + SB);
         auto launch = [&](auto U4tag) {
-            kv_decode_gqa_kernel<decltype(U4tag)::value><<<dim3((int)Hkv, Sg), threads, smem_g, at::cuda::getCurrentCUDAStream()>>>(
+            auto kg = kv_decode_gqa_kernel<decltype(U4tag)::value>;
+            if (smem_g > 48 * 1024)
+                cudaFuncSetAttribute(kg, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_g);
+            kg<<<dim3((int)Hkv, Sg), threads, smem_g, at::cuda::getCurrentCUDAStream()>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
                 vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
@@ -824,12 +962,29 @@ torch::Tensor kv_decode_attention_cuda(
     // cp.async diagnostic path stays measurable. MS_KV_WIDE=0 falls back for A/B.
     const char* wenv = getenv("MS_KV_WIDE");
     const bool wide = (diag == 0) && !(wenv && atoi(wenv) == 0);
-    if (wide) {
+    // design B: warp-transpose P·V (no V staging). u4 + D==128 only (NB warps ==
+    // D/32); other u/D fall through to wide. Opt-in via MS_KV_WARPT=1.
+    const char* tenv = getenv("MS_KV_WARPT");
+    const bool warpT = (diag == 0) && (tenv && atoi(tenv) == 1)
+                       && ((int)u == 4) && ((int)D == 128) && (threads == 128);
+    if (warpT) {
+        const int chunk = threads;
+        const size_t smem_t = (size_t)((int)D + chunk) * sizeof(float);  // q_sh + sc only
+        kv_decode_warpT_kernel<true><<<dim3((int)H, S), threads, smem_t, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+            ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
+            vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
+            part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale);
+    } else if (wide) {
         const int chunk = threads;  // pass1: thread/key, pass2: thread/head_dim
         const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
                             + (size_t)NB * chunk * (UB + SB);   // q_sh + sc + staged V(up,sh)
         auto launch = [&](auto U4tag) {
-            kv_decode_wide_kernel<decltype(U4tag)::value><<<dim3((int)H, S), threads, smem_w, at::cuda::getCurrentCUDAStream()>>>(
+            auto k = kv_decode_wide_kernel<decltype(U4tag)::value>;
+            if (smem_w > 48 * 1024)   // opt in to >48KB dynamic smem (e.g. D=256: staged V)
+                cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_w);
+            k<<<dim3((int)H, S), threads, smem_w, at::cuda::getCurrentCUDAStream()>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
                 vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
@@ -841,6 +996,8 @@ torch::Tensor kv_decode_attention_cuda(
     } else if (cpasync) {           // hide K/V unpack behind cp.async prefetch
         const size_t smem_cp = (size_t)((int)D + CP_CHUNK) * sizeof(float)
                              + (size_t)2 * 2 * (NB * CP_CHUNK * (UB + SB));   // 2 buf x (K+V)(up+sh)
+        if (smem_cp > 48 * 1024)
+            cudaFuncSetAttribute(kv_decode_cpasync_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_cp);
         kv_decode_cpasync_kernel<<<dim3((int)H, S), threads, smem_cp, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
