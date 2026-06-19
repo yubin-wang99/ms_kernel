@@ -509,6 +509,13 @@ __global__ void mxint8_kv_split_kernel(
     const int tid = threadIdx.x;
     const bool active = tid < D;
 
+    // batched decode: grid.z = batch (b==0 when grid.z==1 -> single-token path intact)
+    const long b = blockIdx.z;
+    q += b * (long)H * D;
+    ks += b * (long)Hkv * NB * Lcap; kq += b * (long)Hkv * NB * Lcap * BLOCK;
+    vs += b * (long)Hkv * NB * Lcap; vq += b * (long)Hkv * NB * Lcap * BLOCK;
+    part_o += b * (long)H * S * D; part_m += b * (long)H * S; part_l += b * (long)H * S;
+
     extern __shared__ float smem[];
     float* q_sh = smem;                         // [D]
     float* sc   = smem + D;                      // [KV_CHUNK]
@@ -580,6 +587,9 @@ __global__ void mxint8_kv_combine_kernel(
     const int h = blockIdx.x;
     const int e = threadIdx.x;
     if (e >= D) return;
+    const long b = blockIdx.y;                  // batched: grid.y = batch (b==0 default)
+    part_o += b * (long)H * S * D; part_m += b * (long)H * S; part_l += b * (long)H * S;
+    out += b * (long)H * D;
     float m_g = -INFINITY;
     for (int s = 0; s < S; ++s) m_g = fmaxf(m_g, part_m[h * S + s]);
     float l = 0.0f, acc = 0.0f;
@@ -764,6 +774,35 @@ torch::Tensor mxint8_kv_decode_cuda(
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         (int)H, (int)D, S);
+    return out;
+}
+
+// ---- BATCHED MXINT8 decode (grid.z = batch); fair baseline for the batch sweep
+torch::Tensor mxint8_kv_decode_batched_cuda(
+        torch::Tensor q, torch::Tensor ks, torch::Tensor kq,
+        torch::Tensor vs, torch::Tensor vq,
+        int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t Lcap) {
+    if (Lcap < 0) Lcap = Lk;
+    auto out = torch::empty({B, H, D}, q.options());
+    const int threads = next_pow2((int)D);
+    const size_t smem = (size_t)((int)D + KV_CHUNK) * sizeof(float);
+    const float sm = 1.0f / sqrtf((float)D);
+    const int S = ms::kv_split_count((long)Lk, (int)(H * B));
+    const int key_tile = (int)((Lk + S - 1) / S);
+    auto fopt = q.options().dtype(torch::kFloat32);
+    auto part_o = torch::empty({B, H, (int64_t)S, D}, fopt);
+    auto part_m = torch::empty({B, H, (int64_t)S}, fopt);
+    auto part_l = torch::empty({B, H, (int64_t)S}, fopt);
+
+    mxint8_kv_split_kernel<<<dim3((int)H, S, (int)B), threads, smem, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+        ks.data_ptr<int8_t>(), kq.data_ptr<int8_t>(),
+        vs.data_ptr<int8_t>(), vq.data_ptr<int8_t>(),
+        part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+        (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, key_tile, S, sm);
+    mxint8_kv_combine_kernel<<<dim3((int)H, (int)B), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), (int)H, (int)D, S);
     return out;
 }
 

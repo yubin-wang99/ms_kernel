@@ -344,6 +344,14 @@ __global__ void kv_decode_wide_kernel(
     const int gs_shift = __ffs(gs) - 1;            // gs is pow2: k/gs == k>>shift
     const bool active = tid < D;                   // pass-2 owns head_dim d=tid
 
+    // batched decode: grid.z = batch. b==0 (grid.z==1) leaves the single-token
+    // path byte-identical; per-batch planes are contiguous so offset the pointers.
+    const long b = blockIdx.z;
+    q += b * (long)H * D;
+    ks += b * (long)Hkv * NB * Lcap; ku += b * (long)Hkv * NB * Lcap * UB; kh += b * (long)Hkv * NB * Lcap * SB;
+    vs += b * (long)Hkv * NB * Lcap; vu += b * (long)Hkv * NB * Lcap * UB; vh += b * (long)Hkv * NB * Lcap * SB;
+    part_o += b * (long)H * S * D; part_m += b * (long)H * S; part_l += b * (long)H * S;
+
     extern __shared__ unsigned char smem_w[];
     float* q_sh = (float*)smem_w;                  // [D]
     float* sc   = q_sh + D;                        // [chunk] scores
@@ -796,6 +804,9 @@ __global__ void kv_decode_combine_kernel(
     const int h = blockIdx.x;
     const int e = threadIdx.x;
     if (e >= D) return;
+    const long b = blockIdx.y;                      // batched: grid.y = batch (b==0 default)
+    part_o += b * (long)H * S * D; part_m += b * (long)H * S; part_l += b * (long)H * S;
+    out += b * (long)H * D;
 
     float m_g = -INFINITY;
     for (int s = 0; s < S; ++s) m_g = fmaxf(m_g, part_m[h * S + s]);
@@ -1017,6 +1028,48 @@ torch::Tensor kv_decode_attention_cuda(
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         (int)H, (int)D, S);
+    return out;
+}
+
+// ---- BATCHED decode (KV-only batch/seqlen sweep): grid.z = batch -------------
+//   q [B,H,D]; KV planes [B,Hkv,NB,Lcap,*] contiguous; out [B,H,D]. Forces the
+//   wide kernel. Batch supplies the occupancy the single-token decode lacks
+//   (one-wave) → pushes KV read toward BW-bound where MSAQ's 0.58x bytes win.
+torch::Tensor kv_decode_attention_batched_cuda(
+        torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
+        torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
+        int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs,
+        int64_t Lcap) {
+    TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kBFloat16, "q must be CUDA bf16");
+    if (Lcap < 0) Lcap = Lk;
+    const int wbits = 8 - (int)u;
+    const int UB = BLOCK * wbits / 8;
+    const int SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
+    const int threads = next_pow2((int)D), chunk = threads;
+    const float sm_scale = 1.0f / sqrtf((float)D);
+    const int S = ms::kv_split_count((long)Lk, (int)(H * B));   // split for B*H*S blocks
+    const int key_tile = (int)((Lk + S - 1) / S);
+    auto fopt = q.options().dtype(torch::kFloat32);
+    auto out = torch::empty({B, H, D}, q.options());
+    auto part_o = torch::empty({B, H, (int64_t)S, D}, fopt);
+    auto part_m = torch::empty({B, H, (int64_t)S}, fopt);
+    auto part_l = torch::empty({B, H, (int64_t)S}, fopt);
+    const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float) + (size_t)NB * chunk * (UB + SB);
+    auto launch = [&](auto U4tag) {
+        auto k = kv_decode_wide_kernel<decltype(U4tag)::value>;
+        if (smem_w > 48 * 1024)
+            cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_w);
+        k<<<dim3((int)H, S, (int)B), threads, smem_w, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+            ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
+            vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
+            part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale);
+    };
+    if ((int)u == 4) launch(std::true_type{}); else launch(std::false_type{});
+    kv_decode_combine_kernel<<<dim3((int)H, (int)B), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), (int)H, (int)D, S);
     return out;
 }
 // KV write launcher: bf16 X [H,L,D] -> (scale_exp [H,nb,L], upper [H,nb,L,UB],
