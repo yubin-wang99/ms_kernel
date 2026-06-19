@@ -1349,3 +1349,60 @@ Llama): MXINT8 9.6MB→~11µs, MSAQ 5.4MB→~6µs memory + ~5µs unpack → ~7µ
 늘려도 안 풀림 — wide와 같은 벽). → **roofline 실현엔 cp.async 더블버퍼 + 작은 MMA 타일(+텐서코어)
 파이프라인이 필요**(genuinely hard remaining work). GQA 커널은 구조적으로 옳고 **MS_KV_GQA=1 opt-in**
 으로 남겨 토대로 보존(default는 wide). 미해결: cp.async/텐서코어 pipeline.
+
+# Phase 34 — design B(warp-transpose) + 점유율 lever + sector 진단 → 공정 tie 확정, D=256 fix, 3-model sweep
+
+Phase 32/33의 "KV read는 BW-bound 재작성이 전제" 가설을 끝까지 추적. 먼저 ncu로 병목 재확정
+(MS_KV_WIDE u4 Lk4680): **MXINT8는 이미 memory-bound로 300~480 GB/s 스케일**(Phase 32의 "66 GB/s"는
+stale), MSAQ wide는 140~220 GB/s saturate, 둘 다 점유율 ~23%. 지배 stall = long_scoreboard
+(메모리 latency)+barrier 15%, **math_pipe 3.9%(=ALU bound 아님)**. regs 121→4 blk/SM, waves 0.76.
+
+**design B (warp-transpose P·V, staging 완전 제거; `kv_decode_warpT_kernel`, opt-in `MS_KV_WARPT`,
+u4·D128, bit-exact rel_fro 0~6e-5).** V를 thread-per-key coalesced 적재→레지스터 unpack→32-lane
+broadcast all-reduce로 key→d 전치(스칼라 누적기). shared 11→2 KB로 줄였으나 **점유율 그대로 ~23%**
+(grid가 0.5 wave로 더 작아짐 — per-SM block 캡이 한계가 아니었음), shfl이 L1TEX 57%로 상승 →
+**wide보다 ~5~10% 느림**. 즉 병목은 staging tax 단독이 아니다.
+
+**점유율 lever 전부 실패.** split mult 3→24는 **MXINT8만** 이득(per-block 일 적음)→격차 확대;
+`__launch_bounds__`(regs 121→80 강제)는 spill로 더 느림; cp.async 2× 느림. per-kernel 분해(Lk4680
+mult3): decode MSAQ 48.5µs vs MXINT8 45.6µs(**6% tie**), combine 8.2µs 동일.
+
+**sector 진단(핵심).** DRAM read-sector 비 = **0.59 ≈ 바이트비 0.58**(DRAM 레벨 inflation 없음 —
+바이트 이점은 실재). L2 비는 0.61~0.69(작은 scale/shared plane over-fetch, Lk로 amortize). →
+**latency-wall이지 sector inflation 아님.** 근본: P·V는 키 reduction이라 thread-per-d, **int8 V는
+자연히 full-sector·sub-byte V는 half-sector** → staging/transpose 오버헤드가 0.58× 바이트 절감을
+상쇄. 적게 읽는 MSAQ는 MLP가 작아 latency도 덜 숨김.
+
+**부수 버그 fix:** head_dim=256(Gemma)에서 staged-V shared가 48KB 초과 → `cudaFuncSetAttribute`로
+>48KB dynamic smem opt-in(wide/gqa/cpasync launcher). D=128 무영향.
+
+**문서/하니스:** `kernel_ver2.md`(7-커널 정리, KV dequant 0.54→tie 정정 + sub-byte sector 규칙),
+하니스를 3-model(Llama-3.1-8B/Gemma-2-9B/Mistral-7B) × u{2,3,4} × gs{2,8,32} × 4 scope로 확장
+(`tests/harness.py`, `gen_results_md.py`→`results.md`). 3개 모델 ~1~2% 내 일치: **u4 gs32 최적,
+S1 ~0.79·S2 ~0.90·S3 ~1.01(tie)·S4 ~0.68 (vs MXINT8)**. Gemma D=256 KV는 staged-V 점유율 때문에
+gs 민감(u4 gs2 0.70 vs gs32 0.63). **결론: design B/C/D로 KV tie 못 뒤집음.**
+
+# Phase 35 — batch sweep: latency-wall 가설의 반증
+
+"KV tie의 근본은 one-wave 저점유율 → batch로 점유율을 (combine 오버헤드 없이) 채우면 BW-bound가 되어
+0.58× 바이트가 0.58× 시간으로 환원"이라는 가설을 직접 검증. 배치 flash-decode 커널 추가
+(`blockIdx.z=batch`, MSAQ wide + MXINT8 짝, single-token 경로는 b==0으로 byte-identical, ops
+`kv_decode_attention_batched`/`mxint8_kv_decode_batched`, `tests/kv_batch_bench.py`, 배치 slice ==
+single-token 검증). B∈{1,4,8,16,32} × GQA 32:8 × Lk4096 × u4:
+
+| B | MXINT8 (useful GB/s) | MSAQ (useful GB/s) | MSAQ/MX |
+|---|---|---|---|
+| 1 | 95µs (91) | 90µs (55) | **0.94 win** |
+| 8 | 689µs (100) | 753µs (53) | 1.09 |
+| 32 | 2082µs (133) | 2329µs (68) | 1.12 (gs32: 1.07) |
+
+**반증: batch는 MSAQ를 더 지게 만든다.** per-q-head 커널은 GQA 그룹(4) 안에서 KV를 4× 재독 →
+실제 DRAM은 useful×4. B=32에서 **MXINT8 실효 ~530 GB/s(피크 57%, 진짜 BW-bound 도달)** vs
+**MSAQ ~270 GB/s(29%)**. batch가 머신을 채워 BW-bound로 올린 건 맞으나 **MSAQ의 달성가능 BW 천장이
+MXINT8의 ~절반**(dequant unpack+staging이 throughput throttle) → 0.58× 바이트를 0.51× BW로 읽어
+0.58/0.51≈1.14× 시간 = 관측 ~1.1× 손해. B=1 win(0.94)은 둘 다 BW-bound 아닐 때 적은 바이트의 미세 이점.
+
+**확정(3 lever 종합: split-K / warp-transpose / batch).** KV read의 binding constraint는 점유율이
+아니라 **MSAQ의 dequant-throughput BW 천장(MXINT8 대비 ~0.5×)**. 병렬도를 더 줘도 대역폭을 실제로
+소비하는 MXINT8만 이득. 공정 win은 *dequant 자체를 int8 read와 throughput 동급*(근본적으로 싼
+unpack 또는 텐서코어 dequant 파이프라인)으로 만들어야 가능 — 단순 병렬화로는 불가능함이 입증됨.
