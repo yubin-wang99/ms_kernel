@@ -167,6 +167,20 @@ b==0으로 byte-identical, `kv_decode_attention_batched`/`mxint8_kv_decode_batch
 동급*으로 만들어야(근본적으로 더 싼 unpack, 또는 텐서코어 dequant 파이프라인) 가능하며, 단순 병렬화로는
 불가능함이 batch로 입증됨. (change.md Phase 35.)
 
+### Phase 36 — channel-major V(KIVI식) 탐색: 속도 win, 그러나 정확도 trade로 기각 (2026-06-19)
+P·V half-sector의 *원인*인 token-major layout을 고치는 시도. V를 **channel-major `[d,token]`**로 깔면
+P·V가 coalesced GEMV가 되어 staging/transpose가 사라짐. proxy(`tests/pv_gemv_proxy.py`): token-major에서
+MSAQ를 0.5× BW로 묶던 천장이 사라져 **BW-bound 영역(head fuse OUT=1024+Lk≥8192)에서 MSAQ가 MXINT8과
+동일 BW 도달 → ratio 0.54~0.58 WIN**(weight GEMV 0.56과 동일). 즉 layout이 원인이었음을 확인.
+
+**그러나 fair·정당성 점검에서 기각.** dense block은 32원소 연속이라 channel-major는 **grouping을 32-token
+블록=reduction축으로 강제**(layout↔grouping 분리불가) → KIVI가 V에 권장하는 *per-token grouping*의 반대.
+정확도 probe(`tests/v_grouping_accuracy.py`, 현실적 token_var=3): dequant rel_fro가 **token-major 대비
+×1.31(u4)~×1.76(MXINT8) 악화**. **양쪽 포맷 동일 적용이라 fair는 유지되나 둘 다 정확도 저하** —
+"공짜 win"이 아니라 속도↔정확도 trade이고 관례(KIVI)에 역행. dense packing에선 *per-token(정확도)↔
+channel-major(속도)*를 동시 만족 불가. **결론: 공정·정확도 둘 다 지키는 KV-read win은 per-token V를
+유지한 채 staging+텐서코어 P·V로 흡수하는 길(=BW-bound FlashDecoding 재작성)뿐.** (change.md Phase 36.)
+
 <details><summary>(원래 적출된 비대칭 — 기록용)</summary>
 
 원래 문제: MSAQ는 thread-per-key(wide, Phase 18)인데 MXINT8 KV read만 구버전 warp-per-key+
