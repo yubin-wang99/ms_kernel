@@ -1131,6 +1131,103 @@ __global__ void qk_wmma_mx_kernel(
         }
 }
 
+// ---- SCALAR Q·K (no bf16 staging): thread-per-key (coalesced full-sector K read),
+//   dequant K[key] per d-block into registers, accumulate M-tile dots. Avoids the
+//   WMMA bf16-staging that made the tensor-core Q·K unpack-bound at small M. M is
+//   tiled at MQK=32 accumulators (single tile when M<=32 -> no K re-dequant).
+//   (change.md Phase 40.)
+constexpr int MQK = 32;
+template<bool U4>
+__global__ void qk_scalar_kernel(
+        const __nv_bfloat16* __restrict__ Q,    // [Hkv, M, D]
+        const int8_t* __restrict__ ks, const uint8_t* __restrict__ ku,
+        const uint8_t* __restrict__ kh,         // K planes [Hkv, NBd, Lk, *]
+        float* __restrict__ scores,             // [Hkv, M, Lk]
+        int M, int D, int Lk, int NBd, int u, int gs, int UB, int SB, float sm_scale) {
+    const int hk = blockIdx.y;
+    const int key = blockIdx.x * blockDim.x + threadIdx.x;
+    if (key >= Lk) return;
+    const int gs_shift = __ffs(gs) - 1;
+    Q += (long)hk * M * D; scores += (long)hk * M * Lk;
+    ks += (long)hk * NBd * Lk; ku += (long)hk * NBd * Lk * UB; kh += (long)hk * NBd * Lk * SB;
+
+    for (int mt0 = 0; mt0 < M; mt0 += MQK) {
+        const int mcnt = min(MQK, M - mt0);
+        float dot[MQK];
+        #pragma unroll
+        for (int i = 0; i < MQK; ++i) dot[i] = 0.0f;
+        for (int db = 0; db < NBd; ++db) {
+            const long kbase = (long)db * Lk + key;
+            const float ksc = ms::e8m0_to_scale(ks[kbase]);
+            float Kval[32];
+            if constexpr (U4) {
+                const uint4 up4 = *reinterpret_cast<const uint4*>(ku + kbase * UB);
+                const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+                uint8_t sb[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = kh[kbase * SB + i];
+                #pragma unroll
+                for (int dd = 0; dd < 32; ++dd) {
+                    const int up_code = ms::bfe_s32((int)uw[dd >> 3], (dd & 7) * 4, 4);
+                    const int g = dd >> gs_shift;
+                    const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                    Kval[dd] = (float)(up_code * 16 + sh_code) * ksc;
+                }
+            } else {
+                const long bu = (long)db * Lk * UB, bh = (long)db * Lk * SB;
+                #pragma unroll
+                for (int dd = 0; dd < 32; ++dd)
+                    Kval[dd] = (float)ms::unpack_ms_kv_elem(ku, kh, bu, bh, Lk, key, dd, u, gs, UB, SB) * ksc;
+            }
+            for (int mm = 0; mm < mcnt; ++mm) {
+                const __nv_bfloat16* qrow = Q + (long)(mt0 + mm) * D + db * BLOCK;
+                float a = 0.0f;
+                #pragma unroll
+                for (int dd = 0; dd < 32; ++dd) a += __bfloat162float(qrow[dd]) * Kval[dd];
+                dot[mm] += a;
+            }
+        }
+        for (int mm = 0; mm < mcnt; ++mm)
+            scores[(long)(mt0 + mm) * Lk + key] = dot[mm] * sm_scale;
+    }
+}
+
+__global__ void qk_scalar_mx_kernel(
+        const __nv_bfloat16* __restrict__ Q,
+        const int8_t* __restrict__ ks, const int8_t* __restrict__ kq,  // K [Hkv, NBd, Lk, 32]
+        float* __restrict__ scores,
+        int M, int D, int Lk, int NBd, float sm_scale) {
+    const int hk = blockIdx.y;
+    const int key = blockIdx.x * blockDim.x + threadIdx.x;
+    if (key >= Lk) return;
+    Q += (long)hk * M * D; scores += (long)hk * M * Lk;
+    ks += (long)hk * NBd * Lk; kq += (long)hk * NBd * Lk * BLOCK;
+
+    for (int mt0 = 0; mt0 < M; mt0 += MQK) {
+        const int mcnt = min(MQK, M - mt0);
+        float dot[MQK];
+        #pragma unroll
+        for (int i = 0; i < MQK; ++i) dot[i] = 0.0f;
+        for (int db = 0; db < NBd; ++db) {
+            const long kbase = (long)db * Lk + key;
+            const float ksc = ms::e8m0_to_scale(ks[kbase]);
+            const int8_t* rec = kq + kbase * BLOCK;
+            float Kval[32];
+            #pragma unroll
+            for (int dd = 0; dd < 32; ++dd) Kval[dd] = (float)rec[dd] * ksc;
+            for (int mm = 0; mm < mcnt; ++mm) {
+                const __nv_bfloat16* qrow = Q + (long)(mt0 + mm) * D + db * BLOCK;
+                float a = 0.0f;
+                #pragma unroll
+                for (int dd = 0; dd < 32; ++dd) a += __bfloat162float(qrow[dd]) * Kval[dd];
+                dot[mm] += a;
+            }
+        }
+        for (int mm = 0; mm < mcnt; ++mm)
+            scores[(long)(mt0 + mm) * Lk + key] = dot[mm] * sm_scale;
+    }
+}
+
 // matched MXINT8 P·V WMMA (B-tile = int8 V read direct; same tensor-core path) -----
 __global__ void pv_wmma_mx_kernel(
         const __nv_bfloat16* __restrict__ P,
@@ -1542,6 +1639,19 @@ torch::Tensor qk_wmma_cuda(
     const int UB = BLOCK * wbits / 8, SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
     const float sm = 1.0f / sqrtf((float)D);
     auto scores = torch::empty({Hkv, M, Lk}, Q.options().dtype(torch::kFloat32));
+    const char* sc = getenv("MS_QK_SCALAR");
+    const bool scalar = sc && atoi(sc) == 1;
+    if (scalar) {                          // thread-per-key scalar Q·K (no bf16 staging)
+        dim3 grid(((int)Lk + 127) / 128, (int)Hkv);
+        auto launch = [&](auto U4tag) {
+            qk_scalar_kernel<decltype(U4tag)::value><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+                reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr<at::BFloat16>()),
+                ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
+                scores.data_ptr<float>(), (int)M, (int)D, (int)Lk, (int)NBd, (int)u, (int)gs, UB, SB, sm);
+        };
+        if ((int)u == 4) launch(std::true_type{}); else launch(std::false_type{});
+        return scores;
+    }
     dim3 grid(((int)Lk + 63) / 64, ((int)M + 63) / 64, (int)Hkv);
     auto launch = [&](auto U4tag) {
         qk_wmma_kernel<decltype(U4tag)::value><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -1559,6 +1669,15 @@ torch::Tensor qk_wmma_mx_cuda(
     TORCH_CHECK(Q.is_cuda() && Q.scalar_type() == torch::kBFloat16, "Q must be CUDA bf16");
     const float sm = 1.0f / sqrtf((float)D);
     auto scores = torch::empty({Hkv, M, Lk}, Q.options().dtype(torch::kFloat32));
+    const char* sc = getenv("MS_QK_SCALAR");
+    if (sc && atoi(sc) == 1) {
+        dim3 grid(((int)Lk + 127) / 128, (int)Hkv);
+        qk_scalar_mx_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr<at::BFloat16>()),
+            ks.data_ptr<int8_t>(), kq.data_ptr<int8_t>(),
+            scores.data_ptr<float>(), (int)M, (int)D, (int)Lk, (int)NBd, sm);
+        return scores;
+    }
     dim3 grid(((int)Lk + 63) / 64, ((int)M + 63) / 64, (int)Hkv);
     qk_wmma_mx_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr<at::BFloat16>()),

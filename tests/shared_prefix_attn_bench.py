@@ -72,9 +72,11 @@ def check():
 def bw(t_ms, n): return n / (t_ms * 1e-3) / 1e9
 
 if __name__ == "__main__":
+    import os
     torch.cuda.init()
-    print("[correctness]"); check()
-    print("\n[shared-prefix attention] N requests share 1 KV (M=N*G). ratio=MSAQ/MXINT8 (attn time), lower=MSAQ wins")
+    qk = os.environ.get("MS_QK_SCALAR", "0")
+    print(f"[correctness]  (Q.K = {'SCALAR' if qk=='1' else 'WMMA'})"); check()
+    print(f"\n[shared-prefix attention, Q.K={'scalar' if qk=='1' else 'wmma'}] M=N*G. ratio=MSAQ/MXINT8 (full attn), lower=MSAQ wins")
     for name, Hkv, G, D in MODELS:
         print(f"\n  --- {name}: Hkv={Hkv} G={G} D={D} ---")
         for Lk in (2048, 4096):

@@ -1530,3 +1530,26 @@ MSAQ loss**. 즉 P·V(키 reduction, 긴 contraction→MMA가 unpack 숨김)는 
 한계**. P·V만 떼면 win이나 Q·K가 상쇄. (가능한 개선: Q·K를 bf16-staging 없는 scalar/wide(=tie)로
 바꾸면 full attention이 ~0.93까지 갈 여지 — P·V win 절반만 남음. 미시도, 효과 modest·niche.)
 커널/ops/bench 보존(`qk_wmma*`, `pv_wmma*`, `tests/shared_prefix_attn_bench.py`).
+
+# Phase 40 — scalar Q·K 시도: ratio는 뒤집히나 "느린 영역" artifact, best-vs-best는 여전히 tie
+
+Phase 39의 "scalar Q·K(=tie)면 full attention win 회복" 가설을 구현·검증. `qk_scalar_kernel`(+MX):
+thread-per-key(연속 키 = full-sector coalesced K read, MSAQ 0.58×), K를 d-block마다 레지스터로 dequant,
+M-tile(MQK=32 누적기) dot — **bf16 staging 없음**(WMMA Q·K를 unpack-bound로 만든 tax 제거). env
+`MS_QK_SCALAR=1`. 정확도 rel 2.4e-3.
+
+**결과:** ratio가 **전 구간 win(0.78~0.92)** 으로 뒤집힘. **그러나 absolute가 2~3× 느림** —
+Llama Lk4096 M128: scalar MSAQ 541µs / MXINT8 619µs vs **WMMA MSAQ 243µs / MXINT8 241µs(tie)**.
+scalar Q·K는 텐서코어를 안 써(M×Lk×D scalar FMA) 둘 다 ~2.3× 느린 영역으로 떨어뜨리고, 그 영역에서만
+K-byte 절감이 드러나 ratio가 win.
+
+**best-vs-best(각 포맷 자기 최선):** MSAQ 최선 = min(WMMA 243, scalar 541) = 243(WMMA); MXINT8 최선 =
+min(WMMA 241, scalar 619) = 241(WMMA) → **243/241 = tie(1.008)**. scalar은 MSAQ에게도 항상 더 느려
+best가 아니므로 ratio-win이 best-vs-best에 안 들어온다(pre-split-K P·V·batch-B=1과 동일한 "느린 영역
+ratio-win" artifact).
+
+**최종 확정(8 lever).** fast = 텐서코어 = bf16 staging = tie / ratio-win = 느린 scalar 영역(아무도 안
+고름) — 동시 불가. 공정(best-vs-best)·정확 MSAQ KV-read decode win은 **존재하지 않음**(스칼라/staging/
+warp-transpose/batch/channel-major/텐서코어-P·V/텐서코어-2pass/scalar-Q·K 전부 시도 완료). 진짜 잔여
+가능성은 native sub-byte tensor-core(하드웨어 미지원)뿐. MSAQ의 실제 가치는 weight 경로(GEMV), KV-read는
+tie로 최종 확정. 커널/ops/bench 보존(`qk_scalar*`, env `MS_QK_SCALAR`).
