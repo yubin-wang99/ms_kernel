@@ -956,6 +956,181 @@ __global__ void pv_wmma_combine_kernel(const float* __restrict__ partial,
     O[((long)hk * M + m) * D + d] = __float2bfloat16(acc);
 }
 
+// ---- TENSOR-CORE Q·K (FlashDecoding Pass-1): scores[M,Lk] = Q[M,D] @ K[Lk,D]^T --
+//   Shared-KV: one K per kv-head, M = N*G query rows. Contract over D (token-major K
+//   read coalesced thread-per-key, same as P·V's V load). bf16 WMMA; output fp32
+//   scores for the softmax. NBd = D/32 contraction chunks (small -> no split-K, the
+//   Lk/64 N-tiles fill the grid). (change.md Phase 39.)
+template<bool U4>
+__global__ void qk_wmma_kernel(
+        const __nv_bfloat16* __restrict__ Q,    // [Hkv, M, D]
+        const int8_t* __restrict__ ks, const uint8_t* __restrict__ ku,
+        const uint8_t* __restrict__ kh,         // K planes [Hkv, NBd, Lk, *]
+        float* __restrict__ scores,             // [Hkv, M, Lk]
+        int M, int D, int Lk, int NBd, int u, int gs, int UB, int SB, float sm_scale) {
+    __shared__ __nv_bfloat16 As[64][WSK];        // Q [m][d]
+    __shared__ __nv_bfloat16 Bs[64][WSK];        // dequant K [lk][d]
+    __shared__ float tmp[4][16][16];
+    const int hk = blockIdx.z;
+    const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;   // M-tile, Lk-tile
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wM = warp >> 1, wN = warp & 1;
+    const int gs_shift = __ffs(gs) - 1;
+    Q += (long)hk * M * D;  scores += (long)hk * M * Lk;
+    ks += (long)hk * NBd * Lk; ku += (long)hk * NBd * Lk * UB; kh += (long)hk * NBd * Lk * SB;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    for (int db = 0; db < NBd; ++db) {              // contract over D in 32-wide chunks
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {     // A-tile: Q[m, db*32+d]
+            const int m = idx / BLOCK, d = idx % BLOCK;
+            As[m][d] = (m0 + m < M) ? Q[(long)(m0 + m) * D + db * BLOCK + d]
+                                    : __float2bfloat16(0.0f);
+        }
+        // B-tile: thread-per-key coalesced. thread=(key lkl, dd-half); unpack 16 d's.
+        const int lkl = tid >> 1, half = tid & 1;
+        const int key = n0 + lkl;
+        if (key < Lk) {
+            const long kbase = (long)db * Lk + key;
+            const float ksc = ms::e8m0_to_scale(ks[kbase]);
+            if constexpr (U4) {
+                const uint4 up4 = *reinterpret_cast<const uint4*>(ku + kbase * UB);
+                const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+                uint8_t sb[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = kh[kbase * SB + i];
+                #pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    const int dd = half * 16 + t;
+                    const int up_code = ms::bfe_s32((int)uw[dd >> 3], (dd & 7) * 4, 4);
+                    const int g = dd >> gs_shift;
+                    const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                    Bs[lkl][dd] = __float2bfloat16((float)(up_code * 16 + sh_code) * ksc);
+                }
+            } else {
+                const long bu = (long)db * Lk * UB, bh = (long)db * Lk * SB;
+                #pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    const int dd = half * 16 + t;
+                    const int code = ms::unpack_ms_kv_elem(ku, kh, bu, bh, Lk, key, dd, u, gs, UB, SB);
+                    Bs[lkl][dd] = __float2bfloat16((float)code * ksc);
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int t = 0; t < 16; ++t) Bs[lkl][half * 16 + t] = __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[wM*32 + i*16][wk*16], WSK);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[wN*32 + j*16][wk*16], WSK);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            wmma::store_matrix_sync(wt, acc[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int mb = m0 + wM*32 + i*16, nb = n0 + wN*32 + j*16;
+            for (int e = lane; e < 256; e += 32) {
+                const int m = mb + e / 16, lk = nb + e % 16;
+                if (m < M && lk < Lk) scores[(long)m * Lk + lk] = wt[e] * sm_scale;
+            }
+            __syncwarp();
+        }
+}
+
+// matched MXINT8 Q·K WMMA (K read direct int8) ---------------------------------
+__global__ void qk_wmma_mx_kernel(
+        const __nv_bfloat16* __restrict__ Q,
+        const int8_t* __restrict__ ks, const int8_t* __restrict__ kq,  // K [Hkv, NBd, Lk, 32]
+        float* __restrict__ scores,
+        int M, int D, int Lk, int NBd, float sm_scale) {
+    __shared__ __nv_bfloat16 As[64][WSK];
+    __shared__ __nv_bfloat16 Bs[64][WSK];
+    __shared__ float tmp[4][16][16];
+    const int hk = blockIdx.z;
+    const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wM = warp >> 1, wN = warp & 1;
+    Q += (long)hk * M * D;  scores += (long)hk * M * Lk;
+    ks += (long)hk * NBd * Lk; kq += (long)hk * NBd * Lk * BLOCK;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    for (int db = 0; db < NBd; ++db) {
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, d = idx % BLOCK;
+            As[m][d] = (m0 + m < M) ? Q[(long)(m0 + m) * D + db * BLOCK + d]
+                                    : __float2bfloat16(0.0f);
+        }
+        const int lkl = tid >> 1, half = tid & 1;
+        const int key = n0 + lkl;
+        if (key < Lk) {
+            const long kbase = (long)db * Lk + key;
+            const float ksc = ms::e8m0_to_scale(ks[kbase]);
+            const int8_t* rec = kq + kbase * BLOCK;
+            #pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const int dd = half * 16 + t;
+                Bs[lkl][dd] = __float2bfloat16((float)rec[dd] * ksc);
+            }
+        } else {
+            #pragma unroll
+            for (int t = 0; t < 16; ++t) Bs[lkl][half * 16 + t] = __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[wM*32 + i*16][wk*16], WSK);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[wN*32 + j*16][wk*16], WSK);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            wmma::store_matrix_sync(wt, acc[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int mb = m0 + wM*32 + i*16, nb = n0 + wN*32 + j*16;
+            for (int e = lane; e < 256; e += 32) {
+                const int m = mb + e / 16, lk = nb + e % 16;
+                if (m < M && lk < Lk) scores[(long)m * Lk + lk] = wt[e] * sm_scale;
+            }
+            __syncwarp();
+        }
+}
+
 // matched MXINT8 P·V WMMA (B-tile = int8 V read direct; same tensor-core path) -----
 __global__ void pv_wmma_mx_kernel(
         const __nv_bfloat16* __restrict__ P,
@@ -1356,6 +1531,40 @@ torch::Tensor pv_wmma_mx_cuda(
         partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(O.data_ptr<at::BFloat16>()),
         (int)Hkv, S, (int)M, (int)D);
     return O;
+}
+
+// ---- TENSOR-CORE Q·K launcher: Q[Hkv,M,D], K planes -> scores[Hkv,M,Lk] fp32 ----
+torch::Tensor qk_wmma_cuda(
+        torch::Tensor Q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
+        int64_t Hkv, int64_t M, int64_t D, int64_t Lk, int64_t NBd, int64_t u, int64_t gs) {
+    TORCH_CHECK(Q.is_cuda() && Q.scalar_type() == torch::kBFloat16, "Q must be CUDA bf16");
+    const int wbits = 8 - (int)u;
+    const int UB = BLOCK * wbits / 8, SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
+    const float sm = 1.0f / sqrtf((float)D);
+    auto scores = torch::empty({Hkv, M, Lk}, Q.options().dtype(torch::kFloat32));
+    dim3 grid(((int)Lk + 63) / 64, ((int)M + 63) / 64, (int)Hkv);
+    auto launch = [&](auto U4tag) {
+        qk_wmma_kernel<decltype(U4tag)::value><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr<at::BFloat16>()),
+            ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
+            scores.data_ptr<float>(), (int)M, (int)D, (int)Lk, (int)NBd, (int)u, (int)gs, UB, SB, sm);
+    };
+    if ((int)u == 4) launch(std::true_type{}); else launch(std::false_type{});
+    return scores;
+}
+
+torch::Tensor qk_wmma_mx_cuda(
+        torch::Tensor Q, torch::Tensor ks, torch::Tensor kq,
+        int64_t Hkv, int64_t M, int64_t D, int64_t Lk, int64_t NBd) {
+    TORCH_CHECK(Q.is_cuda() && Q.scalar_type() == torch::kBFloat16, "Q must be CUDA bf16");
+    const float sm = 1.0f / sqrtf((float)D);
+    auto scores = torch::empty({Hkv, M, Lk}, Q.options().dtype(torch::kFloat32));
+    dim3 grid(((int)Lk + 63) / 64, ((int)M + 63) / 64, (int)Hkv);
+    qk_wmma_mx_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr<at::BFloat16>()),
+        ks.data_ptr<int8_t>(), kq.data_ptr<int8_t>(),
+        scores.data_ptr<float>(), (int)M, (int)D, (int)Lk, (int)NBd, sm);
+    return scores;
 }
 // KV write launcher: bf16 X [H,L,D] -> (scale_exp [H,nb,L], upper [H,nb,L,UB],
 // shared [H,nb,L,SB]) — the certified token-major planes. UB/SB from u,gs.

@@ -1504,3 +1504,29 @@ win**. M=16은 combine/소타일 오버헤드가 지배해 tie.
 - **P·V 단독 커널**(Pass-2). 완전한 attention은 Pass-1(Q·K+softmax) 필요 → 2-pass 또는 fused.
 - 아직 end-to-end 하니스(batch=1)에 통합 안 됨 → 기존 S1~S4(batch=1)엔 이 win이 안 나타남.
   end-to-end 입증엔 **batched 2-pass decode 경로 + batched 하니스**가 필요(별도 작업).
+
+# Phase 39 — shared-prefix 2-pass attention(Q·K WMMA + softmax + P·V WMMA): P·V win이 Q·K에 희석
+
+Phase 38 P·V win이 **완전한 attention**에서도 성립하는지 검증. win 조건 정정: M=batch×G는 *독립 배치*
+에선 V가 배치마다 달라 안 통하고, **M개 query가 한 KV를 공유**(shared-prefix caching / beam)할 때만
+M=N·G로 커진다. 그래서 **shared-prefix** 시나리오로 2-pass attention 구현: `qk_wmma`(scores=Q@K^T,
+contract D, K token-major coalesced) + torch softmax + `pv_wmma`(Phase 38). 정확도 통과(rel 2.4e-3).
+
+**완전 attention 실측(MSAQ/MXINT8, M=N·G):**
+
+| 모델 | M 범위 | ratio (small M → large M) |
+|------|--------|----------------------------|
+| Llama (G4,D128) | 32→128 | 1.17 → **1.00** |
+| Gemma (G2,D256) | 16→64 | 1.25 → **0.99 (간신히 win)** |
+| Mistral (G4,D128) | 32→128 | 1.18 → 1.00 |
+
+**P·V 단독은 0.87 win인데 완전 attention은 tie~loss(best ~1.0 at M=128)** — Q·K가 희석한다.
+원인: **Q·K는 contraction이 D=128(작음, MMA 4청크)이라 MMA가 K-unpack을 못 숨겨 unpack-bound →
+MSAQ loss**. 즉 P·V(키 reduction, 긴 contraction→MMA가 unpack 숨김)는 win이지만 Q·K(D reduction,
+짧은 contraction)는 loss라 합치면 ~tie.
+
+**확정(7 lever).** scalar/staging/warp-transpose/batch/channel-major/tensorcore-P·V/tensorcore-2pass
+전부 시도: KV-read의 공정·정확 win은 **완전 attention 레벨에선 shared-prefix 대형 M에서도 ~tie가
+한계**. P·V만 떼면 win이나 Q·K가 상쇄. (가능한 개선: Q·K를 bf16-staging 없는 scalar/wide(=tie)로
+바꾸면 full attention이 ~0.93까지 갈 여지 — P·V win 절반만 남음. 미시도, 효과 modest·niche.)
+커널/ops/bench 보존(`qk_wmma*`, `pv_wmma*`, `tests/shared_prefix_attn_bench.py`).
