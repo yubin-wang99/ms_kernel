@@ -1472,3 +1472,35 @@ reduction + sub-byte는 (a) half-sector(직접) (b) 정확도 trade(channel-majo
 win은 본 스칼라/WMMA dequant 패러다임에선 불가능**. 가능하려면 V를 dequant 없이 텐서코어가 직접
 먹는 native sub-byte MMA(하드웨어 미지원) 또는 GEMV처럼 staging을 회피하는 sub-byte-coalesced
 reduction(half-sector라 불가)이 필요. 커널/ops/bench는 보존(`pv_wmma*`, `tests/pv_wmma_bench.py`).
+
+# Phase 38 — coalesced B-load + 소프트웨어 파이프라인: 텐서코어 P·V가 드디어 WIN (batched)
+
+Phase 37 결론을 뒤집은 두 가지(사용자 제안: overlap/fused로 dequant throughput↑):
+1. **버그 수정 — coalesced thread-per-key B-load.** Phase 37 `pv_wmma`는 스레드를 (d,token)로
+   매핑해 토큰당 nibble 1개를 16B stride로 **scatter read**(half-sector) → MSAQ가 0.58× full-sector
+   이점조차 못 받았다. 수정: 스레드가 한 키의 16B 레코드를 통째로 읽고(32스레드=512B 연속=full
+   sector, 0.58×) 32개 d를 d-major bf16 타일에 on-chip transpose-write.
+2. **double-buffer 소프트웨어 파이프라인.** `stage(next)`를 MMA(current) 뒤로 보내 unpack(+그 DRAM
+   load)이 텐서코어 MMA와 overlap(W+A GEMM `wonly_gemm_wmma_pipe` 기법).
+
+**결과(token-major V 유지 = 정확, rel_fro 2.3e-3; 양쪽 동일 WMMA, unpack만 다름 = 공정):**
+
+| M | Lk4096 ratio | Lk8192 ratio |
+|---|---|---|
+| 16 | 1.01 (tie) | 1.01 |
+| 32 | **0.94 WIN** | 0.93 |
+| 64 | **0.89 WIN** | 0.88 |
+| 128 | **0.87 WIN** | 0.84 |
+
+scatter→coalesce로 MSAQ 실효 BW가 0.5×→~0.6× MXINT8로 회복, 0.58× 바이트와 합쳐져 **M≥32에서
+win**. M=16은 combine/소타일 오버헤드가 지배해 tie.
+
+**의의:** Phase 32~37의 모든 negative를 뒤집는 **첫 공정·정확 KV-read win track**. half-sector도
+정확도 trade도 없이, 텐서코어 + coalesced read + 파이프라인으로 0.58× 바이트가 시간으로 환원됨.
+
+**범위/한계(정직):**
+- **batched 영역(M=batch×G ≥ 32)에서만 win.** single-stream decode(batch=1, G=4 → M=4)는 M<16이라
+  tie/loss — 즉 **배치 서빙 win**이지 단일 토큰 디코드 win이 아니다.
+- **P·V 단독 커널**(Pass-2). 완전한 attention은 Pass-1(Q·K+softmax) 필요 → 2-pass 또는 fused.
+- 아직 end-to-end 하니스(batch=1)에 통합 안 됨 → 기존 S1~S4(batch=1)엔 이 win이 안 나타남.
+  end-to-end 입증엔 **batched 2-pass decode 경로 + batched 하니스**가 필요(별도 작업).

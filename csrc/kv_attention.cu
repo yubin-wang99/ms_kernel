@@ -834,6 +834,11 @@ __global__ void kv_decode_combine_kernel(
 //   byte-advantage are both kept. Structure mirrors wa_gemm.cu::wonly_gemm_wmma; only
 //   the B-tile source differs (V kv-unpack vs weight-unpack). U4 templated; u2/u3 use
 //   the general kv-unpack. Single kv-head per (grid.z); P pre-softmaxed (2-pass).
+// IMPROVED: coalesced thread-per-key B-load (each thread reads a key's full record
+// = full-sector 0.58x DRAM, then transposes 32 d-values into the d-major bf16 tile
+// on-chip) + double-buffered software pipeline (unpack(next) overlaps MMA(current),
+// the wonly_gemm_wmma_pipe lever). Aims to lift MSAQ's dequant throughput past the
+// ~0.5x BW ceiling. (change.md Phase 38.)
 template<bool U4>
 __global__ void pv_wmma_kernel(
         const __nv_bfloat16* __restrict__ P,    // [Hkv, M, Lk]
@@ -841,13 +846,15 @@ __global__ void pv_wmma_kernel(
         const uint8_t* __restrict__ vh,         // V planes [Hkv, NBd, Lk, *] (token-major)
         float* __restrict__ partial,            // [Hkv, S, M, D] fp32 (split-K partials)
         int M, int D, int Lk, int NBd, int u, int gs, int UB, int SB, int S) {
-    __shared__ __nv_bfloat16 As[64][WSK];        // P         [m][k]
-    __shared__ __nv_bfloat16 Bs[64][WSK];        // dequant V [d][k]
+    __shared__ __nv_bfloat16 As[2][64][WSK];     // P         [m][k] (double-buffered)
+    __shared__ __nv_bfloat16 Bs[2][64][WSK];     // dequant V [d][k]
     __shared__ float tmp[4][16][16];
     const int hk = blockIdx.z / S, sp = blockIdx.z % S;   // split-K: kv head + Lk-slice
     const int m0 = blockIdx.y * 64, d0 = blockIdx.x * 64;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wM = warp >> 1, wN = warp & 1;
+    const int gs_shift = __ffs(gs) - 1;
+    const int ndb = d0 >> 5;                      // first d-block of this 64-d tile (even)
     P += (long)hk * M * Lk;  partial += (long)(hk * S + sp) * M * D;
     vs += (long)hk * NBd * Lk; vu += (long)hk * NBd * Lk * UB; vh += (long)hk * NBd * Lk * SB;
 
@@ -859,41 +866,68 @@ __global__ void pv_wmma_kernel(
 
     const int nLk = (Lk + BLOCK - 1) / BLOCK;
     const int kt = (nLk + S - 1) / S, kc0 = sp * kt, kc1 = min(kc0 + kt, nLk);
-    for (int kc = kc0; kc < kc1; ++kc) {
+
+    auto stage = [&](int kc, int buf) {
         const int k0 = kc * BLOCK;
         for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // A-tile: P[m, lk]
             const int m = idx / BLOCK, k = idx % BLOCK, lk = k0 + k;
-            As[m][k] = (m0 + m < M && lk < Lk) ? P[(long)(m0 + m) * Lk + lk]
-                                               : __float2bfloat16(0.0f);
+            As[buf][m][k] = (m0 + m < M && lk < Lk) ? P[(long)(m0 + m) * Lk + lk]
+                                                    : __float2bfloat16(0.0f);
         }
-        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // B-tile: V[d, lk] (d-major)
-            const int dc = idx / BLOCK, k = idx % BLOCK, d = d0 + dc, lk = k0 + k;
-            float v = 0.0f;
-            if (d < D && lk < Lk) {
-                const int db = d >> 5, dd = d & 31;
+        // B-tile: thread = (key j, d-block dbl, dd-half). Reads key j's record ONCE
+        // (coalesced over j -> full sector), unpacks 16 d's, writes d-major Bs[d][j].
+        const int j = tid & 31, dbl = (tid >> 5) & 1, half = tid >> 6;
+        const int db = ndb + dbl, lk = k0 + j, d_base = dbl * 32 + half * 16;
+        if (lk < Lk) {
+            const long vbase = (long)db * Lk + lk;
+            const float vsc = ms::e8m0_to_scale(vs[vbase]);
+            if constexpr (U4) {
+                const uint4 up4 = *reinterpret_cast<const uint4*>(vu + vbase * UB);
+                const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+                uint8_t sb[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = vh[vbase * SB + i];
+                #pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    const int dd = d_base - dbl * 32 + t;   // dd within block = half*16 + t
+                    const int up_code = ms::bfe_s32((int)uw[dd >> 3], (dd & 7) * 4, 4);
+                    const int g = dd >> gs_shift;
+                    const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                    Bs[buf][dbl * 32 + dd][j] = __float2bfloat16((float)(up_code * 16 + sh_code) * vsc);
+                }
+            } else {
                 const long bu = (long)db * Lk * UB, bh = (long)db * Lk * SB;
-                const float vsc = ms::e8m0_to_scale(vs[(long)db * Lk + lk]);
-                int code;
-                if constexpr (U4) code = ms::unpack_ms_kv_elem_u4(vu, vh, bu, bh, lk, dd, gs, UB, SB);
-                else              code = ms::unpack_ms_kv_elem(vu, vh, bu, bh, Lk, lk, dd, u, gs, UB, SB);
-                v = (float)code * vsc;
+                #pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    const int dd = half * 16 + t;
+                    const int code = ms::unpack_ms_kv_elem(vu, vh, bu, bh, Lk, lk, dd, u, gs, UB, SB);
+                    Bs[buf][dbl * 32 + dd][j] = __float2bfloat16((float)code * vsc);
+                }
             }
-            Bs[dc][k] = __float2bfloat16(v);
+        } else {
+            #pragma unroll
+            for (int t = 0; t < 16; ++t) Bs[buf][dbl * 32 + half * 16 + t][j] = __float2bfloat16(0.0f);
         }
-        __syncthreads();
+    };
+
+    stage(kc0, 0);
+    __syncthreads();
+    for (int kc = kc0; kc < kc1; ++kc) {
+        const int cur = (kc - kc0) & 1, nxt = cur ^ 1;
         #pragma unroll
-        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {                 // MMA on the CURRENT tile
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
             #pragma unroll
-            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[wM*32 + i*16][wk*16], WSK);
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[cur][wM*32 + i*16][wk*16], WSK);
             #pragma unroll
-            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[wN*32 + j*16][wk*16], WSK);
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[cur][wN*32 + j*16][wk*16], WSK);
             #pragma unroll
             for (int i = 0; i < 2; ++i)
                 #pragma unroll
                 for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
         }
+        if (kc + 1 < kc1) stage(kc + 1, nxt);                     // unpack NEXT — overlaps the MMA
         __syncthreads();
     }
     float* wt = &tmp[warp][0][0];
@@ -928,13 +962,14 @@ __global__ void pv_wmma_mx_kernel(
         const int8_t* __restrict__ vs, const int8_t* __restrict__ vq,  // V [Hkv, NBd, Lk, 32]
         float* __restrict__ partial,            // [Hkv, S, M, D] fp32
         int M, int D, int Lk, int NBd, int S) {
-    __shared__ __nv_bfloat16 As[64][WSK];
-    __shared__ __nv_bfloat16 Bs[64][WSK];
+    __shared__ __nv_bfloat16 As[2][64][WSK];
+    __shared__ __nv_bfloat16 Bs[2][64][WSK];
     __shared__ float tmp[4][16][16];
     const int hk = blockIdx.z / S, sp = blockIdx.z % S;
     const int m0 = blockIdx.y * 64, d0 = blockIdx.x * 64;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wM = warp >> 1, wN = warp & 1;
+    const int ndb = d0 >> 5;
     P += (long)hk * M * Lk;  partial += (long)(hk * S + sp) * M * D;
     vs += (long)hk * NBd * Lk; vq += (long)hk * NBd * Lk * BLOCK;
 
@@ -946,37 +981,49 @@ __global__ void pv_wmma_mx_kernel(
 
     const int nLk = (Lk + BLOCK - 1) / BLOCK;
     const int kt = (nLk + S - 1) / S, kc0 = sp * kt, kc1 = min(kc0 + kt, nLk);
-    for (int kc = kc0; kc < kc1; ++kc) {
+
+    auto stage = [&](int kc, int buf) {
         const int k0 = kc * BLOCK;
         for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
             const int m = idx / BLOCK, k = idx % BLOCK, lk = k0 + k;
-            As[m][k] = (m0 + m < M && lk < Lk) ? P[(long)(m0 + m) * Lk + lk]
-                                               : __float2bfloat16(0.0f);
+            As[buf][m][k] = (m0 + m < M && lk < Lk) ? P[(long)(m0 + m) * Lk + lk]
+                                                    : __float2bfloat16(0.0f);
         }
-        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
-            const int dc = idx / BLOCK, k = idx % BLOCK, d = d0 + dc, lk = k0 + k;
-            float v = 0.0f;
-            if (d < D && lk < Lk) {
-                const int db = d >> 5, dd = d & 31;
-                const float vsc = ms::e8m0_to_scale(vs[(long)db * Lk + lk]);
-                v = (float)vq[((long)db * Lk + lk) * BLOCK + dd] * vsc;
+        const int j = tid & 31, dbl = (tid >> 5) & 1, half = tid >> 6;
+        const int db = ndb + dbl, lk = k0 + j;
+        if (lk < Lk) {
+            const long vbase = (long)db * Lk + lk;
+            const float vsc = ms::e8m0_to_scale(vs[vbase]);
+            const int8_t* rec = vq + vbase * BLOCK;
+            #pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const int dd = half * 16 + t;
+                Bs[buf][dbl * 32 + dd][j] = __float2bfloat16((float)rec[dd] * vsc);
             }
-            Bs[dc][k] = __float2bfloat16(v);
+        } else {
+            #pragma unroll
+            for (int t = 0; t < 16; ++t) Bs[buf][dbl * 32 + half * 16 + t][j] = __float2bfloat16(0.0f);
         }
-        __syncthreads();
+    };
+
+    stage(kc0, 0);
+    __syncthreads();
+    for (int kc = kc0; kc < kc1; ++kc) {
+        const int cur = (kc - kc0) & 1, nxt = cur ^ 1;
         #pragma unroll
         for (int wk = 0; wk < BLOCK / 16; ++wk) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
             #pragma unroll
-            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[wM*32 + i*16][wk*16], WSK);
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[cur][wM*32 + i*16][wk*16], WSK);
             #pragma unroll
-            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[wN*32 + j*16][wk*16], WSK);
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[cur][wN*32 + j*16][wk*16], WSK);
             #pragma unroll
             for (int i = 0; i < 2; ++i)
                 #pragma unroll
                 for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
         }
+        if (kc + 1 < kc1) stage(kc + 1, nxt);
         __syncthreads();
     }
     float* wt = &tmp[warp][0][0];
