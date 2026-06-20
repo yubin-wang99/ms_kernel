@@ -1,0 +1,11 @@
+# MSAQ kernel project — Python dependencies.
+# The CUDA extension `ms_cuda` is COMPILED from csrc/ by setup.py (torch cpp_extension);
+# it is NOT on PyPI and the built .so is machine-specific — build it on the target.
+#
+# Install torch matching the target's CUDA toolkit. This project was built/tested with
+# the CUDA 11.8 build:
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu118
+torch==2.5.1
+numpy==1.24.4
+ninja        # optional, ~10x faster nvcc builds (without it setup.py uses slow distutils)
+pytest       # to run tests/
