@@ -40,6 +40,12 @@ torch::Tensor kv_decode_attention_batched_cuda(
     torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
     int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs,
     int64_t Lcap);
+torch::Tensor pv_wmma_cuda(
+    torch::Tensor P, torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
+    int64_t Hkv, int64_t M, int64_t D, int64_t Lk, int64_t NBd, int64_t u, int64_t gs);
+torch::Tensor pv_wmma_mx_cuda(
+    torch::Tensor P, torch::Tensor vs, torch::Tensor vq,
+    int64_t Hkv, int64_t M, int64_t D, int64_t Lk, int64_t NBd);
 std::vector<torch::Tensor> kv_write_cuda(
     torch::Tensor X, int64_t H, int64_t L, int64_t D, int64_t NB, int64_t u, int64_t gs);
 void kv_append_cuda(
@@ -96,6 +102,10 @@ TORCH_LIBRARY(msaq, m) {
           "Tensor vs, Tensor vu, Tensor vh, "
           "int B, int H, int Hkv, int Lk, int D, int NB, int u, int gs, int Lcap=-1) -> Tensor",
           &kv_decode_attention_batched_cuda);
+    m.def("pv_wmma(Tensor P, Tensor vs, Tensor vu, Tensor vh, "
+          "int Hkv, int M, int D, int Lk, int NBd, int u, int gs) -> Tensor", &pv_wmma_cuda);
+    m.def("pv_wmma_mx(Tensor P, Tensor vs, Tensor vq, "
+          "int Hkv, int M, int D, int Lk, int NBd) -> Tensor", &pv_wmma_mx_cuda);
     // ---- plain MXINT8 baselines ----
     m.def("mxint8_gemv(Tensor x, Tensor scale_exp, Tensor qweight, "
           "int OUT, int NB) -> Tensor", &mxint8_gemv_cuda);

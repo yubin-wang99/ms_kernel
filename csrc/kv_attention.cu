@@ -40,10 +40,13 @@
 #include <type_traits>
 #include "core/ms_utils.cuh"
 #include <ATen/cuda/CUDAContext.h>
+#include <mma.h>
 
 namespace {
+using namespace nvcuda;
 
 constexpr int BLOCK = 32;
+constexpr int WSK = BLOCK + 8;   // shared K-tile width (+pad) — matches wa_gemm.cu
 constexpr int KV_CHUNK = 128;   // keys processed per chunk (bounds shared mem)
 constexpr int CP_CHUNK = 64;    // keys per cp.async double-buffer chunk (smaller smem)
 
@@ -820,7 +823,192 @@ __global__ void kv_decode_combine_kernel(
     out[h * D + e] = __float2bfloat16(acc / l);
 }
 
+// ---- TENSOR-CORE P·V (FlashDecoding Pass-2) — the win-track --------------------
+//   P·V at (batched) decode is a GEMM:  O[M, D] = P[M, Lk] @ V[D, Lk]   (contract Lk),
+//   M = batch x GQA-group rows. The scalar kernel was latency/dequant-bound (MSAQ
+//   BW ~0.5x MXINT8); a bf16 WMMA does the key-reduction in the tensor-core pipe so
+//   the kernel becomes memory-bound -> MSAQ reading 0.58x V bytes from DRAM wins.
+//   KEY: V stays **token-major** in DRAM (per-token grouping = accurate, KIVI-aligned,
+//   fair) — we read it coalesced/full-sector and UNPACK into a d-major bf16 shared
+//   tile (the transpose is on-chip, no DRAM sector penalty). So accuracy AND the
+//   byte-advantage are both kept. Structure mirrors wa_gemm.cu::wonly_gemm_wmma; only
+//   the B-tile source differs (V kv-unpack vs weight-unpack). U4 templated; u2/u3 use
+//   the general kv-unpack. Single kv-head per (grid.z); P pre-softmaxed (2-pass).
+template<bool U4>
+__global__ void pv_wmma_kernel(
+        const __nv_bfloat16* __restrict__ P,    // [Hkv, M, Lk]
+        const int8_t* __restrict__ vs, const uint8_t* __restrict__ vu,
+        const uint8_t* __restrict__ vh,         // V planes [Hkv, NBd, Lk, *] (token-major)
+        float* __restrict__ partial,            // [Hkv, S, M, D] fp32 (split-K partials)
+        int M, int D, int Lk, int NBd, int u, int gs, int UB, int SB, int S) {
+    __shared__ __nv_bfloat16 As[64][WSK];        // P         [m][k]
+    __shared__ __nv_bfloat16 Bs[64][WSK];        // dequant V [d][k]
+    __shared__ float tmp[4][16][16];
+    const int hk = blockIdx.z / S, sp = blockIdx.z % S;   // split-K: kv head + Lk-slice
+    const int m0 = blockIdx.y * 64, d0 = blockIdx.x * 64;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wM = warp >> 1, wN = warp & 1;
+    P += (long)hk * M * Lk;  partial += (long)(hk * S + sp) * M * D;
+    vs += (long)hk * NBd * Lk; vu += (long)hk * NBd * Lk * UB; vh += (long)hk * NBd * Lk * SB;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    const int nLk = (Lk + BLOCK - 1) / BLOCK;
+    const int kt = (nLk + S - 1) / S, kc0 = sp * kt, kc1 = min(kc0 + kt, nLk);
+    for (int kc = kc0; kc < kc1; ++kc) {
+        const int k0 = kc * BLOCK;
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // A-tile: P[m, lk]
+            const int m = idx / BLOCK, k = idx % BLOCK, lk = k0 + k;
+            As[m][k] = (m0 + m < M && lk < Lk) ? P[(long)(m0 + m) * Lk + lk]
+                                               : __float2bfloat16(0.0f);
+        }
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // B-tile: V[d, lk] (d-major)
+            const int dc = idx / BLOCK, k = idx % BLOCK, d = d0 + dc, lk = k0 + k;
+            float v = 0.0f;
+            if (d < D && lk < Lk) {
+                const int db = d >> 5, dd = d & 31;
+                const long bu = (long)db * Lk * UB, bh = (long)db * Lk * SB;
+                const float vsc = ms::e8m0_to_scale(vs[(long)db * Lk + lk]);
+                int code;
+                if constexpr (U4) code = ms::unpack_ms_kv_elem_u4(vu, vh, bu, bh, lk, dd, gs, UB, SB);
+                else              code = ms::unpack_ms_kv_elem(vu, vh, bu, bh, Lk, lk, dd, u, gs, UB, SB);
+                v = (float)code * vsc;
+            }
+            Bs[dc][k] = __float2bfloat16(v);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[wM*32 + i*16][wk*16], WSK);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[wN*32 + j*16][wk*16], WSK);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            wmma::store_matrix_sync(wt, acc[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int mb = m0 + wM*32 + i*16, db = d0 + wN*32 + j*16;
+            for (int e = lane; e < 256; e += 32) {
+                const int m = mb + e / 16, d = db + e % 16;
+                if (m < M && d < D) partial[(long)m * D + d] = wt[e];   // fp32 partial
+            }
+            __syncwarp();
+        }
+}
+
+// combine split-K partials: O[hk,m,d] = sum_s partial[hk,s,m,d]. grid (Hkv, M), thr=D.
+__global__ void pv_wmma_combine_kernel(const float* __restrict__ partial,
+        __nv_bfloat16* __restrict__ O, int Hkv, int S, int M, int D) {
+    const int hk = blockIdx.x, m = blockIdx.y, d = threadIdx.x;
+    if (d >= D) return;
+    float acc = 0.0f;
+    for (int s = 0; s < S; ++s) acc += partial[(((long)hk * S + s) * M + m) * D + d];
+    O[((long)hk * M + m) * D + d] = __float2bfloat16(acc);
+}
+
+// matched MXINT8 P·V WMMA (B-tile = int8 V read direct; same tensor-core path) -----
+__global__ void pv_wmma_mx_kernel(
+        const __nv_bfloat16* __restrict__ P,
+        const int8_t* __restrict__ vs, const int8_t* __restrict__ vq,  // V [Hkv, NBd, Lk, 32]
+        float* __restrict__ partial,            // [Hkv, S, M, D] fp32
+        int M, int D, int Lk, int NBd, int S) {
+    __shared__ __nv_bfloat16 As[64][WSK];
+    __shared__ __nv_bfloat16 Bs[64][WSK];
+    __shared__ float tmp[4][16][16];
+    const int hk = blockIdx.z / S, sp = blockIdx.z % S;
+    const int m0 = blockIdx.y * 64, d0 = blockIdx.x * 64;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wM = warp >> 1, wN = warp & 1;
+    P += (long)hk * M * Lk;  partial += (long)(hk * S + sp) * M * D;
+    vs += (long)hk * NBd * Lk; vq += (long)hk * NBd * Lk * BLOCK;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    const int nLk = (Lk + BLOCK - 1) / BLOCK;
+    const int kt = (nLk + S - 1) / S, kc0 = sp * kt, kc1 = min(kc0 + kt, nLk);
+    for (int kc = kc0; kc < kc1; ++kc) {
+        const int k0 = kc * BLOCK;
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK, lk = k0 + k;
+            As[m][k] = (m0 + m < M && lk < Lk) ? P[(long)(m0 + m) * Lk + lk]
+                                               : __float2bfloat16(0.0f);
+        }
+        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+            const int dc = idx / BLOCK, k = idx % BLOCK, d = d0 + dc, lk = k0 + k;
+            float v = 0.0f;
+            if (d < D && lk < Lk) {
+                const int db = d >> 5, dd = d & 31;
+                const float vsc = ms::e8m0_to_scale(vs[(long)db * Lk + lk]);
+                v = (float)vq[((long)db * Lk + lk) * BLOCK + dd] * vsc;
+            }
+            Bs[dc][k] = __float2bfloat16(v);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &As[wM*32 + i*16][wk*16], WSK);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Bs[wN*32 + j*16][wk*16], WSK);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            wmma::store_matrix_sync(wt, acc[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int mb = m0 + wM*32 + i*16, db = d0 + wN*32 + j*16;
+            for (int e = lane; e < 256; e += 32) {
+                const int m = mb + e / 16, d = db + e % 16;
+                if (m < M && d < D) partial[(long)m * D + d] = wt[e];   // fp32 partial
+            }
+            __syncwarp();
+        }
+}
+
 inline int next_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
+
+// split the P·V Lk-loop so base_blocks*S ~= mult*#SM fills the machine; cap at nLk
+// (each split needs >=1 32-key chunk). MS_PV_SPLIT_MULT (env, default 4).
+inline int pv_split_count(int base_blocks, int nLk) {
+    static int sm = -1;
+    if (sm < 0) cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, 0);
+    int mult = 4;
+    if (const char* e = getenv("MS_PV_SPLIT_MULT")) { int m = atoi(e); if (m > 0) mult = m; }
+    int S = (mult * sm + base_blocks - 1) / base_blocks;
+    if (S > nLk) S = nLk;
+    if (S < 1) S = 1;
+    return S;
+}
 
 // ---- KV WRITE (prefill): pack_kv as a CUDA kernel ---------------------------
 //   bf16 X [H,L,D] (post-projection+RoPE) -> token-major MSAQ planes that
@@ -1071,6 +1259,56 @@ torch::Tensor kv_decode_attention_batched_cuda(
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), (int)H, (int)D, S);
     return out;
+}
+
+// ---- TENSOR-CORE P·V launcher (win-track proxy). P [Hkv,M,Lk] pre-softmaxed,
+//   V token-major planes [Hkv,NBd,Lk,*] -> O [Hkv,M,D]. grid (D/64, M/64, Hkv). -----
+torch::Tensor pv_wmma_cuda(
+        torch::Tensor P, torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
+        int64_t Hkv, int64_t M, int64_t D, int64_t Lk, int64_t NBd, int64_t u, int64_t gs) {
+    TORCH_CHECK(P.is_cuda() && P.scalar_type() == torch::kBFloat16, "P must be CUDA bf16");
+    const int wbits = 8 - (int)u;
+    const int UB = BLOCK * wbits / 8, SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
+    // split-K over Lk so grid = (D/64)*(M/64)*Hkv*S fills the SMs (decode tile is tiny).
+    const int mt = ((int)M + 63) / 64, dt = ((int)D + 63) / 64;
+    int S = pv_split_count(dt * mt * (int)Hkv, (int)((Lk + BLOCK - 1) / BLOCK));
+    auto fopt = P.options().dtype(torch::kFloat32);
+    auto partial = torch::empty({Hkv, (int64_t)S, M, D}, fopt);
+    auto O = torch::empty({Hkv, M, D}, P.options());
+    dim3 grid(dt, mt, (int)Hkv * S);
+    auto launch = [&](auto U4tag) {
+        pv_wmma_kernel<decltype(U4tag)::value><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(P.data_ptr<at::BFloat16>()),
+            vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(),
+            (int)M, (int)D, (int)Lk, (int)NBd, (int)u, (int)gs, UB, SB, S);
+    };
+    if ((int)u == 4) launch(std::true_type{}); else launch(std::false_type{});
+    pv_wmma_combine_kernel<<<dim3((int)Hkv, (int)M), next_pow2((int)D), 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(O.data_ptr<at::BFloat16>()),
+        (int)Hkv, S, (int)M, (int)D);
+    return O;
+}
+
+torch::Tensor pv_wmma_mx_cuda(
+        torch::Tensor P, torch::Tensor vs, torch::Tensor vq,
+        int64_t Hkv, int64_t M, int64_t D, int64_t Lk, int64_t NBd) {
+    TORCH_CHECK(P.is_cuda() && P.scalar_type() == torch::kBFloat16, "P must be CUDA bf16");
+    const int mt = ((int)M + 63) / 64, dt = ((int)D + 63) / 64;
+    int S = pv_split_count(dt * mt * (int)Hkv, (int)((Lk + BLOCK - 1) / BLOCK));
+    auto fopt = P.options().dtype(torch::kFloat32);
+    auto partial = torch::empty({Hkv, (int64_t)S, M, D}, fopt);
+    auto O = torch::empty({Hkv, M, D}, P.options());
+    dim3 grid(dt, mt, (int)Hkv * S);
+    pv_wmma_mx_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(P.data_ptr<at::BFloat16>()),
+        vs.data_ptr<int8_t>(), vq.data_ptr<int8_t>(),
+        partial.data_ptr<float>(),
+        (int)M, (int)D, (int)Lk, (int)NBd, S);
+    pv_wmma_combine_kernel<<<dim3((int)Hkv, (int)M), next_pow2((int)D), 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(O.data_ptr<at::BFloat16>()),
+        (int)Hkv, S, (int)M, (int)D);
+    return O;
 }
 // KV write launcher: bf16 X [H,L,D] -> (scale_exp [H,nb,L], upper [H,nb,L,UB],
 // shared [H,nb,L,SB]) — the certified token-major planes. UB/SB from u,gs.

@@ -181,6 +181,16 @@ MSAQ를 0.5× BW로 묶던 천장이 사라져 **BW-bound 영역(head fuse OUT=1
 channel-major(속도)*를 동시 만족 불가. **결론: 공정·정확도 둘 다 지키는 KV-read win은 per-token V를
 유지한 채 staging+텐서코어 P·V로 흡수하는 길(=BW-bound FlashDecoding 재작성)뿐.** (change.md Phase 36.)
 
+### Phase 37 — 텐서코어 P·V(bf16 WMMA+split-K) 구현: "정공법"마저 기각 (2026-06-20)
+Phase 36이 지목한 유일한 경로를 구현. P·V를 bf16 WMMA로(`pv_wmma`/`pv_wmma_mx`), **V는 token-major로
+DRAM 0.58× coalesced 읽고 d-major bf16 shared 타일로 on-chip transpose** → 정확도(rel 2.3e-3)·공정
+보존. split-K로 occupancy 회복(절대속도 10× → 스칼라 경쟁력). **결과: MSAQ가 짐(ratio 1.07~1.22),
+실효 BW 다시 ~0.5× MXINT8.** 근본: **텐서코어는 reduction을 가속하나 병목은 dequant→bf16-staging
+throughput이고, MMA는 bf16 타일을 강제하므로 두 포맷이 같은 타일을 만들어 DRAM 0.58×가 무관해진다**
+(GEMV는 staging 없이 wide-load라 win, 텐서코어는 staging 강제라 그 win을 잃음). **6개 lever
+(split-K/warp-transpose/batch/channel-major/텐서코어/split-K WMMA) 종합: 공정·정확한 MSAQ KV-read
+win은 본 dequant 패러다임에서 불가.** (change.md Phase 37.)
+
 <details><summary>(원래 적출된 비대칭 — 기록용)</summary>
 
 원래 문제: MSAQ는 thread-per-key(wide, Phase 18)인데 MXINT8 KV read만 구버전 warp-per-key+
