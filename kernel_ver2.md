@@ -95,6 +95,10 @@ MXINT8을 thread-per-key로 올려 이 원칙을 KV read까지 관철했다(ver.
 - **결과(단일 토큰 H32 D128):** MSAQ u4 8.7µs ≈ MXINT8 8.7µs(런치 지배 동률), BF16 copy 16µs.
 
 ### 2.4 KV cache dequantize / attention  (memory-bound이론 / **실측 latency-bound → 공정 tie**)
+> **KV-read win 시도 총정리는 [kv_read_attempts.md] 참조** — 이 절의 tie 이후 8개 lever(split-K/
+> warp-transpose/batch/channel-major/텐서코어-P·V/2-pass/scalar-Q·K)를 끝까지 시도한 기록과
+> 근본 원인(dequant throughput ~0.5× MXINT8 BW), 최종 결론(공정·정확 win 불가)을 담았다.
+
 **설계.** flash-decode attention이 매 key/value마다 packed plane을 읽어 on-the-fly 복원해
 score·output을 누적. split-K(키축)+online-softmax+combine. K(Q·K dot)는 thread-per-key로
 연속 적재(규칙 7의 "이기는 쪽"). V(P·V)는 키에 대한 reduction이라 thread-per-d가 자연스러운데
