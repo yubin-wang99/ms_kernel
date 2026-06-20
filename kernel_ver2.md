@@ -59,6 +59,10 @@ MXINT8을 thread-per-key로 올려 이 원칙을 KV read까지 관철했다(ver.
 
 ## 1. Prefill 단계 커널 (ver.1과 동일)
 
+> **weight matmul scope(W/GEMV/GEMM) 결과 총정리는 [weight_scope_results.md] 참조** —
+> §1.1·1.2(GEMM)·§2.1·2.2(GEMV)의 설계·lever·수치와 "왜 이기는가"(memory-bound + element-내부
+> reduction)를 KV-read와 대조해 한 곳에 모았다.
+
 ### 1.1 W-only GEMM  (compute-bound)
 - 가중치 plane을 packed로 저장, 타일 프롤로그에서 1회 언팩해 공유타일에 올리고 M행이 재사용.
 - GEMM은 AI가 높아 **compute-bound** → sharing의 대역폭 절약이 가려진다. 타일당 1회 언팩이 최선.

@@ -65,6 +65,10 @@ Phase 22–27.
 Full phase-by-phase history (split-K → coalescing → two-pass → cp.async →
 wide-load → streaming unpack) and the 4-kernel scoreboard are in `change.md`.
 
+> **weight matmul scope(W/GEMV/GEMM) 결과 총정리:** [`weight_scope_results.md`](weight_scope_results.md)
+> — 설계·lever·수치(GEMV u4 0.63, W+A GEMM u4 0.79 …)와 "왜 이기는가". KV-read는
+> [`kv_read_attempts.md`](kv_read_attempts.md)(tie로 정정).
+
 ## Layout
 
 ```
