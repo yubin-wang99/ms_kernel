@@ -16,6 +16,12 @@ cuBLAS/SDPA BF16 too). The wins are bit-exact (no repack, no padding) and came
 from finding the *real* bottleneck by measurement, not by the layout fix the
 design notes assumed.
 
+> **결과 총정리 (두 문서):**
+> - [`weight_scope_results.md`](weight_scope_results.md) — weight matmul scope(W/GEMV/GEMM) **win**
+>   (GEMV u4 0.63, W+A GEMM u4 0.79 …)과 "왜 이기는가".
+> - [`kv_read_attempts.md`](kv_read_attempts.md) — KV-read는 공정성 수정 후 **tie**로 정정
+>   (아래 KV decode 표의 "압승"은 MXINT8 under-optimization 산물; 8개 lever 시도·근본벽 기록).
+
 **KV decode** (Phase 18) — `H=8 Lk=16384 D=128`, pure-HBM. Lever: a
 `key-per-thread` wide coalesced read (each thread owns one key's contiguous
 bytes → a warp reads a full 512 B sector at 100 % utilisation vs the old
