@@ -27,6 +27,12 @@ warp-per-key 50 %).
 | u3 | **0.87×** | 0.32× |
 | u4 | **0.49×** | 0.18× |
 
+> ⚠️ **이 KV-read MSAQ/MXINT8 수치(Phase 18)는 이후 공정성 수정으로 정정됨 → 실제는 tie.**
+> MXINT8 baseline을 동일 thread-per-key로 올리니 위 "압승"의 ~2×가 MXINT8 under-optimization
+> 산물이었음이 드러났다(MSAQ/SDPA 대 BF16 win은 유효). 이후 8개 lever로 KV-read win을 끝까지
+> 시도했고 결론은 **공정·정확 win 불가** — 전체 기록은 [`kv_read_attempts.md`](kv_read_attempts.md),
+> [`for_fair_comparison.md`](for_fair_comparison.md). (W/GEMV/GEMM scope의 win은 유효.)
+
 **W-only GEMV** (Phase 14/16/20) — decode `M=1`, `OUT=K=4096`. u4 uses a single
 int4 load + nibble `bfe`; u2/u3 were *extraction*-bound (the byte-straddle unpack,
 not the load — a perfectly-coalesced plane-split gave zero speedup), fixed by a
