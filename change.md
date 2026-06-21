@@ -1582,3 +1582,31 @@ occupancy-bound(~25× off roofline)라 wide에 못 미침(1.45×, documented neg
 35–40) regime은 bf16-staging 천장 가설 그대로 미재검토. 따라서 **Phase 32의 wide single-token tie만
 win으로 정정**되고, 다른 regime의 "불가능"은 유지. 부속물: `tests/kv_pack_results.md`(전체 측정),
 `tests/kv_pack_bench.py`, 같은 sepsc가 W-only GEMV u3에도 +3–5%(`tests/gemv_sepsc_results.md`).
+
+# Phase 42 — vpack(packed-transposed nibble V staging): GQA도 win, vpack가 디폴트
+
+Phase 41(v8+sepsc+vt)은 MHA만 0.97× win이고 GQA(32/8)는 1.05× loss였다. 사용자 진단: v8이 V를 int8로
+*복원 후* staging하므로 0.58× 바이트 이점이 비병목 DRAM(20%)에만 실리고, 병목인 shared(L1/TEX 60%)엔
+1.0×라 시간이 0.58×로 안 내려간다. FP6-LLM 사상(한가한 ALU로 dequant 흡수 → memory/shared wall 회피)대로
+**v8 결정을 뒤집어 packed sub-byte를 shared에 staging하고 unpack을 Pass-2 레지스터로 미룸**.
+
+구현 = **transposed + nibble-packed** staging: vp[blk][kd][kk]에 2 codes/byte로 packing(write-race
+회피 위해 2 keys/thread), CHP=chunk/2 round-up & CHP/4 홀수 → Pass-2가 int32 1개로 8코드 conflict-free
+read. up·sh를 각각 nibble plane으로.
+
+**no-fake-win 검증(ncu 트랜잭션을 시간보다 먼저):** shared-load wavefronts **불변**(1,721,826 vs
+1,722,816) — up-nibble + sh-nibble 2-plane은 int32 2개/8코드 = v8의 int8 1개/4코드와 동일 로드 수.
+**예측한 shared-transaction 감소는 실현되지 않음.** 그런데 Duration은 135→122µs로 감소(L1/TEX
+51.4→49.9%). 진짜 이득은 **occupancy** — vpack smem 13 KB vs v8+vt 16.5 KB(packed nibble, int8 패딩
+없음) → 블록/SM↑. bit-exact(rel_fro 0.00 vs v8+vt; test_kv 72/72).
+
+**결과(u4/gs2, vpack vs MXINT8):** MHA H8 Lk4096 0.97× · H8 Lk16384 0.83× · H16 Lk16384 0.90×;
+**GQA 32/8 Lk4096 0.90× · Lk16384 0.93×**(전부 WIN). 같은 wide 커널 하나가 Hq/Hkv로 MHA·GQA 둘 다
+처리 → GQA가 long-context서도 win(occupancy↑로 wide의 L2-cached 4× 중복 read + latency가 더 잘 hide).
+design-A KV-reuse 전용 커널은 불필요(occupancy-bound documented negative). vpack를 u4/gs≤2 디폴트로,
+v8/vt는 fallback(`MS_KV_VPACK=0`). 정직한 단서: win은 occupancy/smem 효과이지 FP6-LLM 프레이밍이 예측한
+shared-transaction 감소가 아님(ncu상 트랜잭션 평탄) — 다만 packed-staging 방향 자체는 옳았다.
+
+**KV-read 최종(정정):** single-token decode에서 MSAQ가 MXINT8을 MHA·GQA 모두 공정·정확하게 이긴다
+(스택: nibble u4/gs2 + sepsc + vpack). Phase 32 tie와 Phase 41 GQA parity를 모두 정정. 배치/텐서코어
+regime은 3090 native sub-byte MMA 부재로 미해결(Blackwell 과제).
