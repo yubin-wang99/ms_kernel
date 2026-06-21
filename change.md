@@ -1553,3 +1553,32 @@ ratio-win" artifact).
 warp-transpose/batch/channel-major/텐서코어-P·V/텐서코어-2pass/scalar-Q·K 전부 시도 완료). 진짜 잔여
 가능성은 native sub-byte tensor-core(하드웨어 미지원)뿐. MSAQ의 실제 가치는 weight 경로(GEMV), KV-read는
 tie로 최종 확정. 커널/ops/bench 보존(`qk_scalar*`, env `MS_QK_SCALAR`).
+
+# Phase 41 — single-token MHA decode WIN: Phase 32의 wide-scalar "tie"를 정정 (0.97×)
+
+Phase 32–40은 "best-vs-best tie / 불가능"으로 닫았으나, 그 결론은 (a) fast=텐서코어=bf16-staging 천장,
+(b) ratio-win=스칼라는 2–3× 느린 영역 — 두 전제 위였다. 그러나 **autoregressive single-token decode의
+best-vs-best는 텐서코어가 아니라 wide 스칼라**(M=1 → MMA 타일 무의미; 텐서코어 P·V win은 M≥32 shared-
+prefix 한정)다. 그 wide 스칼라를 ncu로 재측정하니 병목은 dequant-throughput(0.5× 실효 BW 가설)이 아니라
+**Pass-2 staged-V의 L1/TEX shared-transaction**이었다: DRAM 20.7%, **L1/TEX 63.5%**, occupancy 24%
+(reg-limited). 즉 BW-bound도 occupancy-bound도 아닌 **shared-traffic-bound**.
+
+4개 lever를 쌓아 정정(u4/gs2, bit-exact test_kv 72/72):
+1. **패킹-친화 config**: nibble u4/gs2 — robust(+2.72% PPL)인 최저-aggressive nibble(2 codes/byte). 출발 1.45×.
+2. **v8** (`MS_KV_V8`, u4/gs≤2 디폴트): V를 Pass-1서 int8 코드(up·16+sh∈[-120,119])로 복원 staging →
+   Pass-2가 MXINT8과 동일(1 int8 read, no bfe, gs shared-plane 제거). →1.25×.
+3. **sepsc** (`MS_KV_SEPSC`, u4 디폴트): K dot 인수분해 `Σq·(up·2^u+sh)·s = s·(2^u·Σq·up + Σ_g sh·qg)`,
+   qg=query group-sum 1회 precompute → shared항 per-group + scale를 block-level로. →1.02–1.13×.
+4. **vt** (`MS_KV_VT`, v8과 함께 디폴트): staged int8 V를 **transposed+padded** `pV8[blk·32·CH+kd·CH+kk]`,
+   CH=chunk+4(CH/4 홀수 → bank-conflict-free)로 배치 → 각 스레드의 kk-코드가 연속 → Pass-2가 **int32당
+   4코드** read(conflict-free, 4× 적은 shared txn). →**0.97× WIN**.
+
+**결과:** MHA(Hq=Hkv) H8 Lk4096/16384, H16 Lk16384 **전부 0.97× best-vs-best WIN**(MXINT8 wide 대비).
+ncu 확인: L1/TEX 63.5→60.2%, Duration 148→135µs. **MSAQ 최초의 공정·정확 KV-read decode win.**
+
+**미해결(정직):** GQA(Hq>Hkv)는 wide 경로가 KV head를 query-head당 1번(=4×) 중복 read해 1.01–1.07×
+parity. KV-reuse(design-A `kv_decode_gqa_kernel`)에 v8+sepsc 이식했으나 scalar+full-staging 구조가
+occupancy-bound(~25× off roofline)라 wide에 못 미침(1.45×, documented negative). 배치/텐서코어(Phase
+35–40) regime은 bf16-staging 천장 가설 그대로 미재검토. 따라서 **Phase 32의 wide single-token tie만
+win으로 정정**되고, 다른 regime의 "불가능"은 유지. 부속물: `tests/kv_pack_results.md`(전체 측정),
+`tests/kv_pack_bench.py`, 같은 sepsc가 W-only GEMV u3에도 +3–5%(`tests/gemv_sepsc_results.md`).
