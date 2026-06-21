@@ -176,7 +176,7 @@ __global__ void wonly_gemv_wide_kernel(
         const uint8_t* __restrict__ upper_cm,    // [NB, OUT, UB]   column-major
         const uint8_t* __restrict__ shared_cm,   // [NB, OUT, SB]
         float* __restrict__ partial,             // [splitK, OUT]
-        int OUT, int NB, int u, int gs, int UB, int SB, int splitK) {
+        int OUT, int NB, int u, int gs, int UB, int SB, int splitK, int sepsc) {
     const int tid = threadIdx.x;
     const int o   = blockIdx.x * blockDim.x + tid;
     const int sp  = blockIdx.y;
@@ -198,13 +198,32 @@ __global__ void wonly_gemv_wide_kernel(
             const uint4 up4 = *reinterpret_cast<const uint4*>(
                                   upper_cm + ((long)blk * OUT + o) * UB);   // 16 B, one load
             const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
-            #pragma unroll
-            for (int k = 0; k < BLOCK; ++k) {
-                const int up_code = ms::bfe_s32((int)uw[k >> 3], (k & 7) * 4, 4);
-                const int g = k >> gs_shift;
-                const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
-                const int w = up_code * 16 + sh_code;
-                acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
+            if (sepsc) {            // separated-scale: s·(2^u·Σx·up + Σ_g sh·xg), xg=group x-sum
+                const int gsmask = gs - 1;
+                float bup = 0.0f, bsh = 0.0f, xsum = 0.0f; int sh_code = 0;
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) {
+                    if ((k & gsmask) == 0) {
+                        if (k > 0) bsh += sh_code * xsum;
+                        const int g = k >> gs_shift;
+                        sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                        xsum = 0.0f;
+                    }
+                    const float xk = __bfloat162float(x[blk * BLOCK + k]);
+                    bup += ms::bfe_s32((int)uw[k >> 3], (k & 7) * 4, 4) * xk;
+                    xsum += xk;
+                }
+                bsh += sh_code * xsum;
+                acc += scale * (16.0f * bup + bsh);
+            } else {
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) {
+                    const int up_code = ms::bfe_s32((int)uw[k >> 3], (k & 7) * 4, 4);
+                    const int g = k >> gs_shift;
+                    const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                    const int w = up_code * 16 + sh_code;
+                    acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
+                }
             }
         }
     } else {
@@ -243,18 +262,22 @@ __global__ void wonly_gemv_wide_kernel(
             uint64_t ubuf = 0; int unb = 0, uwi = 0;
             uint64_t sbuf = 0; int snb = 0, swi = 0;
             int sh_code = 0;
+            float bup = 0.0f, bsh = 0.0f, xsum = 0.0f;    // sepsc accumulators
             for (int k = 0; k < BLOCK; ++k) {
                 if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
                 const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
                 ubuf >>= wbits; unb -= wbits;
+                const float xk = __bfloat162float(x[blk * BLOCK + k]);
                 if ((k & gsmask) == 0) {                  // new shared group
+                    if (sepsc && k > 0) bsh += sh_code * xsum;
                     if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
                     sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
-                    sbuf >>= u; snb -= u;
+                    sbuf >>= u; snb -= u; xsum = 0.0f;
                 }
-                const int w = up_code * (1 << u) + sh_code;
-                acc += (static_cast<float>(w) * scale) * __bfloat162float(x[blk * BLOCK + k]);
+                if (sepsc) { bup += up_code * xk; xsum += xk; }
+                else acc += (static_cast<float>(up_code * (1 << u) + sh_code) * scale) * xk;
             }
+            if (sepsc) { bsh += sh_code * xsum; acc += scale * ((float)(1 << u) * bup + bsh); }
         }
     }
     partial[(long)sp * OUT + o] = acc;
@@ -428,12 +451,16 @@ torch::Tensor wonly_gemv_wide_cuda(
     const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
     auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
 
+    // separated-scale dot helps the extraction-bound u2/u3 paths; for u4 (memory-bound)
+    // the group-sum bookkeeping adds unhidden latency -> default off there. MS_GEMV_SEPSC forces.
+    int sepsc = ((int)u != 4) ? 1 : 0;
+    if (const char* e = getenv("MS_GEMV_SEPSC")) sepsc = atoi(e) != 0 ? 1 : 0;
     auto launch = [&](auto U4tag) {
         wonly_gemv_wide_kernel<decltype(U4tag)::value><<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             scale_exp.data_ptr<int8_t>(),
             upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
-            partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
+            partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK, sepsc);
     };
     if ((int)u == 4) launch(std::true_type{});
     else             launch(std::false_type{});
