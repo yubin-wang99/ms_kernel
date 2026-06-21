@@ -59,6 +59,34 @@ Cuts the u4/gs2 gap from ~1.45–1.49× to ~1.15–1.25×; gated to gs≤2 (help
 plane is large). Not yet under MXINT8 — the remaining gap is the Pass-1 K extraction/compute
 (separated-scale dequant, next).
 
+## Optimization 2: separated-scale K dot (`MS_KV_SEPSC`, default on for u4)
+Instead of reconstructing a single code `(up·2^u+sh)` per element then scaling, factor the dot:
+`Σ_d q·(up·2^u+sh)·s = s·(2^u·Σ_d q·up + Σ_g sh·qg)` where `qg[g]=Σ_{d∈group} q[d]` is the
+query group-sum — **key-independent, precomputed once** in smem. The shared term becomes per-GROUP
+(16 ops for gs2 vs 32) and both scales fold to the block level. Within rel-Frobenius tol (test_kv 72/72).
+
+Effect on u4/gs2 (on top of v8): a further ~4%.
+| config | v8 only | v8+sepsc | MXINT8 |
+|---|---|---|---|
+| u4/gs2 H8 Lk16k  | 1.14× | **1.09×** | 1.00× |
+| u4/gs2 H16 Lk16k | 1.06× | **1.02×** (parity) | 1.00× |
+
+## Where u4/gs2 KV-read lands (honest result)
+v8 + separated-scale took u4/gs2 from the original **1.45–1.50× down to ~1.02–1.13× MXINT8** — a
+**near-tie** (parity at H16), not a strict win. Why no strict win:
+- KV-decode is **latency/occupancy-bound, not bandwidth-bound** at every size and batch tested (both
+  MSAQ and MXINT8 sustain only 65–330 GB/s, ≤35% of the 3090's ~900 GB/s peak; batched B=32 still
+  ~130 GB/s). So MSAQ's 0.76× **byte savings never convert to time**.
+- The residual gap is the **irreducible bit-extraction** (bfe per element for K, plus the int8 V
+  reconstruct) that a plain-int8 MXINT8 read does not pay. More splits help MXINT8 *more* (it scales
+  better with occupancy), so tuning `MS_KV_SPLIT_MULT` doesn't flip it (best H8 = mult4, 1.05×).
+- GQA (Hq32/Hkv8) makes it worse: the wide path reads each KV head once **per query head** (4×),
+  amplifying MSAQ's per-read cost (batched ratio 1.07→1.26× as B grows).
+This matches the project's documented KV-read history (fundamental obstacle → fair tie). The one
+untried avenue is the design-A GQA kernel (reads+unpacks KV **once** per key, reused across the G
+query rows) — there MSAQ's extraction would amortize over G; the v8/sepsc levers were applied to the
+wide kernel, not that path.
+
 ## Takeaway
 The inference-time lever is **nibble alignment (u4), not minimal bits/elem**. The most-aggressive
 robust config (u3) is extraction-bound and squanders its footprint advantage. A less-aggressive,

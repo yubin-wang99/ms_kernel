@@ -341,7 +341,7 @@ __global__ void kv_decode_wide_kernel(
         const uint8_t* __restrict__ vh,
         float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
         int H, int Hkv, int Lk, int Lcap, int D, int NB, int u, int gs, int UB, int SB,
-        int key_tile, int S, int chunk, float sm_scale, int v8) {
+        int key_tile, int S, int chunk, float sm_scale, int v8, int sepsc) {
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
     const int hk = h / (H / Hkv);                  // GQA: q head -> kv head
     const int gs_shift = __ffs(gs) - 1;            // gs is pow2: k/gs == k>>shift
@@ -356,12 +356,25 @@ __global__ void kv_decode_wide_kernel(
     part_o += b * (long)H * S * D; part_m += b * (long)H * S; part_l += b * (long)H * S;
 
     extern __shared__ unsigned char smem_w[];
-    float* q_sh = (float*)smem_w;                  // [D]
-    float* sc   = q_sh + D;                        // [chunk] scores
+    float* q_sh  = (float*)smem_w;                 // [D]
+    float* qg_sh = q_sh + D;                        // [NB*BLOCK] q group-sums (separated-scale)
+    float* sc    = qg_sh + (long)NB * BLOCK;        // [chunk] scores
     unsigned char* pVu = (unsigned char*)(sc + chunk);  // [NB*chunk*UB] staged V upper
     unsigned char* pVh = pVu + (long)NB * chunk * UB;   // [NB*chunk*SB] staged V shared
     if (active) q_sh[tid] = __bfloat162float(q[h * D + tid]);
     __syncthreads();
+    // separated-scale: per (blk,g) query group-sum qg = Σ_{d∈group} q[d] (key-independent,
+    // computed once). The K/V dot then factors: Σ q·(up·2^u+sh)·s = s·(2^u·Σq·up + Σ_g sh·qg).
+    if (sepsc) {
+        const int ng = BLOCK >> gs_shift;
+        for (int idx = tid; idx < NB * ng; idx += NT) {
+            const int blk = idx / ng, g = idx % ng, base = g << gs_shift;
+            float acc = 0.0f;
+            for (int t = 0; t < gs; ++t) acc += q_sh[blk * BLOCK + base + t];
+            qg_sh[blk * BLOCK + g] = acc;
+        }
+        __syncthreads();
+    }
 
     const int j0 = s * key_tile, j1 = min(j0 + key_tile, Lk);
     float m_i = -INFINITY, l_i = 0.0f, acc = 0.0f;
@@ -388,12 +401,23 @@ __global__ void kv_decode_wide_kernel(
                 if constexpr (U4) {                         // u4 fast path: uint4 + bfe
                     const uint4 up4 = *reinterpret_cast<const uint4*>(ku + kbase * UB);
                     const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
-                    #pragma unroll
-                    for (int kd = 0; kd < BLOCK; ++kd) {
-                        const int up_code = ms::bfe_s32((int)uw[kd >> 3], (kd & 7) * 4, 4);
-                        const int g       = kd >> gs_shift;
-                        const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
-                        dot += q_sh[blk * BLOCK + kd] * ((up_code * 16 + sh_code) * ksc);
+                    if (sepsc) {                            // separated-scale: up per-elem, sh per-group
+                        float bup = 0.0f, bsh = 0.0f;
+                        #pragma unroll
+                        for (int kd = 0; kd < BLOCK; ++kd)
+                            bup += q_sh[blk * BLOCK + kd] * ms::bfe_s32((int)uw[kd >> 3], (kd & 7) * 4, 4);
+                        const int ng = BLOCK >> gs_shift;
+                        for (int g = 0; g < ng; ++g)
+                            bsh += ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4) * qg_sh[blk * BLOCK + g];
+                        dot += ksc * (16.0f * bup + bsh);
+                    } else {
+                        #pragma unroll
+                        for (int kd = 0; kd < BLOCK; ++kd) {
+                            const int up_code = ms::bfe_s32((int)uw[kd >> 3], (kd & 7) * 4, 4);
+                            const int g       = kd >> gs_shift;
+                            const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                            dot += q_sh[blk * BLOCK + kd] * ((up_code * 16 + sh_code) * ksc);
+                        }
                     }
                 } else {                                    // u2/u3: STREAMING bit-buffer unpack
                     // thread-per-key unpacks ALL 32 codes of its key sequentially, so the
@@ -1529,8 +1553,12 @@ torch::Tensor kv_decode_attention_cuda(
         // smem costs occupancy, so default off there. MS_KV_V8 forces (0/1).
         int v8 = ((int)u == 4 && (int)gs <= 2) ? 1 : 0;
         if (const char* e = getenv("MS_KV_V8")) v8 = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
+        // separated-scale K dot (u4): factor scales to block level, shared term per-group.
+        int sepsc = ((int)u == 4) ? 1 : 0;
+        if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
         const size_t stageB = v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB);
-        const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float) + stageB;
+        const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
+                            + (size_t)NB * BLOCK * sizeof(float) + stageB;   // +qg_sh
         auto launch = [&](auto U4tag) {
             auto k = kv_decode_wide_kernel<decltype(U4tag)::value>;
             if (smem_w > 48 * 1024)   // opt in to >48KB dynamic smem (e.g. D=256: staged V)
@@ -1540,7 +1568,7 @@ torch::Tensor kv_decode_attention_cuda(
                 ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
                 vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
                 part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8);
+                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc);
         };
         if ((int)u == 4) launch(std::true_type{});
         else             launch(std::false_type{});
@@ -1596,8 +1624,11 @@ torch::Tensor kv_decode_attention_batched_cuda(
     auto part_l = torch::empty({B, H, (int64_t)S}, fopt);
     int v8 = ((int)u == 4 && (int)gs <= 2) ? 1 : 0;
     if (const char* e = getenv("MS_KV_V8")) v8 = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
+    int sepsc = ((int)u == 4) ? 1 : 0;
+    if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
     const size_t stageB = v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB);
-    const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float) + stageB;
+    const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
+                        + (size_t)NB * BLOCK * sizeof(float) + stageB;   // +qg_sh
     auto launch = [&](auto U4tag) {
         auto k = kv_decode_wide_kernel<decltype(U4tag)::value>;
         if (smem_w > 48 * 1024)
@@ -1607,7 +1638,7 @@ torch::Tensor kv_decode_attention_batched_cuda(
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
             part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8);
+            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc);
     };
     if ((int)u == 4) launch(std::true_type{}); else launch(std::false_type{});
     kv_decode_combine_kernel<<<dim3((int)H, (int)B), threads, 0, at::cuda::getCurrentCUDAStream()>>>(

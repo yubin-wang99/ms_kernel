@@ -34,7 +34,7 @@ def run(u, gs, H=8, Lk=4096, D=128):
     qt = torch.from_numpy(q).to(torch.bfloat16).cuda()
     nb = pmK["nb"]
     msaq = lambda: torch.ops.msaq.kv_decode_attention(qt, ks, ku, kh, vs, vu, vh, H, H, Lk, D, nb, u, gs)
-    mx   = lambda: torch.ops.msaq.mxint8_kv_decode(qt, kxs, kxq, vxs, vxq, H, Lk, D, pxK["nb"])
+    mx   = lambda: torch.ops.msaq.mxint8_kv_decode(qt, kxs, kxq, vxs, vxq, H, H, Lk, D, pxK["nb"])
 
     def t_diag(d):
         os.environ["MS_KV_DIAG"] = str(d)
