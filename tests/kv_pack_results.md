@@ -87,6 +87,26 @@ untried avenue is the design-A GQA kernel (reads+unpacks KV **once** per key, re
 query rows) — there MSAQ's extraction would amortize over G; the v8/sepsc levers were applied to the
 wide kernel, not that path.
 
+## Optimization 3 (attempted): port v8+sepsc into the design-A GQA kernel
+The design-A GQA kernel (`MS_KV_GQA=1`) reads+unpacks each KV once per key and reuses it across the
+G=4 query heads — the regime where MSAQ's extraction should amortize. Ported both levers into it.
+
+| Lk | MXINT8 | wide (v8+sepsc) | gqaA base | gqaA +v8 | gqaA +v8+sepsc |
+|---|---|---|---|---|---|
+| 4096  | 106µs | **0.97× (WIN)** | 1.55× | 1.50× | 1.45× |
+| 16384 | 344µs | 1.15× | 1.42× | 1.35× | 1.38× |
+
+- v8 helps design-A (1.55→1.50, 1.42→1.35) and sepsc helps only at short Lk (1.50→1.45); at long Lk
+  sepsc **hurts** design-A (1.35→1.38) — as expected, it breaks design-A's combined-w amortization
+  over G (the shared term becomes per-(g,group) = G·ng work). So sepsc is default-OFF for GQA.
+- **But design-A stays far behind the wide kernel** (1.45× vs 0.97× at Lk4096). Its scalar +
+  full-chunk-staging form is occupancy/latency-bound (~25× off roofline per the launcher note);
+  v8/sepsc don't fix that structural cost. Realizing design-A's KV-reuse roofline needs the deeper
+  cp.async double-buffer + small-MMA rewrite — out of scope for these two levers.
+
+**Net of the whole effort:** the **wide kernel with v8+separated-scale** is the winner — it reaches
+**0.97× MXINT8 (a real win) at GQA Lk4096**, and ~1.15× at Lk16384. The original u4/gs2 was 1.45–1.50×.
+
 ## Takeaway
 The inference-time lever is **nibble alignment (u4), not minimal bits/elem**. The most-aggressive
 robust config (u3) is extraction-bound and squanders its footprint advantage. A less-aggressive,
