@@ -341,7 +341,7 @@ __global__ void kv_decode_wide_kernel(
         const uint8_t* __restrict__ vh,
         float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
         int H, int Hkv, int Lk, int Lcap, int D, int NB, int u, int gs, int UB, int SB,
-        int key_tile, int S, int chunk, float sm_scale, int v8, int sepsc, int vt) {
+        int key_tile, int S, int chunk, float sm_scale, int v8, int sepsc, int vt, int vpack) {
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
     const int hk = h / (H / Hkv);                  // GQA: q head -> kv head
     const int gs_shift = __ffs(gs) - 1;            // gs is pow2: k/gs == k>>shift
@@ -459,7 +459,43 @@ __global__ void kv_decode_wide_kernel(
         //   u4: 1 uint4 == 1 key. u2/u3: copy the contiguous nC*UB bytes as uint32
         //   words (UB is a multiple of 4) -> still fully coalesced.
         for (int blk = 0; blk < NB; ++blk) {
-            if (U4 && v8) {
+            if (vpack) {
+                // L1+L3 staging: 2 keys/thread, write PACKED+TRANSPOSED nibbles (no write-race).
+                //   vp_up[blk][kd][pi] = up(2pi)@kd | up(2pi+1)@kd<<4 ; vp_sh[blk][g][pi] = sh pair.
+                const int ng_v = BLOCK >> gs_shift;
+                int CHP = (chunk + 1) >> 1; CHP = (CHP + 3) & ~3; if (((CHP >> 2) & 1) == 0) CHP += 4;
+                const long VPUP = (long)NB * BLOCK * CHP;
+                const uint4* vsrc = reinterpret_cast<const uint4*>(
+                        vu + ((long)(hk * NB + blk) * Lcap + cs) * UB);
+                const unsigned char* vsh = vh + ((long)(hk * NB + blk) * Lcap + cs) * SB;
+                uint8_t* up_dst = (uint8_t*)pVu + (long)blk * BLOCK * CHP;
+                uint8_t* sh_dst = (uint8_t*)pVu + VPUP + (long)blk * ng_v * CHP;
+                const int NP = (nC + 1) >> 1;
+                for (int pi = tid; pi < NP; pi += NT) {
+                    const int ka = 2 * pi, kb = 2 * pi + 1;
+                    const uint4 ua = vsrc[ka];
+                    uint4 ub; if (kb < nC) ub = vsrc[kb]; else { ub.x = ub.y = ub.z = ub.w = 0; }
+                    const uint32_t uwa[4] = { ua.x, ua.y, ua.z, ua.w };
+                    const uint32_t uwb[4] = { ub.x, ub.y, ub.z, ub.w };
+                    #pragma unroll
+                    for (int kd2 = 0; kd2 < BLOCK; ++kd2) {
+                        const uint32_t na = (uwa[kd2 >> 3] >> ((kd2 & 7) * 4)) & 0xF;
+                        const uint32_t nb = (uwb[kd2 >> 3] >> ((kd2 & 7) * 4)) & 0xF;
+                        up_dst[(long)kd2 * CHP + pi] = (uint8_t)(na | (nb << 4));
+                    }
+                    uint8_t sa[8], sb[8];
+                    #pragma unroll
+                    for (int t = 0; t < 8; ++t) {
+                        sa[t] = (t < SB) ? vsh[ka * SB + t] : 0;
+                        sb[t] = (kb < nC && t < SB) ? vsh[kb * SB + t] : 0;
+                    }
+                    for (int gg = 0; gg < ng_v; ++gg) {
+                        const uint32_t na = (sa[gg >> 1] >> ((gg & 1) * 4)) & 0xF;
+                        const uint32_t nb = (sb[gg >> 1] >> ((gg & 1) * 4)) & 0xF;
+                        sh_dst[(long)gg * CHP + pi] = (uint8_t)(na | (nb << 4));
+                    }
+                }
+            } else if (U4 && v8) {
                 // u4 fast Pass-2: stage V already reconstructed as int8 codes (up*16+sh,
                 // in [-120,119]). Pass-2 then reads ONE int8/elem (no bfe, no gs shared
                 // plane) -> identical to MXINT8's Pass-2, halving Pass-2 shared traffic.
@@ -496,7 +532,7 @@ __global__ void kv_decode_wide_kernel(
                 const int nw = (nC * UB) >> 2;
                 for (int i = tid; i < nw; i += NT) d32[i] = s32[i];
             }
-            if (!(U4 && v8)) {       // v8 already consumed the shared plane during reconstruct
+            if (!(U4 && v8) && !vpack) {   // v8/vpack consumed the shared plane during reconstruct/pack
                 const unsigned char* srch = vh + ((long)(hk * NB + blk) * Lcap + cs) * SB;
                 unsigned char* dsth = pVh + (long)blk * chunk * SB;
                 for (int i = tid; i < nC * SB; i += NT) dsth[i] = srch[i];  // tiny shared plane
@@ -513,7 +549,35 @@ __global__ void kv_decode_wide_kernel(
         // ---- Pass 2: out[d] += Σ_kk p_kk·V[d,kk]  (thread d, V from staged shared) ----
         const int blk = tid / BLOCK, kd = tid % BLOCK;
         float lsum = 0.0f, a = 0.0f;
-        if (active && U4 && v8 && vt) {
+        if (active && vpack) {
+            // L1+L3: V staged PACKED & TRANSPOSED at nibble density (vp[blk][kd][kk], 2 codes/byte).
+            // This lane's kk-nibbles are CONTIGUOUS → one int32 = 8 codes (vs v8's 4), conflict-free
+            // (CHP/4 odd), decoded in registers. Shared traffic 1.0→~0.75× (gs2) on the bottleneck.
+            const int g = kd >> gs_shift, ng_v = BLOCK >> gs_shift;
+            int CHP = (chunk + 1) >> 1; CHP = (CHP + 3) & ~3; if (((CHP >> 2) & 1) == 0) CHP += 4;
+            const long VPUP = (long)NB * BLOCK * CHP;
+            const uint8_t* up_row = (const uint8_t*)pVu + (long)(blk * BLOCK + kd) * CHP;
+            const uint8_t* sh_row = (const uint8_t*)pVu + VPUP + (long)(blk * ng_v + g) * CHP;
+            const long vscb = (long)(hk * NB + blk) * Lcap + cs;
+            int kk = 0;
+            for (; kk + 7 < nC; kk += 8) {
+                const uint32_t uw = *reinterpret_cast<const uint32_t*>(up_row + (kk >> 1));   // 8 up-nibbles
+                const uint32_t sw = *reinterpret_cast<const uint32_t*>(sh_row + (kk >> 1));   // 8 sh-nibbles
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const float p = expf(sc[kk + t] - m_new); lsum += p;
+                    const int V = ms::bfe_s32((int)uw, t * 4, 4) * 16 + ms::bfe_s32((int)sw, t * 4, 4);
+                    a += (p * ms::e8m0_to_scale(vs[vscb + kk + t])) * (float)V;
+                }
+            }
+            for (; kk < nC; ++kk) {
+                const float p = expf(sc[kk] - m_new); lsum += p;
+                const int sft = (kk & 1) * 4;
+                const int V = ms::bfe_s32((int)(up_row[kk >> 1] >> sft), 0, 4) * 16
+                            + ms::bfe_s32((int)(sh_row[kk >> 1] >> sft), 0, 4);
+                a += (p * ms::e8m0_to_scale(vs[vscb + kk])) * (float)V;
+            }
+        } else if (active && U4 && v8 && vt) {
             // transposed+padded staging: this thread's kk-codes are CONTIGUOUS -> read 4 at a
             // time via one int32 (conflict-free, 4x fewer shared transactions). p/exp unchanged.
             const int CH = chunk + 4;
@@ -1663,16 +1727,23 @@ torch::Tensor kv_decode_attention_cuda(
         // u4-only: stage V as reconstructed int8 (one byte/elem) -> Pass-2 == MXINT8.
         // Helps when the gs shared plane is large (gs<=2); for gs>=8 the extra staging
         // smem costs occupancy, so default off there. MS_KV_V8 forces (0/1).
-        int v8 = ((int)u == 4 && (int)gs <= 2) ? 1 : 0;
-        if (const char* e = getenv("MS_KV_V8")) v8 = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
+        // vpack (transposed-packed nibble V staging) is DEFAULT for u4/gs<=2 -- beats v8+vt ~10%
+        // (smaller smem 13 vs 16.5 KB -> higher occupancy). MS_KV_VPACK=0 falls back to v8+vt.
+        int vpack = ((int)u == 4 && (int)gs <= 2) ? 1 : 0;
+        if (const char* e = getenv("MS_KV_VPACK")) vpack = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
+        int v8 = (!vpack && (int)u == 4 && (int)gs <= 2) ? 1 : 0;
+        if (const char* e = getenv("MS_KV_V8")) v8 = (!vpack && (int)u == 4 && atoi(e) != 0) ? 1 : 0;
         // separated-scale K dot (u4): factor scales to block level, shared term per-group.
         int sepsc = ((int)u == 4) ? 1 : 0;
         if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
         // vt: transposed+padded int8 V staging -> conflict-free vectorized Pass-2 reads.
         int vt = v8 ? 1 : 0;
         if (const char* e = getenv("MS_KV_VT")) vt = (v8 && atoi(e) != 0) ? 1 : 0;
-        const size_t stageB = vt ? (size_t)NB * BLOCK * (chunk + 4)
-                            : (v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB));
+        int CHPv = (chunk + 1) >> 1; CHPv = (CHPv + 3) & ~3; if (((CHPv >> 2) & 1) == 0) CHPv += 4;
+        const int ngv = BLOCK / (int)gs;
+        const size_t stageB = vpack ? (size_t)NB * CHPv * (BLOCK + ngv)
+                            : (vt ? (size_t)NB * BLOCK * (chunk + 4)
+                            : (v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB)));
         const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
                             + (size_t)NB * BLOCK * sizeof(float) + stageB;   // +qg_sh
         auto launch = [&](auto U4tag) {
@@ -1684,7 +1755,7 @@ torch::Tensor kv_decode_attention_cuda(
                 ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
                 vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
                 part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt);
+                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt, vpack);
         };
         if ((int)u == 4) launch(std::true_type{});
         else             launch(std::false_type{});
@@ -1738,14 +1809,19 @@ torch::Tensor kv_decode_attention_batched_cuda(
     auto part_o = torch::empty({B, H, (int64_t)S, D}, fopt);
     auto part_m = torch::empty({B, H, (int64_t)S}, fopt);
     auto part_l = torch::empty({B, H, (int64_t)S}, fopt);
-    int v8 = ((int)u == 4 && (int)gs <= 2) ? 1 : 0;
-    if (const char* e = getenv("MS_KV_V8")) v8 = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
+    int vpack = ((int)u == 4 && (int)gs <= 2) ? 1 : 0;
+    if (const char* e = getenv("MS_KV_VPACK")) vpack = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
+    int v8 = (!vpack && (int)u == 4 && (int)gs <= 2) ? 1 : 0;
+    if (const char* e = getenv("MS_KV_V8")) v8 = (!vpack && (int)u == 4 && atoi(e) != 0) ? 1 : 0;
     int sepsc = ((int)u == 4) ? 1 : 0;
     if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
     int vt = v8 ? 1 : 0;
     if (const char* e = getenv("MS_KV_VT")) vt = (v8 && atoi(e) != 0) ? 1 : 0;
-    const size_t stageB = vt ? (size_t)NB * BLOCK * (chunk + 4)
-                        : (v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB));
+    int CHPv = (chunk + 1) >> 1; CHPv = (CHPv + 3) & ~3; if (((CHPv >> 2) & 1) == 0) CHPv += 4;
+    const int ngv = BLOCK / (int)gs;
+    const size_t stageB = vpack ? (size_t)NB * CHPv * (BLOCK + ngv)
+                        : (vt ? (size_t)NB * BLOCK * (chunk + 4)
+                        : (v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB)));
     const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
                         + (size_t)NB * BLOCK * sizeof(float) + stageB;   // +qg_sh
     auto launch = [&](auto U4tag) {
@@ -1757,7 +1833,7 @@ torch::Tensor kv_decode_attention_batched_cuda(
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
             part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt);
+            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt, vpack);
     };
     if ((int)u == 4) launch(std::true_type{}); else launch(std::false_type{});
     kv_decode_combine_kernel<<<dim3((int)H, (int)B), threads, 0, at::cuda::getCurrentCUDAStream()>>>(

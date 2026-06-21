@@ -174,6 +174,35 @@ not need design-A. Closing the residual long-context gap would require either ma
 DRAM-bound (it isn't) or a templated-on-G / tensor-core-PV design-A rewrite (much larger). design-A+vt
 kept gated (`MS_KV_GQA`, opt-in, default off) as a documented negative.
 
+## Optimization 6: packed-transposed nibble V staging (`MS_KV_VPACK`, now DEFAULT) — GQA also wins
+Diagnosis (user): v8 reconstructs V to int8 *before* staging, so the 0.58× byte advantage lives only
+on DRAM (20%, non-bottleneck) while shared (the 60% bottleneck) carries 1.0×. Fix idea (FP6-LLM):
+stage V **packed sub-byte** in shared and decode in Pass-2 registers, putting the byte advantage on
+the bottleneck. Implemented as **transposed + nibble-packed** staging (`vp[blk][kd][kk]`, 2 codes/byte,
+2 keys/thread to avoid a write-race, `CHP/4` odd for conflict-free `int32` reads → 8 codes/load).
+
+**ncu (per the no-fake-win protocol — transactions BEFORE time):** shared-load wavefronts are
+**unchanged** (1.722M vs 1.722M) — the up-nibble + sh-nibble split is 2 int32 loads / 8 codes, equal
+to v8's 1 int32 / 4 codes. *So the predicted shared-transaction reduction did NOT materialize.* But
+duration dropped anyway (135→122µs, L1/TEX 51.4→49.9%) — the real win is **occupancy**: vpack's smem
+is **13 KB vs v8+vt's 16.5 KB** (packed nibbles, no int8 padding), giving more blocks/SM. Bit-exact
+(rel_fro 0.00 vs v8+vt; test_kv 72/72).
+
+End-to-end (u4/gs2, vpack vs v8+vt vs MXINT8):
+| config | v8+vt | **vpack** |
+|---|---|---|
+| MHA H8 Lk4096   | 1.06× | **0.97× WIN** |
+| MHA H8 Lk16384  | 0.92× | **0.83× WIN** |
+| MHA H16 Lk16384 | 1.00× | **0.90× WIN** |
+| GQA 32/8 Lk4096 | 0.99× | **0.90× WIN** |
+| GQA 32/8 Lk16384| 1.05× (loss) | **0.93× WIN** |
+
+vpack is ~0.90× v8+vt everywhere → **every tested case now beats MXINT8, including GQA at long
+context** (the occupancy gain lets the wide path's L2-cached redundant GQA reads + latency hide
+better). Made **default for u4/gs≤2** (`MS_KV_VPACK=0` falls back to v8+vt). Honest note: the win is
+an occupancy/smem effect, not the shared-transaction reduction the FP6-LLM framing predicted (ncu
+showed transactions flat) — but the packed-staging direction was the right call.
+
 ## Takeaway
 The inference-time lever is **nibble alignment (u4), not minimal bits/elem**. The most-aggressive
 robust config (u3) is extraction-bound and squanders its footprint advantage. A less-aggressive,
