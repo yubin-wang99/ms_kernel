@@ -203,6 +203,29 @@ better). Made **default for u4/gs≤2** (`MS_KV_VPACK=0` falls back to v8+vt). H
 an occupancy/smem effect, not the shared-transaction reduction the FP6-LLM framing predicted (ncu
 showed transactions flat) — but the packed-staging direction was the right call.
 
+## Optimization 7: batched decode re-measured with vpack — wins up to B=16 (overturns Phase 35)
+Phase 35 closed the batched regime as a universal loss (1.07–1.26×) — but on the pre-vpack kernel.
+The batched path (`kv_decode_attention_batched`) uses the same wide kernel, so it now inherits vpack.
+Re-measured (GQA Hq32/Hkv8 = Llama-3.1-8B layout, bit-exact rel_fro 2e-8):
+
+| B | Lk4096 | Lk16384 | effective BW (MSAQ / MXINT8) |
+|---|---|---|---|
+| 1  | 0.86× WIN | 0.90× WIN | ~80 / ~95 |
+| 4  | 0.90× WIN | 0.93× WIN | ~83 / ~99 |
+| 8  | 0.92× WIN | 0.94× WIN | ~82 / ~101 |
+| 16 | 0.99× WIN | 1.00× WIN | ~91 / ~120 |
+| 32 | 1.03× loss | 1.01× loss | 97 / 133 |
+
+So batched decode **wins up to B=16** and is only a slight loss at B=32. Mechanism: at low batch both
+are occupancy-limited (~80–100 GB/s) and vpack's occupancy edge wins; at B=32 MXINT8 becomes BW-bound
+(133 GB/s) while MSAQ saturates at 97 (0.73× — the dequant-throughput throttle), so its 0.76× bytes
+don't fully convert. The crossover moved from "always loses" to "loses only at B≥32".
+
+**Tensor-core regime stays a hardware wall (3090):** no native sub-byte MMA → both formats build the
+same bf16/int8 MMA tile and the byte advantage dies at the MMA (vpack can't touch it). It is also not
+the decode path — tensor-core P·V only helps at large M (prefill/shared-prefix); autoregressive decode
+is M=1–small-batch, where scalar+vpack already wins. Blackwell (native MXFP8/FP4) is the only opener.
+
 ## Takeaway
 The inference-time lever is **nibble alignment (u4), not minimal bits/elem**. The most-aggressive
 robust config (u3) is extraction-bound and squanders its footprint advantage. A less-aggressive,

@@ -1610,3 +1610,21 @@ shared-transaction 감소가 아님(ncu상 트랜잭션 평탄) — 다만 packe
 **KV-read 최종(정정):** single-token decode에서 MSAQ가 MXINT8을 MHA·GQA 모두 공정·정확하게 이긴다
 (스택: nibble u4/gs2 + sepsc + vpack). Phase 32 tie와 Phase 41 GQA parity를 모두 정정. 배치/텐서코어
 regime은 3090 native sub-byte MMA 부재로 미해결(Blackwell 과제).
+
+# Phase 43 — 배치 decode를 vpack로 재측정: B<=16 win (Phase 35 정정)
+
+Phase 35는 배치를 "universal loss(1.07-1.26x)"로 닫았으나 그건 vpack 이전 커널. 배치 경로
+(kv_decode_attention_batched)는 같은 wide 커널을 쓰므로 vpack를 그대로 상속한다. 재측정(GQA Hq32/Hkv8
+= Llama-3.1-8B 구성, bit-exact rel_fro 2e-8):
+
+  Lk4096 : B1 0.86 / B4 0.90 / B8 0.92 / B16 0.99 (WIN) | B32 1.03 (loss)
+  Lk16384: B1 0.90 / B4 0.93 / B8 0.94 / B16 1.00 (WIN) | B32 1.01 (loss)
+
+저배치는 둘 다 occupancy-limited(~80-100 GB/s)라 vpack의 occupancy 이득이 win을 만들고, B32에서
+MXINT8이 BW-bound(133 GB/s) 도달하는 반면 MSAQ는 dequant-throttle로 97(0.73x)에 saturate → 0.76x
+바이트가 시간으로 다 환원 안 돼 slight loss. 즉 crossover가 "항상 loss"에서 "B>=32에서만 loss"로 이동.
+
+텐서코어 regime은 여전히 하드웨어 벽: 3090에 native sub-byte MMA가 없어 두 포맷이 같은 bf16/int8 MMA
+입력 타일을 만들면 바이트 이점이 MMA 직전 소멸(vpack 무관). 또한 decode 경로도 아님 — 텐서코어 P.V는
+large-M(prefill/shared-prefix)용이고, autoregressive decode는 M=1~small-batch라 scalar+vpack가 이미
+win. Blackwell(native MXFP8/FP4)만 여는 과제.
