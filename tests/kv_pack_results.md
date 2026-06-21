@@ -238,6 +238,29 @@ same bf16/int8 MMA tile and the byte advantage dies at the MMA (vpack can't touc
 the decode path — tensor-core P·V only helps at large M (prefill/shared-prefix); autoregressive decode
 is M=1–small-batch, where scalar+vpack already wins. Blackwell (native MXFP8/FP4) is the only opener.
 
+## Optimization 8: compile-time VPACK template — register pressure 163→127, ~3–12% faster
+The wide kernel ran ALL Pass-2 paths (vpack + vt + v8 + generic) behind runtime `if`s, so ptxas
+allocated registers for their UNION — **163 regs** even though only vpack runs by default. Made the
+path **compile-time**: `template<bool U4, bool VPACK>`, with `if constexpr(VPACK)` selecting the
+staging + Pass-2. The default `<u4, vpack>` instantiation now carries only vpack code → **127 regs**.
+
+ncu: occupancy unchanged (still 4 blocks/SM — 127 regs needs ≤102 for 5; smem also caps at 4), yet
+**timing improved ~3–12%** — the win is reduced register pressure / no dead-path bloat (cleaner
+scheduling), not higher occupancy. Bit-exact, test_kv 72/72.
+
+| config | before | templated | vs MXINT8 |
+|---|---|---|---|
+| MHA H8 Lk4096   | 0.95× | **0.84×** | WIN |
+| MHA H8 Lk16384  | 0.82× | **0.79×** | WIN |
+| MHA H16 Lk16384 | 0.87× | **0.86×** | WIN |
+| GQA 32/8 Lk4096 | 0.88× | **0.85×** | WIN |
+| GQA 32/8 Lk16384| 0.94× | **0.90×** | WIN |
+
+Reaching 5 blocks/SM would need both ≤102 regs and smaller smem; `__launch_bounds__` can't (no clean
+target that's safe for the D=256 path, and forcing spilled before). The 127-reg templated version is
+the current best. (Multi-level-MS + vpack was rejected here by ncu: occupancy is register- AND
+smem-limited, so a smaller footprint doesn't help, and multi-level adds shared planes = more L1/TEX.)
+
 ## Takeaway
 The inference-time lever is **nibble alignment (u4), not minimal bits/elem**. The most-aggressive
 robust config (u3) is extraction-bound and squanders its footprint advantage. A less-aggressive,
