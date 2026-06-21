@@ -1,0 +1,13 @@
+ssnf_core.py (new naming: ml_depth/mlN_bitwidth/mlN_mg/mlN_sharingmode/encoding) loaded
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 76.24it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+BF16 PPL = 6.5684; criterion within 3.0%
+
+=== kv ===
+  single-level u3/mg32 bpe=5.344 |   +1.24% | OK  (reference frontier)
+  ML [2,2]/[32,2] bpe=5.312 | naive   +3.45% FAIL | MSAQ  +14.37% FAIL | gain -10.92pp
+  ML [2,2]/[32,4] bpe=4.812 | naive   +5.70% FAIL | MSAQ  +18.00% FAIL | gain -12.30pp
+  ML [3,1]/[32,2] bpe=4.844 | naive   +5.44% FAIL | MSAQ   +6.83% FAIL | gain  -1.39pp
+  ML [3,1]/[32,4] bpe=4.594 | naive   +8.58% FAIL | MSAQ   +7.98% FAIL | gain  +0.61pp
+  ML [3,1]/[32,8] bpe=4.469 | naive  +10.48% FAIL | MSAQ   +8.81% FAIL | gain  +1.68pp
+
