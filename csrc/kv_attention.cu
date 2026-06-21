@@ -546,6 +546,13 @@ __global__ void kv_decode_wide_kernel(
         const float m_new = fmaxf(m_i, m_chunk);
         const float alpha = expf(m_i - m_new);
 
+        // Scores are per-KEY (q·k, d-independent) so m_new is identical across the 32 d-lanes.
+        // Convert sc -> probabilities ONCE per kk (cooperative) instead of 32x redundantly per d
+        // (the per-thread expf was ~half the SM compute at full occupancy / high batch).
+        __syncthreads();
+        for (int kk = tid; kk < nC; kk += NT) sc[kk] = __expf(sc[kk] - m_new);
+        __syncthreads();
+
         // ---- Pass 2: out[d] += Σ_kk p_kk·V[d,kk]  (thread d, V from staged shared) ----
         const int blk = tid / BLOCK, kd = tid % BLOCK;
         float lsum = 0.0f, a = 0.0f;
@@ -565,13 +572,13 @@ __global__ void kv_decode_wide_kernel(
                 const uint32_t sw = *reinterpret_cast<const uint32_t*>(sh_row + (kk >> 1));   // 8 sh-nibbles
                 #pragma unroll
                 for (int t = 0; t < 8; ++t) {
-                    const float p = expf(sc[kk + t] - m_new); lsum += p;
+                    const float p = sc[kk + t]; lsum += p;   // sc already = probability
                     const int V = ms::bfe_s32((int)uw, t * 4, 4) * 16 + ms::bfe_s32((int)sw, t * 4, 4);
                     a += (p * ms::e8m0_to_scale(vs[vscb + kk + t])) * (float)V;
                 }
             }
             for (; kk < nC; ++kk) {
-                const float p = expf(sc[kk] - m_new); lsum += p;
+                const float p = sc[kk]; lsum += p;
                 const int sft = (kk & 1) * 4;
                 const int V = ms::bfe_s32((int)(up_row[kk >> 1] >> sft), 0, 4) * 16
                             + ms::bfe_s32((int)(sh_row[kk >> 1] >> sft), 0, 4);
@@ -588,18 +595,18 @@ __global__ void kv_decode_wide_kernel(
                 const int32_t w4 = *reinterpret_cast<const int32_t*>(vbase + kk);
                 #pragma unroll
                 for (int t = 0; t < 4; ++t) {
-                    const float p = expf(sc[kk + t] - m_new); lsum += p;
+                    const float p = sc[kk + t]; lsum += p;
                     const float vsc = ms::e8m0_to_scale(vs[vscb + kk + t]);
                     a += p * (float)((int8_t)((w4 >> (8 * t)) & 0xff)) * vsc;
                 }
             }
             for (; kk < nC; ++kk) {
-                const float p = expf(sc[kk] - m_new); lsum += p;
+                const float p = sc[kk]; lsum += p;
                 a += p * (float)vbase[kk] * ms::e8m0_to_scale(vs[vscb + kk]);
             }
         } else
         for (int kk = 0; kk < nC; ++kk) {
-            const float p = expf(sc[kk] - m_new);
+            const float p = sc[kk];   // sc already = probability
             lsum += p;
             if (active) {
                 const int j = cs + kk;

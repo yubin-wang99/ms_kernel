@@ -203,23 +203,35 @@ better). Made **default for u4/gs≤2** (`MS_KV_VPACK=0` falls back to v8+vt). H
 an occupancy/smem effect, not the shared-transaction reduction the FP6-LLM framing predicted (ncu
 showed transactions flat) — but the packed-staging direction was the right call.
 
-## Optimization 7: batched decode re-measured with vpack — wins up to B=16 (overturns Phase 35)
+## Optimization 7: batched decode with vpack — robust win up to B≤8 (overturns Phase 35)
 Phase 35 closed the batched regime as a universal loss (1.07–1.26×) — but on the pre-vpack kernel.
-The batched path (`kv_decode_attention_batched`) uses the same wide kernel, so it now inherits vpack.
-Re-measured (GQA Hq32/Hkv8 = Llama-3.1-8B layout, bit-exact rel_fro 2e-8):
+The batched path (`kv_decode_attention_batched`) uses the same wide kernel, so it inherits vpack.
 
-| B | Lk4096 | Lk16384 | effective BW (MSAQ / MXINT8) |
-|---|---|---|---|
-| 1  | 0.86× WIN | 0.90× WIN | ~80 / ~95 |
-| 4  | 0.90× WIN | 0.93× WIN | ~83 / ~99 |
-| 8  | 0.92× WIN | 0.94× WIN | ~82 / ~101 |
-| 16 | 0.99× WIN | 1.00× WIN | ~91 / ~120 |
-| 32 | 1.03× loss | 1.01× loss | 97 / 133 |
+**ncu correction:** an earlier draft of this section blamed a "BW-bound dequant-throttle" at B=32.
+That was wrong — ncu (B=32 batched) shows **DRAM only 9.5%**, L1/TEX **74.9%**, Compute **70.9%**:
+B=32 is **compute + shared bound, NOT bandwidth-bound**. MSAQ's high-batch loss is its irreducible
+**bfe-decode** (a pure ALU cost MXINT8 doesn't pay), not bandwidth.
 
-So batched decode **wins up to B=16** and is only a slight loss at B=32. Mechanism: at low batch both
-are occupancy-limited (~80–100 GB/s) and vpack's occupancy edge wins; at B=32 MXINT8 becomes BW-bound
-(133 GB/s) while MSAQ saturates at 97 (0.73× — the dequant-throughput throttle), so its 0.76× bytes
-don't fully convert. The crossover moved from "always loses" to "loses only at B≥32".
+**Cooperative-exp + fairness:** both kernels recomputed `exp(sc[kk])` 32× redundantly per d-lane
+(scores are per-key → `m_new` is uniform across lanes). Fixed both (MSAQ wide + MXINT8 decode) to
+compute it ONCE per kk cooperatively. This **helps MXINT8 more** (simpler Pass-2 → exp was a bigger
+fraction), so it does NOT reduce MSAQ's high-batch loss — it slightly raises the ratio. Kept anyway
+(best-vs-best must optimize both; no fake win). It also revealed the earlier "B16 win" was fragile —
+it relied on MXINT8 lacking this trivial optimization.
+
+Final, both fairly optimized (GQA Hq32/Hkv8 = Llama-3.1-8B layout, bit-exact rel_fro 2e-8):
+| B | Lk4096 | Lk16384 |
+|---|---|---|
+| 1 | 0.84× WIN | 0.89× WIN |
+| 4 | 0.89× WIN | 0.92× WIN |
+| 8 | 0.92× WIN | 0.93× WIN |
+| 16 | 1.00× (tie) | 1.01× loss |
+| 32 | 1.04× loss | 1.02× loss |
+
+So batched decode **robustly wins up to B=8**; B≥16 is a near-tie/slight loss. The high-batch loss is
+near-fundamental: at full occupancy the kernel is compute+shared-saturated and MSAQ's bfe-decode is a
+pure tax with no DRAM headroom to amortize it (DRAM 9.5%). Single-token (MHA 0.82–0.95×, GQA
+0.88–0.94×) is unaffected by cooperative-exp (it's occupancy-bound there, not compute-bound).
 
 **Tensor-core regime stays a hardware wall (3090):** no native sub-byte MMA → both formats build the
 same bf16/int8 MMA tile and the byte advantage dies at the MMA (vpack can't touch it). It is also not

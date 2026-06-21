@@ -1628,3 +1628,23 @@ MXINT8이 BW-bound(133 GB/s) 도달하는 반면 MSAQ는 dequant-throttle로 97(
 입력 타일을 만들면 바이트 이점이 MMA 직전 소멸(vpack 무관). 또한 decode 경로도 아님 — 텐서코어 P.V는
 large-M(prefill/shared-prefix)용이고, autoregressive decode는 M=1~small-batch라 scalar+vpack가 이미
 win. Blackwell(native MXFP8/FP4)만 여는 과제.
+
+# Phase 44 — B>=32 loss 시도: cooperative-exp(공정), 그러나 MXINT8이 더 이득 (documented negative + 정정)
+
+B>=32 slight-loss를 줄이려 ncu로 병목 재확인: **DRAM 9.5%(BW-bound 아님!), L1/TEX 74.9%, Compute
+70.9%** — Phase 43의 "dequant-throttle/BW-bound 0.73x" 프레이밍은 틀렸다. B=32는 compute+shared 포화이고
+MSAQ의 loss는 bfe-decode(순수 ALU tax, MXINT8엔 없음)다.
+
+레버: 두 커널 모두 score sc[kk]가 per-key라 m_new가 d-lane 간 동일한데 exp(sc[kk]-m_new)를 32 d-lane이
+**32× 중복** 계산. GQA 커널처럼 **cooperative하게 kk당 1회** 계산으로 wide(MSAQ)와 mxint8 decode 둘 다
+수정(공정 best-vs-best). bit-exact(test_kv 72/72).
+
+**결과 = documented negative:** 두 커널 다 빨라졌으나 **단순한 MXINT8이 더 이득**(Pass-2에 bfe가 없어
+exp가 더 큰 비중) → MSAQ 고배치 비율 오히려 약간 악화(Lk16384 B16 0.998→1.010, B32 1.012→1.019). 즉
+cooperative-exp는 B>=32 loss를 못 줄인다. 동시에 Phase 43의 "B<=16 win"이 MXINT8 미최적화에 기댄
+fragile 결과였음이 드러남 — 공정(둘 다 최적)하면 **robust win은 B<=8**, B16 ~tie, B32 slight loss.
+
+cooperative-exp는 유지(공정 최적화, no-fake-win; single-token은 occupancy-bound라 무영향, 여전히 win).
+**정정된 배치 결론(공정):** robust win B<=8(0.84-0.93x), B>=16 near-tie/slight-loss(1.00-1.04x).
+고배치 loss는 near-fundamental — full-occupancy compute+shared 포화에 MSAQ bfe-decode가 DRAM(9.5%)
+여유 없이 그대로 노출. single-token MHA/GQA win은 불변.

@@ -557,13 +557,19 @@ __global__ void mxint8_kv_split_kernel(
         const float m_new = fmaxf(m_i, m_chunk);
         const float alpha = expf(m_i - m_new);
 
+        // scores are per-key -> m_new identical across d-lanes: exp ONCE per kk (cooperative)
+        // instead of 32x redundantly per d (matches the MSAQ wide kernel; fair best-vs-best).
+        __syncthreads();
+        for (int kk = tid; kk < nC; kk += blockDim.x) sc[kk] = __expf(sc[kk] - m_new);
+        __syncthreads();
+
         // ---- Pass 2: out[d] += Σ_kk p_kk·V[d,kk] ----
         const int blk = tid / BLOCK, kd = tid % BLOCK;
         const long qbase = (long)(hk * NB + blk) * BLOCK * Lcap;
         const long sbase = (long)(hk * NB + blk) * Lcap;
         float lsum = 0.0f, a = 0.0f;
         for (int kk = 0; kk < nC; ++kk) {
-            const float p = expf(sc[kk] - m_new);
+            const float p = sc[kk];   // sc already = probability
             lsum += p;
             if (active) {
                 const int j = cs + kk;
