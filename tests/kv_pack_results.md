@@ -124,6 +124,31 @@ occupancy-bound in a way reg-capping can fix. The v8+separated-scale state is th
 that cuts shared-memory traffic (e.g. transposed/padded V staging for conflict-free vectorized
 Pass-2 reads, or cp.async pipelining) — larger, higher-risk, uncertain payoff.
 
+## Optimization 4: transposed+padded V staging (`MS_KV_VT`, default on with v8) — MHA BEATS MXINT8
+The ncu profile pinned the limiter at **L1/TEX shared traffic** (the Pass-2 V reads), not DRAM. The
+old v8 layout `pV8[blk·chunk·32 + kk·32 + kd]` makes each thread read its codes **strided by 32**
+(non-vectorizable, 4-way bank conflict). Fix: stage transposed+padded `pV8[blk·32·CH + kd·CH + kk]`
+with **CH = chunk+4** (so CH/4 is odd → conflict-free), making each thread's `kk`-sequence
+**contiguous** → read **4 codes per `int32`**: 4× fewer shared transactions, conflict-free.
+
+Result (u4/gs2, vt off → on; bit-exact, test_kv 72/72):
+| config | vt off | **vt on** | speedup |
+|---|---|---|---|
+| MHA H8 Lk4096   | 1.16× | **0.97× WIN** | 1.19× |
+| MHA H8 Lk16384  | 1.07× | **0.97× WIN** | 1.10× |
+| MHA H16 Lk16384 | 1.07× | **0.97× WIN** | 1.11× |
+| GQA 32/8 Lk4096 | 1.09× | 1.01× | 1.08× |
+| GQA 32/8 Lk16384| 1.20× | 1.07× | 1.12× |
+
+ncu (H8 Lk16384): L1/TEX 63.5%→60.2%, Duration 148→135µs. **MHA (Hq=Hkv) now beats MXINT8 at 0.97×
+across all sizes** — the first robust, fair, accurate KV-read win for MSAQ. GQA (Hq>Hkv) lands at
+parity/slight-loss because the wide path reads each KV head once **per query head** (4× redundant);
+closing that needs the design-A KV-reuse kernel (which is occupancy-bound — see Optimization 3).
+
+**This overturns the prior "KV-read MSAQ win is impossible" verdict (`kv_read_attempts.md`) for the
+MHA case.** Full stack that gets there: nibble u4 + int8-staged V (v8) + separated-scale K dot
+(sepsc) + transposed-padded staging (vt).
+
 ## Takeaway
 The inference-time lever is **nibble alignment (u4), not minimal bits/elem**. The most-aggressive
 robust config (u3) is extraction-bound and squanders its footprint advantage. A less-aggressive,

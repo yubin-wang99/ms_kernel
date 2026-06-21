@@ -341,7 +341,7 @@ __global__ void kv_decode_wide_kernel(
         const uint8_t* __restrict__ vh,
         float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
         int H, int Hkv, int Lk, int Lcap, int D, int NB, int u, int gs, int UB, int SB,
-        int key_tile, int S, int chunk, float sm_scale, int v8, int sepsc) {
+        int key_tile, int S, int chunk, float sm_scale, int v8, int sepsc, int vt) {
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
     const int hk = h / (H / Hkv);                  // GQA: q head -> kv head
     const int gs_shift = __ffs(gs) - 1;            // gs is pow2: k/gs == k>>shift
@@ -466,7 +466,8 @@ __global__ void kv_decode_wide_kernel(
                 const uint4* vsrc = reinterpret_cast<const uint4*>(
                         vu + ((long)(hk * NB + blk) * Lcap + cs) * UB);
                 const unsigned char* vsh = vh + ((long)(hk * NB + blk) * Lcap + cs) * SB;
-                int8_t* d8 = (int8_t*)pVu + (long)blk * chunk * BLOCK;
+                int8_t* d8 = (int8_t*)pVu;
+                const int CH = chunk + 4;            // vt: pad so CH/4 is odd -> conflict-free int32 reads
                 for (int i = tid; i < nC; i += NT) {
                     const uint4 up4 = vsrc[i];
                     const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
@@ -478,7 +479,9 @@ __global__ void kv_decode_wide_kernel(
                         const int up_code = ms::bfe_s32((int)uw[kd >> 3], (kd & 7) * 4, 4);
                         const int g       = kd >> gs_shift;
                         const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
-                        d8[i * BLOCK + kd] = (int8_t)(up_code * 16 + sh_code);
+                        const int8_t code = (int8_t)(up_code * 16 + sh_code);
+                        if (vt) d8[(long)blk * BLOCK * CH + kd * CH + i] = code;   // [blk][kd][kk]
+                        else    d8[(long)blk * chunk * BLOCK + i * BLOCK + kd] = code;
                     }
                 }
             } else if constexpr (U4) {
@@ -510,6 +513,27 @@ __global__ void kv_decode_wide_kernel(
         // ---- Pass 2: out[d] += Σ_kk p_kk·V[d,kk]  (thread d, V from staged shared) ----
         const int blk = tid / BLOCK, kd = tid % BLOCK;
         float lsum = 0.0f, a = 0.0f;
+        if (active && U4 && v8 && vt) {
+            // transposed+padded staging: this thread's kk-codes are CONTIGUOUS -> read 4 at a
+            // time via one int32 (conflict-free, 4x fewer shared transactions). p/exp unchanged.
+            const int CH = chunk + 4;
+            const int8_t* vbase = (const int8_t*)pVu + (long)blk * BLOCK * CH + (long)kd * CH;
+            const long vscb = (long)(hk * NB + blk) * Lcap + cs;
+            int kk = 0;
+            for (; kk + 3 < nC; kk += 4) {
+                const int32_t w4 = *reinterpret_cast<const int32_t*>(vbase + kk);
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const float p = expf(sc[kk + t] - m_new); lsum += p;
+                    const float vsc = ms::e8m0_to_scale(vs[vscb + kk + t]);
+                    a += p * (float)((int8_t)((w4 >> (8 * t)) & 0xff)) * vsc;
+                }
+            }
+            for (; kk < nC; ++kk) {
+                const float p = expf(sc[kk] - m_new); lsum += p;
+                a += p * (float)vbase[kk] * ms::e8m0_to_scale(vs[vscb + kk]);
+            }
+        } else
         for (int kk = 0; kk < nC; ++kk) {
             const float p = expf(sc[kk] - m_new);
             lsum += p;
@@ -1617,7 +1641,11 @@ torch::Tensor kv_decode_attention_cuda(
         // separated-scale K dot (u4): factor scales to block level, shared term per-group.
         int sepsc = ((int)u == 4) ? 1 : 0;
         if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
-        const size_t stageB = v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB);
+        // vt: transposed+padded int8 V staging -> conflict-free vectorized Pass-2 reads.
+        int vt = v8 ? 1 : 0;
+        if (const char* e = getenv("MS_KV_VT")) vt = (v8 && atoi(e) != 0) ? 1 : 0;
+        const size_t stageB = vt ? (size_t)NB * BLOCK * (chunk + 4)
+                            : (v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB));
         const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
                             + (size_t)NB * BLOCK * sizeof(float) + stageB;   // +qg_sh
         auto launch = [&](auto U4tag) {
@@ -1629,7 +1657,7 @@ torch::Tensor kv_decode_attention_cuda(
                 ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
                 vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
                 part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc);
+                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt);
         };
         if ((int)u == 4) launch(std::true_type{});
         else             launch(std::false_type{});
@@ -1687,7 +1715,10 @@ torch::Tensor kv_decode_attention_batched_cuda(
     if (const char* e = getenv("MS_KV_V8")) v8 = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
     int sepsc = ((int)u == 4) ? 1 : 0;
     if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
-    const size_t stageB = v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB);
+    int vt = v8 ? 1 : 0;
+    if (const char* e = getenv("MS_KV_VT")) vt = (v8 && atoi(e) != 0) ? 1 : 0;
+    const size_t stageB = vt ? (size_t)NB * BLOCK * (chunk + 4)
+                        : (v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB));
     const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
                         + (size_t)NB * BLOCK * sizeof(float) + stageB;   // +qg_sh
     auto launch = [&](auto U4tag) {
@@ -1699,7 +1730,7 @@ torch::Tensor kv_decode_attention_batched_cuda(
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
             part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc);
+            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt);
     };
     if ((int)u == 4) launch(std::true_type{}); else launch(std::false_type{});
     kv_decode_combine_kernel<<<dim3((int)H, (int)B), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
