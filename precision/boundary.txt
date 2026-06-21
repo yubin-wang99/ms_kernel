@@ -1,0 +1,43 @@
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 77.14it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+BF16 PPL = 6.5684; criterion = within 3.0%
+
+=== weight (sorted by bits/elem, most aggressive first) ===
+ bits  u  mg |  light % | 3%?
+4.500  4  16 |  +10.33% | FAIL
+4.750  4   8 |  +10.09% | FAIL
+5.250  4   4 |   +9.20% | FAIL
+5.344  3  32 |   +3.50% | FAIL
+5.438  3  16 |   +3.38% | FAIL
+5.625  3   8 |   +3.00% | OK
+6.000  3   4 |   +2.77% | OK
+6.250  4   2 |   +6.09% | FAIL
+7.250  2   2 |   +0.53% | OK
+  -> MIN-BITS robust: u3/mg8 = 5.625 bits/elem (+3.00%)
+
+=== activation (sorted by bits/elem, most aggressive first) ===
+ bits  u  mg |  light % | 3%?
+4.500  4  16 |  +13.39% | FAIL
+4.750  4   8 |  +12.08% | FAIL
+5.250  4   4 |  +10.31% | FAIL
+5.344  3  32 |   +3.37% | FAIL
+5.438  3  16 |   +3.40% | FAIL
+5.625  3   8 |   +3.07% | FAIL
+6.000  3   4 |   +2.54% | OK
+6.250  4   2 |   +6.69% | FAIL
+7.250  2   2 |   +0.57% | OK
+  -> MIN-BITS robust: u3/mg4 = 6.000 bits/elem (+2.54%)
+
+=== kv (sorted by bits/elem, most aggressive first) ===
+ bits  u  mg |  light % | 3%?
+4.500  4  16 |   +5.72% | FAIL
+4.750  4   8 |   +5.19% | FAIL
+5.250  4   4 |   +4.20% | FAIL
+5.344  3  32 |   +1.24% | OK
+5.438  3  16 |   +1.20% | OK
+5.625  3   8 |   +1.18% | OK
+6.000  3   4 |   +0.88% | OK
+6.250  4   2 |   +2.72% | OK
+7.250  2   2 |   +0.16% | OK
+  -> MIN-BITS robust: u3/mg32 = 5.344 bits/elem (+1.24%)
+

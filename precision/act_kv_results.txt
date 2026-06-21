@@ -1,0 +1,20 @@
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 74.20it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tokens; window=2048 stride=1024 max_win=30
+
+BF16 PPL = 6.5684
+[kv patch sanity] sdpa hits with fn set = 960 (should be > 0)
+
+=== act-only PPL (% over BF16 6.568, 3% criterion) ===
+ u  mg |    naive    light     MSAQ | within3%(l/m)
+ 2   2 |   +0.82%   +0.57%   +0.55% | OK/OK
+ 3   4 |   +3.88%   +2.54%   +2.89% | OK/OK
+ 4   2 |  +13.58%   +6.69%   +6.75% | FAIL/FAIL
+ 4   8 |  +24.93%  +12.08%  +12.71% | FAIL/FAIL
+
+=== kv-only PPL (% over BF16 6.568, 3% criterion) ===
+ u  mg |    naive    light     MSAQ | within3%(l/m)
+ 2   2 |   +0.10%   +0.16%   +0.21% | OK/OK
+ 3   4 |   +0.94%   +0.88%   +0.86% | OK/OK
+ 4   2 |   +3.07%   +2.72%   +2.89% | OK/OK
+ 4   8 |   +6.37%   +5.19%   +5.14% | FAIL/FAIL
