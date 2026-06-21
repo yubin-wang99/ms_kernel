@@ -149,6 +149,31 @@ closing that needs the design-A KV-reuse kernel (which is occupancy-bound — se
 MHA case.** Full stack that gets there: nibble u4 + int8-staged V (v8) + separated-scale K dot
 (sepsc) + transposed-padded staging (vt).
 
+## Optimization 5 (attempted): vt ported into the design-A KV-reuse kernel — still occupancy-bound
+To make GQA win at long context, ported `vt` into `kv_decode_gqa_kernel` (design-A: reads each KV head
+ONCE, reused across G=4 query heads). Result — **design-A stays 1.35–1.64×**, far behind the wide
+kernel:
+
+| Hq/Hkv, Lk | MXINT8 | wide (v8+sepsc+vt) | design-A +vt |
+|---|---|---|---|
+| 32/8 Lk4096 | 106µs | **0.90× WIN** | 1.51× |
+| 32/8 Lk16384 | 345µs | 1.06× | 1.35× |
+| 8/2 Lk16384 | 98µs | 1.01× | 1.64× |
+| 32/4 Lk8192 | 171µs | 1.05× | 1.35× |
+
+Why vt can't rescue design-A — **the regime is not DRAM-bound** (ncu: DRAM 20%). design-A's whole
+premise is reading KV 4× less from *global*, but a non-DRAM-bound kernel can't turn that into time.
+And design-A's real limiter is **occupancy**: holding G=4 query heads per block (G accumulators + G
+dots + G softmax states, `MAX_G=8` register arrays) starves registers. vt only cuts *shared* traffic,
+not occupancy → no help.
+
+Meanwhile the **wide kernel handles GQA well without explicit reuse**: it reads KV 4× from global, but
+the 4 query-head blocks of one kv head are consecutive → **L2 absorbs most of the redundancy** → it
+**wins at short context (0.90× Lk4096)** and is near-parity (1.05–1.06×) at long context. So GQA does
+not need design-A. Closing the residual long-context gap would require either making the kernel
+DRAM-bound (it isn't) or a templated-on-G / tensor-core-PV design-A rewrite (much larger). design-A+vt
+kept gated (`MS_KV_GQA`, opt-in, default off) as a documented negative.
+
 ## Takeaway
 The inference-time lever is **nibble alignment (u4), not minimal bits/elem**. The most-aggressive
 robust config (u3) is extraction-bound and squanders its footprint advantage. A less-aggressive,
