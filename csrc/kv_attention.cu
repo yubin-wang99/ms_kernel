@@ -1348,7 +1348,7 @@ __global__ void kv_write_kernel(
         int8_t*  __restrict__ scale_exp,         // [H, nb, L]
         uint8_t* __restrict__ upper,             // [H, nb, L, UB]
         uint8_t* __restrict__ shared,            // [H, nb, L, SB]
-        int H, int L, int D, int NB, int u, int gs, int UB, int SB) {
+        int H, int L, int D, int NB, int u, int gs, int UB, int SB, int lightms) {
     const int h = blockIdx.x;
     const int blk = blockIdx.z;                            // one head_dim block per grid-z
     const int j = blockIdx.y * blockDim.x + threadIdx.x;
@@ -1359,7 +1359,8 @@ __global__ void kv_write_kernel(
     #pragma unroll
     for (int k = 0; k < 32; ++k) x[k] = __bfloat162float(X[xb + k]);
     int q_upper[32], r_shared[16];
-    const int ea = ms::decompose_ms_block(x, u, gs, q_upper, r_shared);
+    const int ea = lightms ? ms::decompose_lightms_block(x, u, gs, q_upper, r_shared)
+                           : ms::decompose_ms_block(x, u, gs, q_upper, r_shared);
     const long tok = (long)(h * NB + blk) * L + j;
     uint32_t ureg[8] = {0u,0u,0u,0u,0u,0u,0u,0u};         // <=24 packed upper bytes
     ms::pack_codes_lsb(q_upper, 32, wbits, (uint8_t*)ureg, UB);
@@ -1384,7 +1385,7 @@ __global__ void kv_append_kernel(
         int8_t*  __restrict__ scale_exp,         // [H, nb, Lcap]
         uint8_t* __restrict__ upper,             // [H, nb, Lcap, UB]
         uint8_t* __restrict__ shared,            // [H, nb, Lcap, SB]
-        int H, int D, int NB, int pos, int Lcap, int u, int gs, int UB, int SB) {
+        int H, int D, int NB, int pos, int Lcap, int u, int gs, int UB, int SB, int lightms) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= H * NB) return;
     const int h = t / NB, blk = t % NB, ng = 32 / gs, wbits = 8 - u;
@@ -1393,7 +1394,8 @@ __global__ void kv_append_kernel(
     #pragma unroll
     for (int k = 0; k < 32; ++k) x[k] = __bfloat162float(X[xb + k]);
     int q_upper[32], r_shared[16];
-    const int ea = ms::decompose_ms_block(x, u, gs, q_upper, r_shared);
+    const int ea = lightms ? ms::decompose_lightms_block(x, u, gs, q_upper, r_shared)
+                           : ms::decompose_ms_block(x, u, gs, q_upper, r_shared);
     const long slot = (long)(h * NB + blk) * Lcap + pos;
     uint8_t ubuf[32], sbuf[8];
     ms::pack_codes_lsb(q_upper, 32, wbits, ubuf, UB);
@@ -1699,11 +1701,12 @@ std::vector<torch::Tensor> kv_write_cuda(
     auto upper     = torch::empty({H, NB, L, UB}, u8);
     auto shared    = torch::empty({H, NB, L, SB}, u8);
     const int TPB = 128;                                  // smaller block + grid-z=nb -> more blocks
+    const char* lm = getenv("MS_LIGHTMS"); const int lightms = (lm && atoi(lm) == 1) ? 1 : 0;
     kv_write_kernel<<<dim3((int)H, ((int)L + TPB - 1) / TPB, (int)NB), TPB, 0,
                       at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
-        (int)H, (int)L, (int)D, (int)NB, (int)u, (int)gs, UB, SB);
+        (int)H, (int)L, (int)D, (int)NB, (int)u, (int)gs, UB, SB, lightms);
     return {scale_exp, upper, shared};
 }
 
@@ -1718,8 +1721,9 @@ void kv_append_cuda(
     const int UB = BLOCK * wbits / 8;
     const int SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
     const int total = (int)(H * NB), TPB = 128;
+    const char* lm = getenv("MS_LIGHTMS"); const int lightms = (lm && atoi(lm) == 1) ? 1 : 0;
     kv_append_kernel<<<(total + TPB - 1) / TPB, TPB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
-        (int)H, (int)D, (int)NB, (int)pos, (int)Lcap, (int)u, (int)gs, UB, SB);
+        (int)H, (int)D, (int)NB, (int)pos, (int)Lcap, (int)u, (int)gs, UB, SB, lightms);
 }

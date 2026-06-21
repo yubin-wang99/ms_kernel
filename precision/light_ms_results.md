@@ -45,9 +45,41 @@ MSAQ의 FP-residual 평균을 **INT-residual 평균**으로 바꾼 경량 변형
 light-MS = **MSAQ 동등 정확도 + naive보다 명백히 우수(특히 activation) + INT-averaging으로 online-quant
 커널 overhead 절감.** robust-aggressive: KV u3/mg32(0.65×) · Weight u3/mg8(0.68×) · Act u3/mg4(0.73×).
 
+## 4. 커널 시간 (GPU, RTX 3090) — light-MS는 quant time을 줄이지 않음 (정직한 negative)
+정수-친화 decompose(`decompose_lightms_block`: q8=round(x/sa) 1회 후 전부 정수)를 KV write/append에
+env-gated(`MS_LIGHTMS=1`)로 넣고 측정.
+
+**(i) quant-kernel time** (`tests/quant_time_bench.py`):
+| | MXINT8 | MSAQ(FP-avg) | light-MS(INT) |
+|---|---|---|---|
+| KV append (launch-bound) | 7.05µs | 8.45µs | **8.43µs (=MSAQ)** |
+| KV write (decompose 노출) | 50µs | 62µs (1.23×) | **73µs (1.18× MSAQ)** |
+- append는 launch-bound라 light-MS = MSAQ(증가 없음). **write는 light-MS가 1.18× 느림** — 정수
+  decompose의 signed-rounding 분기 + q8[32] 레지스터 압박이 손해. **GPU는 FP FMA가 싸서**(MSAQ의
+  residual은 1 FMA) 정수화가 이득이 아님 — 순수 정수 ASIC 가정에서만 유효.
+- 둘 다 MXINT8보다 1.2~1.45× 느림 = decompose+bit-pack의 내재 포맷 비용(light-MS 무관).
+- 정확도(정수 double-rounding 변형 `light_ms_int`): QSNR이 MSAQ 대비 −0.07~−0.30 dB(u3/u4), u2mg2서 −1.4 dB.
+
+**(ii) footprint → GEMV speed** (`tests/gemv_u_bench.py`, W-only 4096²):
+| config | bytes | GEMV time | BW |
+|---|---|---|---|
+| MXINT8 | 1.00× | 1.00× | 356 GB/s |
+| u4 (0.58×) | 0.58× | **0.58×** | 355 (memory-bound, 완전 환원) |
+| u3 (0.70×, robust) | 0.70× | **0.84×** | 295 (extraction-bound) |
+- u4만 byte→time 완전 환원, robust u3는 streaming-unpack이 extraction-bound라 부분적(0.84×). light-MS=MSAQ.
+
+**결론:** light-MS의 가치는 **정확도(≈MSAQ ≫naive) + 정수-친화(ASIC)**이지 **GPU 커널 speedup이 아님**.
+quant는 launch/메모리-bound라 averaging이 병목이 아니고, 정수화는 GPU에서 오히려 손해.
+→ default는 MSAQ(`decompose_ms_block`) 불변, light-MS는 `MS_LIGHTMS` gated 실험/documented-negative로 보존.
+
 ## 재현 스크립트
 - `lightms_qsnr.py` — weight QSNR (naive/light/MSAQ), 자체 완결 양자화 정의.
 - `lightms_output_qsnr.py` — output-QSNR + 반복-텍스트 PPL.
 - `lightms_wikitext_ppl.py` — weight-only wikitext PPL.
 - `lightms_act_kv_ppl.py` — activation/KV scope PPL (SDPA 패치로 KV 양자화).
 - `lightms_boundary.py` — scope별 bits-정렬 robust 경계 sweep.
+- `lightms_qsnr.py::light_ms_int` — 커널 정수 decompose(double-rounding) 정확도 변형.
+- `../tests/quant_time_bench.py` — (i) KV write/append quant time (MSAQ/light/MXINT8).
+- `../tests/gemv_u_bench.py` — (ii) footprint→GEMV speed.
+
+커널: `csrc/core/ms_utils.cuh::decompose_lightms_block`(정수-친화), KV write/append에 `MS_LIGHTMS=1` gated.

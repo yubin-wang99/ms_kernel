@@ -233,6 +233,43 @@ __device__ __forceinline__ int decompose_ms_block(
     return ea;
 }
 
+// light-MS decompose: same stored format as decompose_ms_block, but INTEGER-friendly.
+// One FP round per element (q8 = round(x/sa)); everything after is integer — the
+// per-element FP residual (x - q_upper*s_unshared) and the FP group-mean are replaced
+// by integer subtract + integer round-to-nearest mean. q_upper = round(q8 / 2^u) and
+// shared = round(mean(q8 - q_upper*2^u)) in pure int. (Validated ~= decompose_ms_block
+// in QSNR/PPL; a double-rounding variant of MSAQ. change.md Phase 41.)
+__device__ __forceinline__ int decompose_lightms_block(
+        const float* __restrict__ x, int u, int gs, int* q_upper, int* r_shared) {
+    float amax = 1e-30f;
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) amax = fmaxf(amax, fabsf(x[k]));
+    const int ea = e8m0_exp_from_amax(amax);
+    const float inv_sa = exp2f(-(float)ea);
+    const int qmax = (1 << (7 - u)) - 1, smin = -(1 << (u - 1)), smax = (1 << (u - 1)) - 1;
+    const int half_u = 1 << (u - 1), lg = __ffs(gs) - 1, half_g = gs >> 1;
+    int q8[32];
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) q8[k] = (int)rintf(x[k] * inv_sa);   // only FP round / elem
+    const int ng = 32 / gs;
+    for (int g = 0; g < ng; ++g) {
+        int ssum = 0;
+        for (int kk = 0; kk < gs; ++kk) {
+            const int k = g * gs + kk;
+            const int q = q8[k];
+            int up = (q >= 0) ? ((q + half_u) >> u) : -(((-q) + half_u) >> u);  // round(q/2^u), signed
+            up = max(-qmax, min(qmax, up));
+            q_upper[k] = up;
+            int res = q - (up << u);
+            res = max(smin, min(smax, res));
+            ssum += res;
+        }
+        const int m = (ssum >= 0) ? ((ssum + half_g) >> lg) : -(((-ssum) + half_g) >> lg);  // int round-mean
+        r_shared[g] = max(smin, min(smax, m));
+    }
+    return ea;
+}
+
 // Dense LSB bit-pack tail (inverse of extract_code): n codes of `width` bits,
 // LSB-first, into a contiguous `nbytes`-byte buffer. A code straddles at most two
 // bytes (width<=7). Used by the KV write/append kernels to produce the certified

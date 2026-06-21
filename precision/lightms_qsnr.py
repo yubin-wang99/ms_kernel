@@ -49,6 +49,21 @@ def light_ms(x, u, mg):                                  # light: quantize then 
     shared = torch.round(grp.mean(-1, keepdim=True)).clamp(s_min, s_max).expand(-1, -1, mg).reshape(res.shape)
     return (x_un + shared * step).reshape(x.shape)        # INTEGER round-to-nearest mean
 
+def light_ms_int(x, u, mg):                              # kernel decompose_lightms_block: q8=round(x/sa), then all-int
+    xf = _blocks(x)
+    s = _mxint8_scale(xf)
+    q8 = torch.round(xf / s)                             # full 8-bit code (|x/sa| < 128, no clamp)
+    pw = float(1 << u); half_u = 1 << (u - 1); qmax = (1 << (7 - u)) - 1
+    qu = torch.where(q8 >= 0, torch.div(q8 + half_u, pw, rounding_mode="floor"),
+                     -torch.div(-q8 + half_u, pw, rounding_mode="floor")).clamp(-qmax, qmax)
+    s_min, s_max = -(1 << (u - 1)), (1 << (u - 1)) - 1
+    res = (q8 - qu * pw).clamp(s_min, s_max)
+    grp = res.reshape(res.shape[0], -1, mg); ssum = grp.sum(-1, keepdim=True); hg = mg // 2
+    m = torch.where(ssum >= 0, torch.div(ssum + hg, mg, rounding_mode="floor"),
+                    -torch.div(-ssum + hg, mg, rounding_mode="floor"))
+    shared = m.clamp(s_min, s_max).expand(-1, -1, mg).reshape(res.shape)
+    return ((qu * pw + shared) * s).reshape(x.shape)
+
 def naive_ms(x, u, mg):                                  # MXINT8 quant, share low-u bits (unsigned int mean)
     xf = _blocks(x)                                      # = single_level_mantissa_sharing (ssnf round_mean)
     s = _mxint8_scale(xf)
