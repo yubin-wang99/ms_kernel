@@ -1648,3 +1648,26 @@ cooperative-exp는 유지(공정 최적화, no-fake-win; single-token은 occupan
 **정정된 배치 결론(공정):** robust win B<=8(0.84-0.93x), B>=16 near-tie/slight-loss(1.00-1.04x).
 고배치 loss는 near-fundamental — full-occupancy compute+shared 포화에 MSAQ bfe-decode가 DRAM(9.5%)
 여유 없이 그대로 노출. single-token MHA/GQA win은 불변.
+
+# Phase 45 — W+A GEMM에 streaming-unpack(SWAR 전 단계) 이식: documented negative (read-bound)
+
+TC-FPx 방향(추출 명령 축소)을 W+A GEMM(wa_imma)에 적용 시도. 이전 측정에서 wa_imma의 weight unpack이
+노출(+58~69%)됐기에 extraction-bound로 보고, GEMV Phase-20 streaming bit-buffer를 stage()에 이식
+(thread-per-output-channel, 컬럼의 UB/SB 바이트를 word로 모아 1 shift+mask/code). bit-exact(test_wa 36/36).
+
+**그러나 clean 벤치(plane을 GPU에 1회 pre-upload; ops.wa_gemm 래퍼는 매 호출 H2D 복사라 측정 오염)로
+재측정하니 negative:**
+  M64  : u2 1.22x / u3 1.35x / u4 1.24x (loss) | unpack-exposed +67~72%
+  M256 : u2 1.34x / u3 1.32x / u4 1.21x (loss) | +57~62%
+  M1024: u2 0.96x / u3 0.96x / u4 0.89x         | +54~57%
+
+unpack-exposed(diag2: weight read+unpack 생략)가 streaming 후에도 +54~72%로 **이전과 동일** →
+병목은 extraction이 아니라 **strided weight READ**(upper[(blk*UB+B)*OUT+o], OUT-stride)다. MSAQ의
+strided read가 MXINT8의 contiguous read보다 coalescing 비효율이라, 바이트가 적어도 small-M에서 loss.
+extraction을 빠르게 해도 read-bound prologue는 안 움직인다(KV/GEMV에서 본 것과 동형의 fake-win).
+
+→ streaming 이식 **revert**(원본 per-element unpack 복원, 128-thread). 진짜 lever는 weight LAYOUT
+재설계(segment-major / register-aligned repack)뿐 — pack.py 재설계 + roundtrip 재인증이 드는 longer-
+horizon(TC-FPx 본체). no-fake-win 원칙대로, read-bound에 extraction 최적화를 얹어 win 주장하지 않음.
+(주: Readme의 W+A GEMM win 수치는 별도 tile-cfg/warm 조건; 이 clean 벤치의 small-M loss와의 정합은
+재확인 필요 — 본 실험의 결론은 "streaming은 read-bound라 무효"라는 negative에 한정.)
