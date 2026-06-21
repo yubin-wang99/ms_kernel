@@ -39,6 +39,26 @@ robust weight config (u3) only yields ~10–17% speedup (extraction-bound).
   consistent with the Phase-32 KV-read tie/loss). Among MSAQ, the packing-friendly **u4/gs2 is the
   best robust operating point**, not the bpe-minimal u3/gs32.
 
+## Optimization 1: int8-staged V Pass-2 (`MS_KV_V8`, default on for u4/gs≤2)
+Diag showed KV-decode is latency/occupancy-bound (both MSAQ and MXINT8 sustain only ~326 GB/s,
+~35% of peak), and that the u4/gs2 gap over u4/gs8 is the **V-staging shared plane**: the wide
+kernel stages raw packed V (upper+shared) into smem and re-unpacks per (kk,kd) in Pass-2; for gs2
+the shared plane is 4× bigger (SB=8 vs 2) → more smem (caps occupancy) + 2 shared bytes/elem read.
+
+Fix: for u4, stage V **already reconstructed as int8 codes** (`up·16+sh`, in [-120,119] since the
+encoder clamps q_upper∈[-7,7]) during Pass-1. Pass-2 then reads **one int8/elem** — identical to
+MXINT8's Pass-2, no bfe, no gs shared-plane. Bit-exact (test_kv 72/72).
+
+| config | before | after (v8) | speedup | vs MXINT8 |
+|---|---|---|---|---|
+| u4/gs2 H8 Lk16k  | 1.45× | **1.25×** | 1.16× | still >1 |
+| u4/gs2 H16 Lk16k | 1.49× | **1.15×** | 1.29× | still >1 |
+| u4/gs8 (SB=2) | 1.17× | 1.13× (hurts) | — | gated OFF (extra smem not worth it) |
+
+Cuts the u4/gs2 gap from ~1.45–1.49× to ~1.15–1.25×; gated to gs≤2 (helps only when the shared
+plane is large). Not yet under MXINT8 — the remaining gap is the Pass-1 K extraction/compute
+(separated-scale dequant, next).
+
 ## Takeaway
 The inference-time lever is **nibble alignment (u4), not minimal bits/elem**. The most-aggressive
 robust config (u3) is extraction-bound and squanders its footprint advantage. A less-aggressive,
