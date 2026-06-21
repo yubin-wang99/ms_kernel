@@ -107,6 +107,23 @@ G=4 query heads — the regime where MSAQ's extraction should amortize. Ported b
 **Net of the whole effort:** the **wide kernel with v8+separated-scale** is the winner — it reaches
 **0.97× MXINT8 (a real win) at GQA Lk4096**, and ~1.15× at Lk16384. The original u4/gs2 was 1.45–1.50×.
 
+## Profiling the optimized wide kernel (ncu) + occupancy attempt
+ncu on u4/gs2 wide (v8+sepsc, H8/Lk16384, 148µs) pinned the limiter:
+- **DRAM throughput 20.7%** → NOT bandwidth-bound (so the 0.76× byte savings can't convert here).
+- **L1/TEX cache 63.5%** → shared-memory traffic is the top resource (the staged-V Pass-2 reads).
+- **Achieved occupancy 24% / theoretical 33%, limited by REGISTERS** (4 blocks/SM; smem allows 5,
+  warps allow 12). The kernel needs ~128 regs for its accumulators.
+
+Tried `__launch_bounds__(256,3)` to cap registers (~85) and raise occupancy → **backfired**
+(GQA Lk4096 0.97→1.09×, Lk16384 1.15→1.28×, H16 1.02→1.15×): capping forced **spills to local
+memory**, which add exactly the L1/TEX/DRAM traffic that is already the bottleneck. Reverted.
+
+**Conclusion:** the kernel is **L1/TEX-shared-bound and register-heavy**, not bandwidth- or
+occupancy-bound in a way reg-capping can fix. The v8+separated-scale state is the practical optimum
+(0.97× MX at GQA Lk4096; ~1.03–1.15× at long context). Further gains would need a structural change
+that cuts shared-memory traffic (e.g. transposed/padded V staging for conflict-free vectorized
+Pass-2 reads, or cp.async pipelining) — larger, higher-risk, uncertain payoff.
+
 ## Takeaway
 The inference-time lever is **nibble alignment (u4), not minimal bits/elem**. The most-aggressive
 robust config (u3) is extraction-bound and squanders its footprint advantage. A less-aggressive,
