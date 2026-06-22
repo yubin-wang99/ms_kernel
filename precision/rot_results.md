@@ -37,11 +37,35 @@ Key has persistent CHANNEL outliers → full head_dim rotation mixes them (32-bl
   +2.04%, u4/mg2 +2.49→+1.08%. u4/gs2 is exactly the packing-friendly config the vpack KV-decode
   kernel wins with → rotation **expands the robust frontier toward the fastest config**.
 
+## 3. Online path — end-to-end PPL verification (`rot_qrot_ppl.py`)
+The §2 numbers used the **effective-dequant fold** (`k_deq = msaq(K@H)@Hᵀ/D`, H unnormalized,
+`D=2⁷` folds into E8M0 exactly), so Q was never rotated and no √D scale entered the quantizer. The
+deployed kernel instead does the **true online rotation with an orthonormal Hadamard** `Hₙ = H/√D`:
+`Q_rot = Q@Hₙ` (attn prologue, `MS_KV_QROT=1`), `K_stored = msaq(K@Hₙ)` (`kv_append_rot`). Because
+msaq's E8M0 is per-32-block absmax and `1/√128` is **not** a power of two, the online path is *not*
+bit-identical to the fold — worth verifying it keeps the win. wikitext-2, Llama-3.1-8B-Instruct, BF16
+PPL 6.5684:
+
+| scope·config | MSAQ (none) | +rot fold | **+rot online (kernel)** | online−fold |
+|---|---|---|---|---|
+| K  u4/mg8 | +4.63% | +1.77% | **+1.76%** | −0.01pp |
+| K  u3/mg8 | +1.07% | +0.42% | **+0.41%** | −0.01 |
+| K  u4/mg2 | +2.49% | +1.08% | **+0.99%** | −0.09 |
+| KV u4/mg8 | +5.14% (FAIL) | +2.10% | **+1.89% (robust)** | −0.20 |
+| KV u3/mg8 | +1.25% | +0.51% | **+0.43%** | −0.08 |
+| KV u4/mg2 | +2.89% | +1.25% | **+1.19%** | −0.06 |
+
+**The online path reproduces the fold win — in fact marginally BETTER** (online ≤ fold everywhere,
+by 0.01–0.20pp). The non-pow2 `1/√128` did not introduce harmful extra rounding; the per-block E8M0
+absorbs it and the orthonormal scaling is slightly favorable. The headline **KV u4/mg8 +5.14% (FAIL)
+→ +1.89% (robust)** holds with the *actual* online Q-rotation + rotated-K-quant the kernel runs. So
+the deployed `MS_KV_QROT` / `kv_append_rot` kernels deliver the full accuracy win end-to-end.
+
 ## Verdict
 Rotation's accuracy value for MSAQ is **concentrated in KV-Key**, not weights. Weight gain is marginal
-(+0.3 dB, hurts u4); **Key gain is large and unlocks the aggressive nibble config**. Next: a kernel
-that rotates K online (post-RoPE H₁₂₈, Q mirrored) — but that adds cost to the latency-bound decode
-hot path, so the TPOT delta must be weighed against the accuracy/aggressiveness gain (per the no-fake-win
-rule). V-rotation via W_o fold is free but accuracy-irrelevant. Matched baseline: compare MSAQ+rot vs
+(+0.3 dB, hurts u4); **Key gain is large and unlocks the aggressive nibble config**. The online kernel
+that rotates K (post-RoPE H₁₂₈, Q mirrored) is **built and verified**: fused into `kv_append` /
+the attn prologue its marginal latency is ~0 (see `rot_kv_latency.md`), and §3 confirms the online
+math keeps the full accuracy win end-to-end. V-rotation via W_o fold is free but accuracy-irrelevant. Matched baseline: compare MSAQ+rot vs
 MXINT8+rot on the accuracy axis; on latency, rotating only MSAQ-K is a format difference (note in
 for_fair_comparison.md), like quant_act_msaq.
