@@ -138,6 +138,47 @@ over the B rows in registers) replaces it for both W-only and W+A.
   staging wall; `change.md` Phase 47, documented-negative). `B≥64` OOM on the 3090 (24 GB, 32-layer KV).
   Full ratio tables (prefill/decode/total × mq/mx·mq/bf·mx/bf) in [`tests/harness_batchsweep_results.md`](tests/harness_batchsweep_results.md).
 
+## `u` / `gs` per scope (our setup)
+
+MSAQ is parameterized by `u` (per-element *unshared* upper bits — fewer `u` ⇒ fewer bytes ⇒ more
+aggressive) and `gs` (= `mg`, the *shared*-code group size — smaller `gs` ⇒ finer shared scale ⇒ more
+accurate, more bytes). We set them on **two axes**:
+
+**Latency / E2E (timing is value-independent → one config compared apples-to-apples):**
+| run | scope coverage | `u` / `gs` |
+|---|---|---|
+| **E2E batched** (`harness_batchsweep`) | all 5 scopes (S1–S5) | **`u4/gs2`** (the packing-friendly nibble the vpack KV-decode kernel wins with) |
+| E2E batch-1 (`harness.py`) | all scopes | sweep `u∈{2,3,4}` × `gs∈{2,8,32}` |
+| kernel microbench (`tests/benchmark.py`) | per kernel (sweepable defaults) | GEMV `u3/gs8`, W-only GEMM `u3/gs8`, W+A GEMM `u2/gs8`, KV `u3/gs8` |
+
+**Accuracy-robust `u`/`gs` per scope** (within 3% wikitext PPL, block=32 — the design target):
+| scope | plain MSAQ (E8M0) | with the unlocking lever |
+|---|---|---|
+| **KV-cache** | **`u4/gs2`** ✓ (`u3/gs8` ✓; `u4/gs8` fails +5.1%) | `u4/gs8` robust via online K-rotation (+1.9%) **or** MX two-level `d2=1` (all `gs`) |
+| **weight** | `u3/gs8` ✓ (`u4` fails) | `u4` robust via MX two-level `d2=2` at `gs≤4` |
+| **weight+act** | `u2/gs8` (hardest scope) | `u4/gs2` robust only via two-level `d2=2` + rotation |
+| **weight+KV** | `u3/gs8` (bounded by weight) | follows weight/KV levers |
+
+So the **latency headline uses `u4/gs2` everywhere**; **accuracy then says which scope can actually run
+`u4`** — KV yes (rotation/two-level), weight/W+A only with the extra levers. Per-scope numbers + the
+levers: [`precision/u4_robustness_study.md`](precision/u4_robustness_study.md),
+[`precision/rot_results.md`](precision/rot_results.md).
+
+## Where to look (results + design)
+
+| topic | file |
+|---|---|
+| **E2E batched latency** (prefill/decode/total × ratios) | [`tests/harness_batchsweep_results.md`](tests/harness_batchsweep_results.md), harness `tests/harness_batchsweep.py` |
+| E2E batch-1 (TTFT/TPOT, 4 scenarios × 3 models) | [`harness_results.md`](harness_results.md), `tests/harness.py` |
+| weight-matmul kernel wins (GEMV/GEMM/W+A) | [`weight_scope_results.md`](weight_scope_results.md) |
+| KV-read decode win (nibble u4/gs2 + sepsc + vpack) | [`kv_read_attempts.md`](kv_read_attempts.md), [`tests/kv_pack_results.md`](tests/kv_pack_results.md) |
+| **u=4 accuracy robustness per scope** (block/scale/rotation/MX two-level) | [`precision/u4_robustness_study.md`](precision/u4_robustness_study.md) |
+| Hadamard K-rotation (accuracy + ≈free online cost) | [`precision/rot_results.md`](precision/rot_results.md), [`precision/rot_kv_latency.md`](precision/rot_kv_latency.md) |
+| **phase-by-phase design history** (every kernel decision incl. Phase 47 batched-decode) | [`change.md`](change.md) |
+| serving workload spec (B, L_in/L_out axes) | [`kernel_ver2.md`](kernel_ver2.md) §3 |
+| fairness audit (what differs from MXINT8 besides element handling) | [`for_fair_comparison.md`](for_fair_comparison.md) |
+| kernels / numerics / op registration | `csrc/*.cu`, `ms_lib/pack.py`, `csrc/pybind.cpp` |
+
 ## Layout
 
 ```
