@@ -70,7 +70,9 @@ class QLinear:
         # B>1 W-only -> batched-decode GEMV (amortize weight read over B); else GEMM
         if p == "msaq_wonly":   return OPS.wonly_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
         if p == "mxint8_wonly": return OPS.mxint8_gemv_batched(X, self.s, self.qw, B, self.OUT, self.nb)
-        return self.gemm(X)                              # bf16 (cuBLAS) / W+A (GEMM)
+        if p == "msaq_wa":      return OPS.wa_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
+        if p == "mxint8_wa":    return OPS.mxint8_wa_gemv_batched(X, self.s, self.qw, B, self.OUT, self.nb)
+        return self.gemm(X)                              # bf16 (cuBLAS)
 
 
 def rmsnorm(x):
