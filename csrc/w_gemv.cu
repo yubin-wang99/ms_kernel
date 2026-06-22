@@ -283,6 +283,84 @@ __global__ void wonly_gemv_wide_kernel(
     partial[(long)sp * OUT + o] = acc;
 }
 
+// ---- BATCHED-DECODE W-only GEMV (M=B small): amortize the weight read over B rows --
+//   The B=1 wide GEMV is memory-bound on the weight (the column read dominates; the
+//   activation is tiny). At decode batch M=B the SAME weight column serves all B rows,
+//   so reading it ONCE and applying it to MR activation rows held in registers
+//   (acc[MR]) amortizes the weight read M-fold. MSAQ's ~0.5x weight bytes then convert
+//   to time -> wins vs MXINT8 (1B) and bf16 GEMM until the compute crossover (~tens of
+//   rows, §3.2). x [M,K] row-major; partial [splitK, M, OUT]; grid (OUT/thr, splitK, ceil(M/MR)).
+template<bool U4, int MR>
+__global__ void wonly_gemv_batched_kernel(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int u, int gs, int UB, int SB, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK, gs_shift = __ffs(gs) - 1;
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const long base = (long)blk * OUT + o;
+        uint8_t sb[8];
+        const long sbase = base * SB;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) if (i < SB) sb[i] = shared_cm[sbase + i];
+        if constexpr (U4) {
+            const uint4 up4 = *reinterpret_cast<const uint4*>(upper_cm + base * UB);
+            const uint32_t uw[4] = { up4.x, up4.y, up4.z, up4.w };
+            #pragma unroll
+            for (int k = 0; k < BLOCK; ++k) {
+                const int up_code = ms::bfe_s32((int)uw[k >> 3], (k & 7) * 4, 4);
+                const int g = k >> gs_shift;
+                const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
+                const float wf = (float)(up_code * 16 + sh_code) * scale;
+                const int kk = blk * BLOCK + k;
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += wf * __bfloat162float(x[(long)m * K + kk]); }
+            }
+        } else {
+            const int wbits = 8 - u;
+            const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+            const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+            uint32_t sreg[3] = {0u,0u,0u};
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) if (i < SB) sreg[i >> 2] |= (uint32_t)sb[i] << (8 * (i & 3));
+            uint32_t ureg[6] = {0u,0u,0u,0u,0u,0u};
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UB);
+            #pragma unroll
+            for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+            const int gsmask = gs - 1;
+            uint64_t ubuf = 0; int unb = 0, uwi = 0; uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+            for (int k = 0; k < BLOCK; ++k) {
+                if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+                const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign; ubuf >>= wbits; unb -= wbits;
+                if ((k & gsmask) == 0) { if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; } sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign; sbuf >>= u; snb -= u; }
+                const float wf = (float)(up_code * (1 << u) + sh_code) * scale;
+                const int kk = blk * BLOCK + k;
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += wf * __bfloat162float(x[(long)m * K + kk]); }
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+}
+
+__global__ void gemv_combine_batched_kernel(
+        const float* __restrict__ partial, __nv_bfloat16* __restrict__ y, int M, int OUT, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y;
+    if (o >= OUT || m >= M) return;
+    float acc = 0.0f;
+    for (int sp = 0; sp < splitK; ++sp) acc += partial[((long)sp * M + m) * OUT + o];
+    y[(long)m * OUT + o] = __float2bfloat16(acc);
+}
+
 // ---- W+A GEMV (decode): wide-load skeleton + int dot ------------------------
 //   The W-only wide GEMV above with the activation ALSO quantized (MSAQ-s).
 //   A separate pre-pass (ms_launch_quant_act_msaq, M=1) decomposes x[K] into the
@@ -468,6 +546,42 @@ torch::Tensor wonly_gemv_wide_cuda(
     gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+
+// batched-decode wide GEMV: x [M,K] -> y [M,OUT]. MR (compile-time rows/block) = next
+// pow2 of M capped 32; M>MR tiles. Amortizes the weight read over M (the decode win).
+torch::Tensor wonly_gemv_batched_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    const int wbits = 8 - (int)u, UB = BLOCK * wbits / 8, SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto launch = [&](auto U4tag, auto MRtag) {
+        wonly_gemv_batched_kernel<decltype(U4tag)::value, decltype(MRtag)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
+    };
+#define MRDISP(U4) switch (MR) { \
+        case 1:  launch(U4, std::integral_constant<int,1>{});  break; \
+        case 2:  launch(U4, std::integral_constant<int,2>{});  break; \
+        case 4:  launch(U4, std::integral_constant<int,4>{});  break; \
+        case 8:  launch(U4, std::integral_constant<int,8>{});  break; \
+        case 16: launch(U4, std::integral_constant<int,16>{}); break; \
+        default: launch(U4, std::integral_constant<int,32>{}); break; }
+    if ((int)u == 4) { MRDISP(std::true_type{}); } else { MRDISP(std::false_type{}); }
+#undef MRDISP
+    gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
     return y;
 }
 

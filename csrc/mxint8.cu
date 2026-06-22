@@ -66,6 +66,44 @@ __global__ void mxint8_gemv_combine_kernel(
     y[o] = __float2bfloat16(acc);
 }
 
+// batched-decode MXINT8 GEMV (matched to the MSAQ batched GEMV): read each int8 weight
+// column once, amortize over MR activation rows. x [M,K] -> partial [splitK, M, OUT].
+template<int MR>
+__global__ void mxint8_gemv_batched_kernel(
+        const __nv_bfloat16* __restrict__ x, const int8_t* __restrict__ scale_exp,
+        const int8_t* __restrict__ qweight, float* __restrict__ partial,
+        int M, int OUT, int NB, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            const float wf = (float)qweight[(blk * BLOCK + k) * OUT + o] * scale;
+            const int kk = blk * BLOCK + k;
+            #pragma unroll
+            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += wf * __bfloat162float(x[(long)m * K + kk]); }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+}
+
+__global__ void mxint8_gemv_combine_batched_kernel(
+        const float* __restrict__ partial, __nv_bfloat16* __restrict__ y, int M, int OUT, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y;
+    if (o >= OUT || m >= M) return;
+    float acc = 0.0f;
+    for (int sp = 0; sp < splitK; ++sp) acc += partial[((long)sp * M + m) * OUT + o];
+    y[(long)m * OUT + o] = __float2bfloat16(acc);
+}
+
 // Matched MXINT8 W+A GEMV: plain-MXINT8 activation pre-pass + int dot. Mirror of
 // the MSAQ wa_gemv (same int idot=sum qw*qx fold) but both operands are full
 // int8 (no decompose) -> the matched baseline for the W+A decode scope.
@@ -678,6 +716,37 @@ torch::Tensor mxint8_gemv_cuda(
     mxint8_gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+
+// batched-decode MXINT8 GEMV: x [M,K] -> y [M,OUT]. Matched to wonly_gemv_batched.
+torch::Tensor mxint8_gemv_batched_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight,
+        int64_t M, int64_t OUT, int64_t NB) {
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto launch = [&](auto MRtag) {
+        mxint8_gemv_batched_kernel<decltype(MRtag)::value><<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), qweight.data_ptr<int8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+    };
+    switch (MR) {
+        case 1:  launch(std::integral_constant<int,1>{});  break;
+        case 2:  launch(std::integral_constant<int,2>{});  break;
+        case 4:  launch(std::integral_constant<int,4>{});  break;
+        case 8:  launch(std::integral_constant<int,8>{});  break;
+        case 16: launch(std::integral_constant<int,16>{}); break;
+        default: launch(std::integral_constant<int,32>{}); break;
+    }
+    mxint8_gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
     return y;
 }
 

@@ -64,8 +64,13 @@ class QLinear:
         if p == "msaq_wonly":    return OPS.wonly_gemv_wide(x, self.s, self.upc, self.shc, self.OUT, self.nb, self.u, self.gs)
         if p == "msaq_wa":       return OPS.wa_gemv(x, self.s, self.upc, self.shc, self.OUT, self.nb, self.u, self.gs)
 
-    def fwd(self, X):                                    # decode: [B,K]->[B,OUT]; B=1 -> GEMV
-        return self.gemv(X[0])[None] if X.shape[0] == 1 else self.gemm(X)
+    def fwd(self, X):                                    # decode: [B,K]->[B,OUT]
+        B, p = X.shape[0], self.path
+        if B == 1: return self.gemv(X[0])[None]          # B=1 -> wide GEMV
+        # B>1 W-only -> batched-decode GEMV (amortize weight read over B); else GEMM
+        if p == "msaq_wonly":   return OPS.wonly_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
+        if p == "mxint8_wonly": return OPS.mxint8_gemv_batched(X, self.s, self.qw, B, self.OUT, self.nb)
+        return self.gemm(X)                              # bf16 (cuBLAS) / W+A (GEMM)
 
 
 def rmsnorm(x):
