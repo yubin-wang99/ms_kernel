@@ -341,7 +341,7 @@ __global__ void kv_decode_wide_kernel(
         const uint8_t* __restrict__ vh,
         float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
         int H, int Hkv, int Lk, int Lcap, int D, int NB, int u, int gs, int UB, int SB,
-        int key_tile, int S, int chunk, float sm_scale, int v8, int sepsc, int vt) {
+        int key_tile, int S, int chunk, float sm_scale, int v8, int sepsc, int vt, int qrot) {
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
     const int hk = h / (H / Hkv);                  // GQA: q head -> kv head
     const int gs_shift = __ffs(gs) - 1;            // gs is pow2: k/gs == k>>shift
@@ -363,6 +363,25 @@ __global__ void kv_decode_wide_kernel(
     unsigned char* pVh = pVu + (long)NB * chunk * UB;   // [NB*chunk*SB] staged V shared
     if (active) q_sh[tid] = __bfloat162float(q[h * D + tid]);
     __syncthreads();
+    // ---- FUSED ONLINE Q-ROTATION (post-RoPE H_D, orthonormal) ----------------
+    //   Mirrors the KV-Key rotation done at append (kv_append_rot) so QK^T is
+    //   preserved: (Q·H)(K·H)^T = Q·K^T. Done here in the prologue (once/block,
+    //   all D threads active) so it costs ZERO extra launch — its marginal cost
+    //   is what MS_KV_QROT=1 adds over =0. FWHT: 7 butterfly stages, 1/sqrt(D).
+    if (qrot) {
+        for (int hh = 1; hh < D; hh <<= 1) {
+            float nv = 0.0f;
+            if (active) {
+                const float ve = q_sh[tid], vp = q_sh[tid ^ hh];
+                nv = (tid & hh) ? (vp - ve) : (ve + vp);
+            }
+            __syncthreads();
+            if (active) q_sh[tid] = nv;
+            __syncthreads();
+        }
+        if (active) q_sh[tid] *= rsqrtf((float)D);
+        __syncthreads();
+    }
     // separated-scale: per (blk,g) query group-sum qg = Σ_{d∈group} q[d] (key-independent,
     // computed once). The K/V dot then factors: Σ q·(up·2^u+sh)·s = s·(2^u·Σq·up + Σ_g sh·qg).
     if (sepsc) {
@@ -1633,6 +1652,50 @@ __global__ void kv_append_kernel(
     scale_exp[slot] = (int8_t)ea;
 }
 
+// ---- KV QUANTIZE + FUSED ONLINE K-ROTATION (decode append) -------------------
+//   The Hadamard rotation is over the FULL head_dim (H_D), not per-32-block, so
+//   one block owns one head: D threads load the row, do the FWHT in shared
+//   (orthonormal, 1/sqrt(D)), then NB threads each decompose+pack their 32-elem
+//   block to the same token-major slot as kv_append. Because the rotation rides
+//   the append's existing launch, its MARGINAL cost vs kv_append (no rotation)
+//   is the true online K-rotation tax. grid=(H), block=D.
+__global__ void kv_append_rot_kernel(
+        const __nv_bfloat16* __restrict__ X,    // [H, D] (new token's K)
+        int8_t*  __restrict__ scale_exp,         // [H, nb, Lcap]
+        uint8_t* __restrict__ upper,             // [H, nb, Lcap, UB]
+        uint8_t* __restrict__ shared,            // [H, nb, Lcap, SB]
+        int H, int D, int NB, int pos, int Lcap, int u, int gs, int UB, int SB, int lightms) {
+    extern __shared__ float sr[];                          // [D] rotated row
+    const int h = blockIdx.x, e = threadIdx.x;
+    sr[e] = __bfloat162float(X[(long)h * D + e]);
+    __syncthreads();
+    for (int hh = 1; hh < D; hh <<= 1) {                   // FWHT, 7 stages for D=128
+        const float ve = sr[e], vp = sr[e ^ hh];
+        const float nv = (e & hh) ? (vp - ve) : (ve + vp);
+        __syncthreads();
+        sr[e] = nv;
+        __syncthreads();
+    }
+    sr[e] *= rsqrtf((float)D);                             // orthonormal H
+    __syncthreads();
+
+    if (e >= NB) return;                                   // NB threads do the quant+pack
+    const int blk = e, ng = 32 / gs, wbits = 8 - u;
+    float x[32];
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) x[k] = sr[blk * 32 + k];
+    int q_upper[32], r_shared[16];
+    const int ea = lightms ? ms::decompose_lightms_block(x, u, gs, q_upper, r_shared)
+                           : ms::decompose_ms_block(x, u, gs, q_upper, r_shared);
+    const long slot = (long)(h * NB + blk) * Lcap + pos;
+    uint8_t ubuf[32], sbuf[8];
+    ms::pack_codes_lsb(q_upper, 32, wbits, ubuf, UB);
+    ms::pack_codes_lsb(r_shared, ng, u, sbuf, SB);
+    for (int bi = 0; bi < UB; ++bi) upper[slot * UB + bi] = ubuf[bi];
+    for (int bi = 0; bi < SB; ++bi) shared[slot * SB + bi] = sbuf[bi];
+    scale_exp[slot] = (int8_t)ea;
+}
+
 } // namespace
 
 // Host launcher. Signature matches ms_lib.ops.kv_decode_attention / the schema.
@@ -1767,7 +1830,7 @@ torch::Tensor kv_decode_attention_cuda(
                 ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
                 vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
                 part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt);
+                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt, 0);
           };
           if (vpack) run(std::true_type{}); else run(std::false_type{});
         };
@@ -1831,6 +1894,8 @@ torch::Tensor kv_decode_attention_batched_cuda(
     if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
     int vt = v8 ? 1 : 0;
     if (const char* e = getenv("MS_KV_VT")) vt = (v8 && atoi(e) != 0) ? 1 : 0;
+    int qrot = 0;                                  // fused online Q-rotation (H_D)
+    if (const char* e = getenv("MS_KV_QROT")) qrot = atoi(e) != 0 ? 1 : 0;
     int CHPv = (chunk + 1) >> 1; CHPv = (CHPv + 3) & ~3; if (((CHPv >> 2) & 1) == 0) CHPv += 4;
     const int ngv = BLOCK / (int)gs;
     const size_t stageB = vpack ? (size_t)NB * CHPv * (BLOCK + ngv)
@@ -1848,7 +1913,7 @@ torch::Tensor kv_decode_attention_batched_cuda(
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
             part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt);
+            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt, qrot);
       };
       if (vpack) run(std::true_type{}); else run(std::false_type{});
     };
@@ -2000,6 +2065,23 @@ void kv_append_cuda(
     const int total = (int)(H * NB), TPB = 128;
     const char* lm = getenv("MS_LIGHTMS"); const int lightms = (lm && atoi(lm) == 1) ? 1 : 0;
     kv_append_kernel<<<(total + TPB - 1) / TPB, TPB, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
+        (int)H, (int)D, (int)NB, (int)pos, (int)Lcap, (int)u, (int)gs, UB, SB, lightms);
+}
+
+// Fused K-rotation append: rotate each head's D-row by H_D, then quantize+append.
+// grid=(H), block=D threads; D*sizeof(float) dynamic smem for the row.
+void kv_append_rot_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
+        int64_t H, int64_t D, int64_t NB, int64_t pos, int64_t Lcap, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    const int wbits = 8 - (int)u;
+    const int UB = BLOCK * wbits / 8;
+    const int SB = ((BLOCK / (int)gs) * (int)u + 7) / 8;
+    const char* lm = getenv("MS_LIGHTMS"); const int lightms = (lm && atoi(lm) == 1) ? 1 : 0;
+    const size_t smem = (size_t)D * sizeof(float);
+    kv_append_rot_kernel<<<(int)H, (int)D, smem, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
         (int)H, (int)D, (int)NB, (int)pos, (int)Lcap, (int)u, (int)gs, UB, SB, lightms);

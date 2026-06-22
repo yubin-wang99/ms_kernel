@@ -1,0 +1,17 @@
+correctness: rel-err vs H-matmul = 2.58e-03 | QK^T-preservation rel-err = 3.32e-03
+            PASS
+
+decode-step added latency (rot is 2 launches Q+K; K-only is 1) vs kv_decode_attention:
+
+B= 1 Lk= 1024 | attn   31.24us | Q+K(2 launch)  17.64us (56.5%) | Q+K(1 launch)   8.85us (28.3%) | K-only   8.95us (28.7%)
+B= 1 Lk= 4096 | attn  104.10us | Q+K(2 launch)  19.06us (18.3%) | Q+K(1 launch)   9.79us ( 9.4%) | K-only   9.81us ( 9.4%)
+B= 1 Lk=16384 | attn  421.87us | Q+K(2 launch)  18.72us ( 4.4%) | Q+K(1 launch)   9.78us ( 2.3%) | K-only   9.86us ( 2.3%)
+
+B= 8 Lk= 1024 | attn  187.21us | Q+K(2 launch)  17.58us ( 9.4%) | Q+K(1 launch)   9.60us ( 5.1%) | K-only   8.89us ( 4.7%)
+B= 8 Lk= 4096 | attn  787.11us | Q+K(2 launch)  17.42us ( 2.2%) | Q+K(1 launch)   8.90us ( 1.1%) | K-only   8.86us ( 1.1%)
+B= 8 Lk=16384 | attn 2951.56us | Q+K(2 launch)  18.09us ( 0.6%) | Q+K(1 launch)   9.19us ( 0.3%) | K-only   9.30us ( 0.3%)
+
+B=32 Lk= 1024 | attn  692.02us | Q+K(2 launch)  17.66us ( 2.6%) | Q+K(1 launch)   8.94us ( 1.3%) | K-only   8.99us ( 1.3%)
+B=32 Lk= 4096 | attn 2665.18us | Q+K(2 launch)  17.63us ( 0.7%) | Q+K(1 launch)   8.99us ( 0.3%) | K-only   8.97us ( 0.3%)
+B=32 Lk=16384 | attn 10776.89us | Q+K(2 launch)  18.75us ( 0.2%) | Q+K(1 launch)   8.93us ( 0.1%) | K-only   8.94us ( 0.1%)
+

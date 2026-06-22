@@ -1,0 +1,20 @@
+=== correctness ===
+(A) Q-prologue FWHT  : kernel-qrot vs host-qrot (same cache)  rel_fro 1.47e-03 PASS
+(B) append_rot path  : kernel-append_rot vs host pack_kv(bf16(K)@H)  rel_fro 0.00e+00 PASS
+
+=== K-rotation fused into kv_append (true marginal) ===
+K-append  : plain   8.41us | +rot   8.38us | MARGINAL  -0.03us
+
+=== Q-rotation fused into attn prologue (true marginal) ===
+B= 1 Lk= 1024 | attn    31.08us | +Qrot    31.67us | MARGINAL  +0.59us (+1.89%)
+B= 1 Lk= 4096 | attn   103.86us | +Qrot   104.45us | MARGINAL  +0.59us (+0.57%)
+B= 1 Lk=16384 | attn   416.18us | +Qrot   371.15us | MARGINAL -45.03us (-10.82%)
+
+B= 8 Lk= 1024 | attn   185.92us | +Qrot   188.02us | MARGINAL  +2.10us (+1.13%)
+B= 8 Lk= 4096 | attn   736.58us | +Qrot   741.05us | MARGINAL  +4.48us (+0.61%)
+B= 8 Lk=16384 | attn  2965.73us | +Qrot  2965.08us | MARGINAL  -0.64us (-0.02%)
+
+B=32 Lk= 1024 | attn   687.98us | +Qrot   674.84us | MARGINAL -13.14us (-1.91%)
+B=32 Lk= 4096 | attn  2675.27us | +Qrot  2673.19us | MARGINAL  -2.08us (-0.08%)
+B=32 Lk=16384 | attn 10802.01us | +Qrot 10842.58us | MARGINAL +40.57us (+0.38%)
+

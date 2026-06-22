@@ -45,6 +45,7 @@ setup(
                 os.path.join(CSRC, "w_gemv.cu"),
                 os.path.join(CSRC, "wa_gemm.cu"),
                 os.path.join(CSRC, "kv_attention.cu"),
+                os.path.join(CSRC, "rotate.cu"),
                 os.path.join(CSRC, "mxint8.cu"),
             ],
             include_dirs=include_dirs,

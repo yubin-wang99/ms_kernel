@@ -57,6 +57,12 @@ std::vector<torch::Tensor> kv_write_cuda(
 void kv_append_cuda(
     torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
     int64_t H, int64_t D, int64_t NB, int64_t pos, int64_t Lcap, int64_t u, int64_t gs);
+void kv_append_rot_cuda(
+    torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
+    int64_t H, int64_t D, int64_t NB, int64_t pos, int64_t Lcap, int64_t u, int64_t gs);
+
+// defined in rotate.cu
+torch::Tensor hadamard_rotate_cuda(torch::Tensor x);
 
 // defined in mxint8.cu (baseline)
 torch::Tensor mxint8_gemv_cuda(
@@ -96,6 +102,8 @@ TORCH_LIBRARY(msaq, m) {
     m.def("kv_write(Tensor X, int H, int L, int D, int NB, int u, int gs) -> Tensor[]", &kv_write_cuda);
     m.def("kv_append(Tensor X, Tensor(a!) scale_exp, Tensor(b!) upper, Tensor(c!) shared, "
           "int H, int D, int NB, int pos, int Lcap, int u, int gs) -> ()", &kv_append_cuda);
+    m.def("kv_append_rot(Tensor X, Tensor(a!) scale_exp, Tensor(b!) upper, Tensor(c!) shared, "
+          "int H, int D, int NB, int pos, int Lcap, int u, int gs) -> ()", &kv_append_rot_cuda);
     m.def("wonly_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wonly_gemm_cuda);
     m.def("wa_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "
@@ -116,6 +124,7 @@ TORCH_LIBRARY(msaq, m) {
           "int Hkv, int M, int D, int Lk, int NBd, int u, int gs) -> Tensor", &qk_wmma_cuda);
     m.def("qk_wmma_mx(Tensor Q, Tensor ks, Tensor kq, "
           "int Hkv, int M, int D, int Lk, int NBd) -> Tensor", &qk_wmma_mx_cuda);
+    m.def("hadamard_rotate(Tensor x) -> Tensor", &hadamard_rotate_cuda);
     // ---- plain MXINT8 baselines ----
     m.def("mxint8_gemv(Tensor x, Tensor scale_exp, Tensor qweight, "
           "int OUT, int NB) -> Tensor", &mxint8_gemv_cuda);
