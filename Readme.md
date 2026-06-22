@@ -54,6 +54,24 @@ the `Hq/Hkv` branch — both win. Bit-exact (no repack), `test_kv` 72/72.
 > sub-byte MMA, so both formats build the same MMA input tile and the byte advantage dies at the MMA;
 > it is also not the decode path. design-A KV-reuse kernel is a gated documented-negative (occupancy-bound).
 
+**Online K-rotation** (Hadamard H₁₂₈, post-RoPE, Q mirrored) — *expands the robust frontier toward
+the fastest KV config at ≈ free latency.* A full head-dim Hadamard rotation of the KV-**Key** kills
+the persistent channel outliers (QuaRot mechanism), making the **nibble `u4/gs2`** config — exactly
+the one the vpack KV-decode kernel wins with — robust: wikitext PPL **+5.14% → +2.04%** (`u4/mg8` KV;
+`precision/rot_results.md`). It is a pair op so accuracy is preserved exactly: rotate K before
+quant+append and mirror Q before QKᵀ — `(Q·H)(K·H)ᵀ = Q·Kᵀ`. V stays un-rotated (accuracy-irrelevant).
+
+The cost lands on the latency-bound decode hot path, so it was measured (`precision/rot_kv_latency.md`):
+- **Standalone** (`torch.ops.msaq.hadamard_rotate`, FWHT — 7 butterfly stages, not a 128² matmul):
+  ~9 µs/launch, **flat** across (B, Lk) — Q+K in one launch (8.9 µs) == K alone == ½ of two launches,
+  i.e. the cost is **pure launch overhead**, not the math.
+- **Fused** (rides launches the decode already pays): K-rotation into `kv_append`
+  (`kv_append_rot`, byte-exact, rel_fro 0.0) → marginal **−0.03 µs (noise)**; Q-rotation into the
+  attn prologue (`MS_KV_QROT=1`) → marginal **≤ ~1 µs / ≤ ~1%**, at/below attn run-to-run jitter.
+
+So the u4-KV robustness gain is bought for **essentially zero latency** when fused. `test_kv` 72/72,
+default path unchanged. Benches `tests/rot_{kv,fused}_bench.py`.
+
 **W-only GEMV** (Phase 14/16/20) — decode `M=1`, `OUT=K=4096`. u4 uses a single
 int4 load + nibble `bfe`; u2/u3 were *extraction*-bound (the byte-straddle unpack,
 not the load — a perfectly-coalesced plane-split gave zero speedup), fixed by a
@@ -98,7 +116,8 @@ ms/
 │   ├── core/ms_utils.cuh     shared MSAQ-s unpack primitive (+ profiling macros)
 │   ├── w_gemv.cu             [pure CUDA] W-only decode GEMV
 │   ├── wa_gemm.cu            W+A GEMM + W-only prefill GEMM
-│   ├── kv_attention.cu       [pure CUDA] KV-cache flash-decode attention
+│   ├── kv_attention.cu       [pure CUDA] KV-cache flash-decode attention (+ fused K-rotation append)
+│   ├── rotate.cu             [pure CUDA] online Hadamard K/Q-rotation (standalone, FWHT)
 │   └── pybind.cpp            registers torch.ops.msaq.*
 ├── ms_lib/                   Python frontend
 │   ├── pack.py               numerics + offline packing (NumPy ground truth)
