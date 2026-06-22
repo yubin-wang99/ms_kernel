@@ -1716,3 +1716,32 @@ online이 fold win을 재현 + **오히려 미세하게 더 좋음**(online ≤ 
 포맷과 동류의 **(D) 의도된 포맷 차이**. nibble u4를 살리는 MSAQ 고유 레버(MXINT8 8-bit는 불필요;
 weight scope선 u4에 오히려 해). MSAQ만 비용을 내지만 fuse marginal ≈ 0이라 **(A) 최적화-수준
 비대칭으로 번지지 않음**. 정확도 축 apples-to-apples는 MSAQ+rot vs MXINT8+rot로 가능.
+
+# Phase 47 — Batched-decode GEMV (B>1): W-only/KV win vs MXINT8; tensor-core can't beat bf16 (documented wall)
+
+kernel_ver2 §3 E2E batch sweep (harness_batchsweep) exposed the decode B>1 hole: the per-token weight
+matmul becomes GEMM(M=B) and there was no small-batch decode path -> the large-M tile GEMM ran ~3-6x
+bf16 and only tied MXINT8 (kernel-maturity gap, not format). Fixed + probed the ceiling.
+
+**(a) scalar batched-decode GEMV (WIN vs MXINT8).** `wonly_gemv_batched` / `mxint8_gemv_batched`:
+extend the B=1 wide GEMV to M rows -- read each weight column ONCE and apply it to MR (compile-time,
+=next_pow2(B)<=32) activation rows held in registers (acc[MR]); M>MR tiles. Correct (rel_fro 1.7e-3 vs
+dequant oracle, 0.0 vs row-wise). Wired into harness decode for B>1 W-only. Result vs the old GEMM:
+W-only decode mq/mx 0.99->**0.44** (S1 B32) / **0.35** (S4 B32) -- MSAQ's packed-column wide uint4 load
+vs MXINT8's 32 scalar int8 loads; mq/bf 5.67->1.33 (S1 B8). S4 (W-only+KV) now WINS vs bf16 at long
+output (total 0.72x @L_out3880). KV-cache (S3) already wins (0.39-0.65x bf16). (harness_batchsweep_results.md)
+
+**(b) tensor-core batched GEMV -> documented NEGATIVE (can't beat bf16).** `wonly_gemv_tc` (wa_gemm.cu):
+split-K WMMA, M-tile=16, weight unpacked to a bf16 tile (dequant_col_stream_bf16) so the sub-byte read
+rides the tensor core. 4.4x better than naive cfg=11 at decode (743->168us @M8/OUT4096) but still
+**3.5-8.8x bf16** (45us). Measured weight-DRAM floor ~14-18us; TC runs 12-37x off it -> NOT DRAM-bound.
+Root cause = the **Phase 37 wall**: feeding tensor cores forces materializing a full-width bf16 K-tile
+(unpack + shared staging), whose on-chip cost is ~the full bf16 traffic, so the 0.38x DRAM-byte saving
+is cancelled at the staging. Scalar avoids staging (faster at M=8: 100us) but is compute-bound at M>=16.
+bf16 cuBLAS has neither penalty (reads bf16 straight into the MMA, DRAM-bound) -> unbeatable here.
+
+**Verdict.** Decode B>1: MSAQ WINS vs the matched MXINT8 baseline (the format axis) everywhere, and vs
+bf16 at B=1 / KV-cache / W-only+KV-long-output. Beating bf16 cuBLAS on pure W-only decode B>1 is a
+SUB-BYTE STRUCTURAL LIMIT (tensor-core staging wall OR scalar compute wall; bf16 has neither), not a
+tuning gap -- consistent with Phase 32-37. wonly_gemv_tc kept as the documented-negative artifact +
+the decode-regime split-K WMMA reference. B>=64 OOM (3090 24GB, 32-layer KV + prefill activation).

@@ -458,6 +458,75 @@ __global__ void wonly_gemm_wmma_pipe(
         }
 }
 
+// ---- DECODE TENSOR-CORE BATCHED GEMV (M=B small): split-K WMMA ----------------
+//   wmma_pipe is built for prefill (64x64 tile, no split-K) -> at decode (M=8-32,
+//   OUT=4096) it leaves the machine empty (~64 blocks) and runs 10-16x off. Here the
+//   M-tile is just 16 (one WMMA m; M>16 uses grid.y) and the K axis is SPLIT for
+//   occupancy (grid.z), so OUT/64 * ceil(M/16) * splitK blocks fill the SMs and the
+//   kernel becomes weight-DRAM-bound -> MSAQ's ~0.4x weight bytes convert to time and
+//   beat bf16 cuBLAS. 4 warps = a 16x64 output tile; weight unpacked to a bf16 tile
+//   (dequant_col_stream_bf16) so the sub-byte read rides the tensor core. partial
+//   [splitK, M, OUT] -> gemv_combine_tc.
+__global__ void wonly_gemv_tc_kernel(
+        const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper, const uint8_t* __restrict__ shared,
+        float* __restrict__ partial, int M, int OUT, int K, int NB, int u, int gs, int UB, int SB, int splitK) {
+    __shared__ __nv_bfloat16 As[2][16][WSK];
+    __shared__ __nv_bfloat16 Bs[2][64][WSK];
+    __shared__ float wt[4][16][16];
+    const int m0 = blockIdx.y * 16, o0 = blockIdx.x * 64, sp = blockIdx.z;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+    auto stage = [&](int b, int buf) {
+        for (int idx = tid; idx < 16 * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[buf][m][k] = (m0 + m < M) ? X[(long)(m0 + m) * K + b * BLOCK + k] : __float2bfloat16(0.0f);
+        }
+        for (int oc = tid; oc < 64; oc += 128) {
+            const int o = o0 + oc;
+            if (o < OUT) {
+                const float sc = ms::e8m0_to_scale(scale_exp[b * OUT + o]);
+                dequant_col_stream_bf16(upper, shared, b, o, OUT, u, gs, UB, SB, sc, &Bs[buf][oc][0]);
+            } else {
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = __float2bfloat16(0.0f);
+            }
+        }
+    };
+    if (b0 < b1) stage(b0, 0);
+    __syncthreads();
+    for (int blk = b0; blk < b1; ++blk) {
+        const int cur = (blk - b0) & 1, nxt = cur ^ 1;
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+            wmma::load_matrix_sync(a, &As[cur][0][wk * 16], WSK);
+            wmma::load_matrix_sync(b, &Bs[cur][warp * 16][wk * 16], WSK);
+            wmma::mma_sync(acc, a, b, acc);
+        }
+        if (blk + 1 < b1) stage(blk + 1, nxt);
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(&wt[warp][0][0], acc, 16, wmma::mem_row_major);
+    __syncwarp();
+    for (int e = lane; e < 256; e += 32) {
+        const int m = m0 + e / 16, o = o0 + warp * 16 + e % 16;
+        if (m < M && o < OUT) partial[((long)sp * M + m) * OUT + o] = wt[warp][e / 16][e % 16];
+    }
+}
+
+__global__ void gemv_combine_tc_kernel(
+        const float* __restrict__ partial, __nv_bfloat16* __restrict__ y, int M, int OUT, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y;
+    if (o >= OUT || m >= M) return;
+    float acc = 0.0f;
+    for (int sp = 0; sp < splitK; ++sp) acc += partial[((long)sp * M + m) * OUT + o];
+    y[(long)m * OUT + o] = __float2bfloat16(acc);
+}
+
 // ---- STAGE 1: W+A as PURE INT8 GEMM (IMMA), activation PRE-QUANTIZED ----------
 //   Reads qX int8 (Stage 0 output) directly — the in-kernel activation quant that
 //   filled the prologue in P23/24 is GONE, so the only heavy stage is the weight
@@ -634,6 +703,29 @@ torch::Tensor wonly_gemm_cuda(
         DISPATCH_TILE(wonly_gemm_tiled);
 #undef ARGS
     return Y;
+}
+
+// decode tensor-core batched GEMV: x [M,K] -> y [M,OUT]. split-K WMMA, weight-DRAM-bound.
+torch::Tensor wonly_gemv_tc_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
+        int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    int UB, SB; gemm_dims(u, gs, UB, SB);
+    auto y = torch::empty({M, OUT}, x.options());
+    const int K = (int)NB * BLOCK;
+    const int nO = ((int)OUT + 63) / 64, nM = ((int)M + 15) / 16;
+    // split K so nO*nM*splitK ~ 4x SM count -> fill the machine (decode underfills otherwise)
+    int splitK = (4 * 82) / (nO * nM); if (splitK < 1) splitK = 1; if (splitK > (int)NB) splitK = (int)NB;
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(nO, nM, splitK);
+    wonly_gemv_tc_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
+        partial.data_ptr<float>(), (int)M, (int)OUT, K, (int)NB, (int)u, (int)gs, UB, SB, splitK);
+    gemv_combine_tc_kernel<<<dim3(((int)OUT + 127) / 128, (int)M), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return y;
 }
 
 // W+A GEMM = STAGE 0 (runtime activation quant) + STAGE 1 (pure int8 IMMA GEMM).
