@@ -1,0 +1,11 @@
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 69.08it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tokens | BF16 PPL = 6.5684 | criterion: within 3%
+
+================  BLOCK = 8 elements  ================
+      scope | u4/mg8  u4/mg4  u4/mg2  | within 3%?
+     weight |  +6.22%   +6.16%   +4.21% | FAIL FAIL FAIL
+ weight+act | +12.23%  +11.21%   +7.73% | FAIL FAIL FAIL
+         KV |  +2.50%   +2.16%   +1.29% | OK OK OK
+  weight+KV |  +9.20%   +9.12%   +5.79% | FAIL FAIL FAIL
+

@@ -1,0 +1,20 @@
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 74.81it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tokens | BF16 PPL = 6.5684 | d2=2 two-level | within 3%
+rotation = full input-dim Hadamard (K=4096->H4096 ; down_proj->H2048 x7)
+
+==== scope = weight (d2=2) ====
+   mode | u4/mg8  u4/mg4  u4/mg2  | within 3%?
+  norot |  +3.44%   +2.83%   +2.09% | FAIL OK OK
+    rot |  +3.12%   +2.52%   +1.53% | FAIL OK OK
+
+==== scope = act (d2=2) ====
+   mode | u4/mg8  u4/mg4  u4/mg2  | within 3%?
+  norot |  +2.80%   +2.32%   +1.69% | OK OK OK
+    rot |  +1.95%   +1.90%   +1.30% | OK OK OK
+
+==== scope = weight+act (d2=2) ====
+   mode | u4/mg8  u4/mg4  u4/mg2  | within 3%?
+  norot |  +6.44%   +5.37%   +3.87% | FAIL FAIL FAIL
+    rot |  +5.51%   +4.49%   +2.75% | FAIL FAIL OK
+

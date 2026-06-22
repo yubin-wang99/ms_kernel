@@ -1,0 +1,25 @@
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 68.84it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tokens | BF16 PPL = 6.5684 | L1=E8M0/32, L2=microexp/2 | within 3%
+
+================  d2=0 (=msaq_signed baseline)  ================
+      scope | u4/mg8  u4/mg4  u4/mg2  | within 3%?
+     weight | +10.02%   +9.03%   +6.04% | FAIL FAIL FAIL
+ weight+act | +26.17%  +21.94%  +13.43% | FAIL FAIL FAIL
+         KV |  +5.14%   +4.26%   +2.89% | FAIL FAIL OK
+  weight+KV | +17.55%  +15.27%   +9.32% | FAIL FAIL FAIL
+
+================  d2=1 (two-level, 1-bit microexp/2)  ================
+      scope | u4/mg8  u4/mg4  u4/mg2  | within 3%?
+     weight |  +4.72%   +4.32%   +3.03% | FAIL FAIL FAIL
+ weight+act | +10.03%   +8.47%   +5.89% | FAIL FAIL FAIL
+         KV |  +2.06%   +1.68%   +1.23% | OK OK OK
+  weight+KV |  +7.68%   +6.76%   +4.47% | FAIL FAIL FAIL
+
+================  d2=2 (two-level, 2-bit microexp/2)  ================
+      scope | u4/mg8  u4/mg4  u4/mg2  | within 3%?
+     weight |  +3.44%   +2.83%   +2.09% | FAIL OK OK
+ weight+act |  +6.44%   +5.37%   +3.87% | FAIL FAIL FAIL
+         KV |  +1.45%   +1.22%   +0.87% | OK OK OK
+  weight+KV |  +5.48%   +4.29%   +3.02% | FAIL FAIL FAIL
+
