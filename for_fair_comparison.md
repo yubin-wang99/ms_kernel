@@ -40,6 +40,24 @@ element 취급의 일부이며 별도 비대칭 없음.
     decompose + int8 store. 이는 "element를 packed로 만드는" 작업 자체라 제거 불가(포맷의 정의).
     공정성 위배가 아니라 mantissa-sharing의 내재 비용.
 
+### ⚠️(D) Online K-rotation — MSAQ-K 전용 의도된 포맷 차이
+KV-Key를 head-dim Hadamard(H₁₂₈, orthonormal `Hₙ=H/√D`)로 online 회전해 채널 outlier를 죽이고
+**aggressive nibble u4/gs2를 robust로 만든다**(QuaRot 메커니즘). K는 `kv_append_rot`에서
+양자화 직전 회전, Q는 attn prologue(`MS_KV_QROT=1`)에서 미러 — pair op라 `(Q·H)(K·H)ᵀ=Q·Kᵀ`로
+score는 보존된다(V는 회전 안 함, 정확도 무관). **MXINT8 baseline은 회전하지 않는다(미러 안 함)** →
+W+A 활성화 포맷(MSAQ-s vs plain MXINT8)과 **동류의 (D) 의도된 포맷 차이**다.
+
+- **정당화(왜 비대칭이 공정한가):** rotation의 정확도 가치는 *MSAQ의 공격적 저비트(nibble u4)를
+  쓸 수 있게 하는 것*에 있다. MXINT8의 8-bit base는 이미 충분히 정밀해 회전이 필요 없다(weight scope
+  실험에서 회전은 u4에 오히려 해 — `rot_results.md §1`). 즉 회전은 MXINT8에 미러할 이유가 없는
+  **MSAQ 포맷 고유의 레버**다. 정확도 축을 apples-to-apples로 보려면 **MSAQ+rot vs MXINT8+rot**로
+  비교하면 되고(둘 다 같은 H 적용), 그 경우에도 §2/§3 결론(K-rotation이 MSAQ 저비트를 살린다)은 유효.
+- **latency 비대칭이 결과를 편향시키지 않는다(정량화):** 회전을 MSAQ만 지불하지만, decode가 이미
+  내는 launch에 fuse되어 **marginal cost ≈ 0**이다 — `kv_append_rot` vs `kv_append` **−0.03µs(노이즈)**,
+  `MS_KV_QROT=1` vs 0 **≤~1µs/≤~1%**(attn run-to-run jitter 이하). standalone ~9µs/launch는 전부
+  launch 오버헤드(fuse로 제거). 따라서 (D)지만 (A) 최적화-수준 비대칭으로 번지지 않는다. 검증·수치는
+  `precision/rot_kv_latency.md`(latency), `precision/rot_qrot_ppl.py`/`rot_results.md §3`(정확도 end-to-end).
+
 ### ⚠️ W-only GEMV / W+A GEMV — 차이 3~4개
 | 항목 | MSAQ | MXINT8 | 분류 |
 |------|------|--------|------|
@@ -232,6 +250,9 @@ MXINT8에도 적용돼야 공정 → 위에서 적용·정량화 완료.
 4. **⚠️ KV append이 일을 더 함**(decompose+pack) — 포맷의 내재 비용, 위배 아님.
 5. **✅ scale 처리, GEMM 전부, KV write/append 구조, 누적기** — matched.
 6. **(D) W+A 활성화 포맷(MSAQ-s vs MXINT8)** — 의도된 문서화 차이.
+7. **(D) Online K-rotation(MSAQ-K만 회전, MXINT8 미러 안 함)** — 의도된 포맷 차이. nibble u4를
+   robust로 만드는 MSAQ 고유 레버(MXINT8 8-bit는 불필요). fuse 시 marginal latency ≈ 0이라
+   (A)로 번지지 않음. 정확도 축은 MSAQ+rot vs MXINT8+rot로 비교 가능.
 
 **결론:** scale을 포함한 대부분은 element 취급에만 차이가 있고 공정하다. **KV read의 매핑 비대칭은
 해결**(MXINT8도 thread-per-key)했고, 그 결과 **이전 KV "압승"은 ~2× MXINT8 under-optimization
