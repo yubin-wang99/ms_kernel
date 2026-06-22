@@ -57,9 +57,16 @@ the `Hq/Hkv` branch — both win. Bit-exact (no repack), `test_kv` 72/72.
 **Online K-rotation** (Hadamard H₁₂₈, post-RoPE, Q mirrored) — *expands the robust frontier toward
 the fastest KV config at ≈ free latency.* A full head-dim Hadamard rotation of the KV-**Key** kills
 the persistent channel outliers (QuaRot mechanism), making the **nibble `u4/gs2`** config — exactly
-the one the vpack KV-decode kernel wins with — robust: wikitext PPL **+5.14% → +2.04%** (`u4/mg8` KV;
-`precision/rot_results.md`). It is a pair op so accuracy is preserved exactly: rotate K before
-quant+append and mirror Q before QKᵀ — `(Q·H)(K·H)ᵀ = Q·Kᵀ`. V stays un-rotated (accuracy-irrelevant).
+the one the vpack KV-decode kernel wins with — robust: wikitext PPL **+5.14% (FAIL) → +1.89%** (`u4/mg8`
+KV; `precision/rot_results.md`). It is a pair op so accuracy is preserved: rotate K before quant+append
+and mirror Q before QKᵀ — `(Q·H)(K·H)ᵀ = Q·Kᵀ`. V stays un-rotated (accuracy-irrelevant).
+
+*Accuracy verified end-to-end on the **actual online path** the kernel runs* (orthonormal `Hₙ=H/√D`,
+`Q@Hₙ` in the attn prologue + `msaq(K@Hₙ)` in append — not the offline dequant-fold proxy, and not
+bit-identical to it since `1/√128` isn't a power of two). wikitext PPL (Llama-3.1-8B) reproduces the
+fold's win — in fact marginally **better** everywhere (online ≤ fold by 0.01–0.20 pp): K `u4/mg8`
++4.63%→**+1.76%**, KV `u4/mg8` +5.14%→**+1.89%**, KV `u3/mg8` +1.25%→**+0.43%**. So `MS_KV_QROT` /
+`kv_append_rot` deliver the win for real (`precision/rot_qrot_ppl.py`).
 
 The cost lands on the latency-bound decode hot path, so it was measured (`precision/rot_kv_latency.md`):
 - **Standalone** (`torch.ops.msaq.hadamard_rotate`, FWHT — 7 butterfly stages, not a 128² matmul):
