@@ -115,6 +115,29 @@ wide-load → streaming unpack) and the 4-kernel scoreboard are in `change.md`.
 > — 설계·lever·수치(GEMV u4 0.63, W+A GEMM u4 0.79 …)와 "왜 이기는가". KV-read decode win은
 > [`kv_read_attempts.md`](kv_read_attempts.md) + [`tests/kv_pack_results.md`](tests/kv_pack_results.md).
 
+**Batched E2E inference (Phase 47, `harness_batchsweep`)** — full 32-layer Llama-3.1-8B forward,
+**TTFT (prefill) + integrated decode = total inference time** (not isolated kernels), over the
+`kernel_ver2.md` §3 serving sweep: batch `B∈{1,8,32}` at `(L_in,L_out)=(1024,512)` + output sweep
+`L_out∈{128..3880}` at `B=8`, for 5 scopes × {bf16, MXINT8, MSAQ u4/gs2}. Ratios `mq=MSAQ`, `mx=MXINT8`,
+`bf=bf16` (`<1` = faster). At decode `B>1` the per-token weight matmul becomes GEMM(M=B); a
+**batched-decode GEMV** (`wonly_gemv_batched`/`wa_gemv_batched`, weight column read once and amortized
+over the B rows in registers) replaces it for both W-only and W+A.
+
+| decode ratio | S1 W-only | S4 W-only+KV | S3 KV-only | S5 W+A+KV |
+|---|---|---|---|---|
+| **mq/mx** (vs MXINT8, B=32) | **0.44** | **0.35** | 1.00 | 0.97 |
+| **mq/bf** (vs bf16, B=8) | 1.32 | 0.95 | **0.65** | **0.97** |
+| **mq/bf total, L_out=3880** (B=8) | 1.24 | **0.73** | **0.51** | **0.74** |
+
+- **vs the matched MXINT8 baseline: MSAQ wins/ties at every decode scope** — W-only decode 0.35–0.44× @B32
+  (packed-column wide `uint4` load vs MXINT8's 32 scalar int8 loads), W+A 0.87–0.98×.
+- **vs bf16: KV-cache wins at batch** (0.39–0.65×, growing with B and `L_out`), and **both full-quant
+  scopes (S4, S5) win at long output** (total 0.73–0.74× @`L_out`3880; S5 W+A+KV decode beats bf16 from B=8).
+- **Honest walls (not the format):** pure W-only decode stays ~1.2× bf16 and prefill ~5× — the tensor-core
+  deficit of scalar/staged sub-byte kernels (a dedicated tensor-core decode GEMV hits the unpack→bf16
+  staging wall; `change.md` Phase 47, documented-negative). `B≥64` OOM on the 3090 (24 GB, 32-layer KV).
+  Full ratio tables (prefill/decode/total × mq/mx·mq/bf·mx/bf) in [`tests/harness_batchsweep_results.md`](tests/harness_batchsweep_results.md).
+
 ## Layout
 
 ```
