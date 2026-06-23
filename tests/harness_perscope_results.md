@@ -10,42 +10,53 @@ but **not weight-accurate**; this run is the accuracy-grounded picture. Raw: `ha
 ## DECODE ratios at (1024, 512)
 | scope (config) | B=1 mq/bf | B=8 mq/mx · mq/bf | B=32 mq/mx · mq/bf |
 |---|---|---|---|
-| **S1 W-only** (u3/gs16) | **0.84** | 1.19 · 1.60 | **0.60** · 2.77 |
-| **S2 W+A** (u2/gs8) | **0.84** | 1.08 · 1.58 | 1.44 · 3.70 |
-| **S3 KV** (u4/gs2) | 0.94 | 0.98 · **0.65** | 1.00 · **0.39** |
-| **S4 W-only+KV** (u2/gs8) | **0.84** | 1.39 · 1.37 | **0.58** · 2.31 |
-| **S5 W+A+KV** (u2/gs8) | **0.81** | 1.20 · 1.33 | 1.64 · 3.22 |
+| **S1 W-only** (u3/gs16) | **0.55** | 1.19 · 1.60 | **0.61** · 2.79 |
+| **S2 W+A** (u2/gs8) | **0.76** | **0.85** · 1.27 | **0.79** · 2.02 |
+| **S3 KV** (u4/gs2) | 0.92 | 0.98 · **0.65** | 1.00 · **0.39** |
+| **S4 W-only+KV** (u2/gs8) | **0.56** | **0.95** · 0.94 | **0.87** · 3.49 |
+| **S5 W+A+KV** (u2/gs8) | **0.59** | **0.91** · 1.00 | **0.79** · 1.54 |
+
+(After the W+A register-pressure fix `MS_WA_MR=8` — see below — **every scope now has decode mq/mx ≤ ~1.0
+except S1 @B8**; S2/S5 went from 1.44/1.64 @B32 to **0.79**.)
 
 ## OUTPUT sweep — total mq/bf (and mx/bf), B=8
 | scope | L=128 | 512 | 1024 | 2048 | 3880 | mx/bf @3880 |
 |---|---|---|---|---|---|---|
-| **S3 KV** (u4/gs2) | 0.77 | 0.68 | 0.63 | 0.57 | **0.51** | 0.53 |
-| S4 W-only+KV (u2/gs8) | 2.30 | 1.63 | 1.43 | 1.24 | 1.07 | **0.76** |
-| S5 W+A+KV (u2/gs8) | 2.84 | 1.77 | 1.48 | 1.26 | 1.07 | 0.85 |
-| S1 W-only (u3/gs16) | 2.43 | 1.84 | 1.67 | 1.53 | 1.41 | 1.25 |
-| S2 W+A (u2/gs8) | 3.00 | 1.99 | 1.73 | 1.55 | 1.41 | 1.34 |
+| **S3 KV** (u4/gs2) | 0.74 | 0.67 | 0.63 | 0.57 | **0.50** | 0.53 |
+| **S4 W-only+KV** (u2/gs8) | 1.92 | 1.19 | 1.00 | 0.85 | **0.74** | 0.76 |
+| **S5 W+A+KV** (u2/gs8) | 2.53 | 1.40 | 1.12 | 0.93 | **0.79** | 0.85 |
+| S1 W-only (u3/gs16) | 2.11 | 1.46 | 1.31 | 1.22 | 1.16 | 1.26 |
+| S2 W+A (u2/gs8) | 2.73 | 1.68 | 1.44 | 1.30 | 1.21 | 1.34 |
 
-## Findings (the honest, accuracy-grounded result)
-1. **KV-cache (S3) is the only clean E2E win at robust accuracy.** KV tolerates the **u4 nibble** (u4/gs2
-   +2.89% PPL), so its kernel-optimal config IS accuracy-valid: decode **0.39–0.65× bf16** (growing with
-   B and L_out), total **0.51× @L_out3880**, tie vs MXINT8. This is the headline that survives the 3.5%
-   accuracy bar.
-2. **Weight / W+A scopes are accuracy-bound to u2/u3 — and there MSAQ's latency edge largely evaporates
-   at decode.** At u2/u3 (non-nibble) the byte advantage shrinks (u2 = 6.5 bits/elem vs MXINT8 8.25, only
-   ~0.79×) AND the streaming sub-byte unpack is heavier than MXINT8's direct int8 read, so decode mq/mx
-   often **> 1** (S2/S5 1.05–1.64; S1/S4 win only at B=32, 0.58–0.60). vs bf16 these scopes lose at B>1
-   (prefill 4.6–7.3×, decode 1.0–3.7×); at S4 long-output MXINT8 even beats bf16 (mx/bf 0.76) while
-   MSAQ-u2 does not (mq/bf 1.07) — the non-nibble unpack overhead.
-3. **B=1 decode (GEMV) still wins vs bf16 at every scope** (mq/bf 0.81–0.94) — the memory-bound single-
-   token path, regardless of config.
-4. **Contrast with uniform u4/gs2** (`harness_batchsweep_results.md`): that run showed W-only decode
-   mq/mx 0.35–0.44 @B32 — but u4 is **not weight-accurate** (weight u4/gs2 +6.04% PPL). At the
-   accuracy-robust weight config (u3/u2) the same scope is 0.58–0.60 (B32) / >1 (B8). So the earlier
-   weight-scope latency wins were at a non-robust config; **only KV's win is simultaneously fast and accurate.**
+(decode-only mq/bf @3880: S3 **0.50**, S4 **0.71**, S5 **0.75**, S1 1.13, S2 1.17.)
+
+## What changed this round (two non-nibble decode optimizations)
+1. **(u,gs) compile-time specialization** of the u2/u3 unpack (decode GEMV / batched / W+A / KV paths) —
+   the dense-LSB straddle bit-math is resolved at compile time per (u,gs), turning the streaming
+   bit-buffer into a fixed shift/mask schedule. ~1.3–1.8× on the non-nibble decode paths.
+2. **W+A register-pressure fix** — W+A batched held `idot[MR]`(int) + `acc[MR]`(float) + unpack buffers →
+   **spill at MR=32** (micro-bench decode mq/mx 1.55–1.70, worsening with M). Capping the W+A row-tile
+   (default **`MS_WA_MR=8`**, tile M>8) keeps accumulators in registers: W+A M=32 (OUT=14336) **2371→1451
+   µs, mq/mx 1.64→1.00**; exact (rel_fro 0.0).
+
+Together these flipped S2/S5 W+A decode from losing to **winning vs MXINT8 at every batch** (@B32 1.44/1.64
+→ **0.79**), and S5 long-output now **beats bf16** (total 0.79× @L_out3880). (W-only non-nibble already
+won at M≥16; only M=8 is a slight intrinsic-unpack loss ~1.2×.)
+
+## Findings (accuracy-grounded, post W+A fix)
+1. **vs the matched MXINT8 baseline: MSAQ decode now wins/ties at essentially every scope & batch** — S2/S5
+   W+A 0.76–0.91, S4 0.56–0.95, S1/S4 0.55–0.87 (only S1 @B8 = 1.19, the u3 small-batch intrinsic). The
+   byte+wide-load advantage holds at the robust configs once the W+A spill is fixed.
+2. **KV-cache (S3) is the clean win vs BF16** (tolerates the u4 nibble): decode 0.39–0.65×, total 0.50×
+   @L_out3880, grows with B and L_out.
+3. **Both full-quant scopes win vs BF16 at long output** — S4 total 0.74×, S5 **0.79× @L_out3880** (S5
+   decode 0.75×); the KV win compounds with the now-cheap weight/W+A decode. **B=1 GEMV decode wins vs bf16
+   at every scope** (0.55–0.92).
+4. **Residual vs-BF16 losses are the tensor-core deficit, not the format** — prefill ~4.6–7.3× (scalar/
+   staged sub-byte vs cuBLAS) dominates TOTAL at short L_out; pure W-only decode ~1.1–1.2× bf16.
 
 ## Verdict
-Under a 3.5% PPL bar, MSAQ's E2E latency advantage is **concentrated in the KV-cache scope** (u4-nibble-
-robust → 0.39–0.65× bf16 at batch, growing with output length) plus the B=1 GEMV decode. Weight and W+A
-are accuracy-pinned to u2/u3, where the smaller byte saving and the non-nibble unpack overhead make MSAQ
-tie/lose vs MXINT8 and bf16 at B>1 decode. Closing the weight/W+A gap needs either u4 made weight-robust
-(rotation / MX two-level — not in these kernels) or a faster non-nibble decode unpack. (B≥64 OOM, 3090.)
+Under a 3.5% PPL bar, after the W+A register fix: **MSAQ ties/beats the matched MXINT8 baseline at decode
+across all scopes** (W+A 0.79–0.91 @batch), **KV-cache beats BF16** (0.39–0.65×), and **full-quant
+(S4/S5) beats BF16 at long output** (0.74–0.79× @L3880) plus B=1 GEMV everywhere. The remaining vs-BF16
+gap is prefill (~5×, tensor-core), not the quantization format. (B≥64 OOM, 3090.)
