@@ -1,0 +1,28 @@
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 64.77it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2 | BF16 PPL = 6.5684 | max_win=30 | <=+3.5% | baseline 16s
+
+=== W+A (attn fp) ===
+   u2/gs2 :  +0.79%  OK  (7.25 b/elem)
+   u2/gs4 :  +1.47%  OK  (6.75 b/elem)
+   u2/gs8 :  +1.59%  OK  (6.50 b/elem)
+   u2/gs16:  +1.77%  OK  (6.50 b/elem)
+   u2/gs32:  +1.73%  OK  (6.50 b/elem)
+   u3/gs2 :  +3.71%  FAIL  (6.75 b/elem)
+   -> max-aggressive robust: u2/gs8 (+1.59%, 6.50 b/elem)
+
+=== W+A+AA (attn act*act quant) ===
+   u2/gs2 :  +1.38%  OK  (7.25 b/elem)
+   u2/gs4 :  +1.96%  OK  (6.75 b/elem)
+   u2/gs8 :  +2.47%  OK  (6.50 b/elem)
+   u2/gs16:  +2.72%  OK  (6.50 b/elem)
+   u2/gs32:  +2.76%  OK  (6.50 b/elem)
+   u3/gs2 :  +5.48%  FAIL  (6.75 b/elem)
+   -> max-aggressive robust: u2/gs8 (+2.47%, 6.50 b/elem)
+
+========================================================
+SUMMARY — max-aggressive robust (u,gs), <=+3.5% PPL
+  W+A (attn fp)                 : u2/gs8 (+1.59%, 6.50 b/elem)
+  W+A+AA (attn act*act quant)   : u2/gs8 (+2.47%, 6.50 b/elem)
+
+total 780s
