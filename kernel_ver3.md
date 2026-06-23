@@ -91,9 +91,22 @@ prefill tiled GEMM은 **L1TEX(로드 파이프) bound**다 — `extract_code`가
 | `wonly_gemm` u2 | 512 | 2574 µs | **2143 µs** | **1.20×** |
 
 ncu(M=256): **sector-util 11.8→42.9%**(3.6× coalescing), **L1TEX 72.8→43.5%**(병목 완화), 1.90→1.59 ms.
-즉 진단(load-bound)이 정확했고 처방(coalesce)이 들어맞았다. 단 prefill은 여전히 텐서코어 없는 scalar
-FP32 GEMM이라 bf16과는 거리가 멀다 — 텐서코어가 직교 레버(WMMA/IMMA override가 이미 제공). 본 작업은
-언팩-로드 절반을 고친 것.
+즉 진단(load-bound)이 정확했고 처방(coalesce)이 들어맞았다.
+
+**W+A prefill(`wa_imma`, INT8 IMMA)도 동일 처방 — 1.15–1.40× (landed).** `wa_imma`는 double-buffer로
+언팩을 MMA 뒤에 숨기려 했으나, `MS_WA_DIAG`로 재보니 언팩이 **숨지 않고 ~62% 노출**(M=256: full 1694 µs vs
+unpack-skip 620 µs)이었다 — 원인은 동일한 per-element uncoalesced 로드. `wa_imma`를 `<bool CM>`로 템플릿화해
+CM=true는 column-major 평면을 컬럼별 wide-load + register streaming-unpack(int8), CM=false는 기존 경로
+(`wa_gemm_cm` op, `ms_lib.ops.wa_gemm` 기본). 비트 동일, `test_wa.py` 통과:
+
+| 경로 | M | row | **column-major** | speedup |
+|---|---|---|---|---|
+| `wa_gemm` u2 | 256 | 3226 µs | **2392 µs** | **1.35×** |
+| `wa_gemm` u2 | 512 | 5254 µs | **3757 µs** | **1.40×** |
+| `wa_gemm` u4 | 256 | 2680 µs | **2324 µs** | 1.15× |
+
+즉 prefill의 W-only·W+A **둘 다** 언팩-로드를 coalesce해 고쳤다. (W-only는 여전히 scalar FP32 GEMM이라
+텐서코어가 남은 직교 레버; W+A는 이미 IMMA 텐서코어 위에서 노출 언팩만 고친 것.)
 
 ## 3. 일반 교훈 — 특수화가 먹히는 조건
 
@@ -102,7 +115,7 @@ FP32 GEMM이라 bf16과는 거리가 멀다 — 텐서코어가 직교 레버(WM
 | regime | 예 | 처방 / 효과 |
 |---|---|---|
 | wide-load + 언팩-ALU/local-mem bound | decode GEMV/배치/W+A, KV-decode | (u,gs) 특수화 → **1.3–1.9× (적용)** |
-| per-element uncoalesced-load bound | prefill tiled | (u,gs) 특수화 0 → **column-major wide-load로 1.2–1.26× (적용)** |
+| per-element uncoalesced-load bound | prefill W-only tiled / W+A imma | (u,gs) 특수화 0 → **column-major wide-load로 1.2–1.4× (적용)** |
 | launch-bound | KV-append | 특수화 무의미 → **미적용** |
 
 즉 "런타임 인자를 상수로"는 만능이 아니라 **병목이 그 상수가 줄이는 비용(연산)에 있을 때만** 작동한다.
@@ -115,8 +128,9 @@ FP32 GEMM이라 bf16과는 거리가 멀다 — 텐서코어가 직교 레버(WM
   - decode (u,gs) 특수화: `csrc/w_gemv.cu`(4커널), `ms::stream_block_uspec`(`csrc/core/ms_utils.cuh`),
     `setup.py`(`--expt-extended-lambda`). 1.34–1.86×.
   - KV-decode (u,gs) 특수화: `csrc/kv_attention.cu`(`kv_decode_wide_kernel<…,U_,GS_>`). 1.31×.
-  - prefill column-major wide-load: `csrc/wa_gemm.cu`(`wonly_gemm_tiled_cm` + `wonly_gemm_cm` op),
-    `csrc/pybind.cpp`, `ms_lib/ops.py`(기본 경로). 1.2–1.26×.
+  - prefill column-major wide-load: `csrc/wa_gemm.cu`(W-only `wonly_gemm_tiled_cm`+`wonly_gemm_cm`;
+    W+A `wa_imma<true>`+`wa_gemm_cm`), `csrc/pybind.cpp`, `ms_lib/ops.py`(둘 다 기본 경로).
+    W-only 1.2–1.26×, W+A 1.15–1.40×.
 - **미적용(documented negative)**: prefill (u,gs) 연산 특수화(load-bound, reverted), KV-append(launch-bound).
 - **토글**: `MS_GEMV_NOSPEC=1`(decode/KV generic), `MS_GEMM_ROWMAJOR=1`(prefill 구 row-major).
 - **검증**: 전 경로 `max|spec−generic|=0` / `max|cm−row|=0`; `test_w`+`test_wa`+`test_kv` 통과.
