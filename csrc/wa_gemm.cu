@@ -632,6 +632,7 @@ __global__ void gemv_combine_tc_kernel(
 //   heavy part) overlaps the current block's MMA -> the unpack hides behind the
 //   tensor core, exactly the W-only WMMA-pipe lesson (P23) now that Stage 0 freed
 //   the prologue of activation quant.
+template<bool CM>
 __global__ void wa_imma(
         const int8_t* __restrict__ qX, const int8_t* __restrict__ sa_exp,
         const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper,
@@ -655,11 +656,51 @@ __global__ void wa_imma(
             const int m = idx >> 5, k = idx & 31;
             As[buf][m][k] = (m0 + m < M) ? qX[(long)(m0 + m) * K + blk * BLOCK + k] : (int8_t)0;
         }
-        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // weight unpack (heavy)
-            const int oc = idx >> 5, k = idx & 31, o = o0 + oc;
-            Bs[buf][oc][k] = (diag == 2) ? (int8_t)0 : ((o < OUT)
-                ? (int8_t)ms::unpack_ms_weight_elem(upper, shared, blk, o, k, OUT, u, gs, UB, SB)
-                : (int8_t)0);
+        if constexpr (CM) {
+            // COLUMN-MAJOR wide-load: thread owns whole columns; wide-load the column's
+            // UB bytes (contiguous, adjacent columns UB apart -> coalesced) then
+            // streaming-unpack all 32 codes from registers (replaces the per-element
+            // uncoalesced extract_code that was ~62% of wa_imma exposed).
+            const int wbits = 8 - u, gsmask = gs - 1;
+            const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+            const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+            for (int oc = tid; oc < 64; oc += 128) {
+                const int o = o0 + oc;
+                if (diag == 2 || o >= OUT) {
+                    #pragma unroll
+                    for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = (int8_t)0;
+                    continue;
+                }
+                const long base = (long)blk * OUT + o;
+                uint32_t ureg[6];
+                const uint32_t* src = reinterpret_cast<const uint32_t*>(upper + base * UB);
+                #pragma unroll
+                for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+                uint32_t sreg[3] = {0u, 0u, 0u};
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) if (i < SB) sreg[i >> 2] |= (uint32_t)shared[base * SB + i] << (8 * (i & 3));
+                uint64_t ubuf = 0; int unb = 0, uwi = 0;
+                uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) {
+                    if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+                    const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+                    ubuf >>= wbits; unb -= wbits;
+                    if ((k & gsmask) == 0) {
+                        if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+                        sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+                        sbuf >>= u; snb -= u;
+                    }
+                    Bs[buf][oc][k] = (int8_t)(up_code * (1 << u) + sh_code);
+                }
+            }
+        } else {
+            for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // weight unpack (heavy)
+                const int oc = idx >> 5, k = idx & 31, o = o0 + oc;
+                Bs[buf][oc][k] = (diag == 2) ? (int8_t)0 : ((o < OUT)
+                    ? (int8_t)ms::unpack_ms_weight_elem(upper, shared, blk, o, k, OUT, u, gs, UB, SB)
+                    : (int8_t)0);
+            }
         }
         if (tid < 64) {
             const int o = o0 + tid;
@@ -870,10 +911,34 @@ torch::Tensor wa_gemm_cuda(
                              qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(),
                              (int)M, (int)K, (int)NB, (int)u, (int)gs);
     int diag = 0; if (const char* d = getenv("MS_WA_DIAG")) diag = atoi(d);
-    // Stage 1: pure int8 IMMA GEMM
-    wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+    // Stage 1: pure int8 IMMA GEMM (row-major weight unpack)
+    wa_imma<false><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
         upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB, diag);
+    return Y;
+}
+
+// COLUMN-MAJOR wide-load W+A GEMM: Stage-0 activation quant + IMMA GEMM whose weight
+// unpack wide-loads the COLUMN-MAJOR planes (coalesced). The wa_imma unpack was ~62%
+// of total exposed (MS_WA_DIAG) -> not hidden behind the MMA, so coalescing it pays.
+torch::Tensor wa_gemm_cm_cuda(
+        torch::Tensor X, torch::Tensor scale_exp,
+        torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    int UB, SB; gemm_dims(u, gs, UB, SB);
+    auto Y = torch::empty({M, OUT}, X.options());
+    auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
+    auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
+    ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+                             qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(),
+                             (int)M, (int)K, (int)NB, (int)u, (int)gs);
+    int diag = 0; if (const char* d = getenv("MS_WA_DIAG")) diag = atoi(d);
+    wa_imma<true><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+        upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
         (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB, diag);
     return Y;

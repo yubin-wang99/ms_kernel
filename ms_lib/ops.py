@@ -113,12 +113,20 @@ def wonly_gemm(p, X_bf16):
 
 def wa_gemm(p, X_bf16):
     """W+A GEMM (also serves decode at M=1). X_bf16 [M,K] -> Y [M,OUT] bf16.
-    Weight unpacked to int8; activation quantized to MXINT8 on the fly (IMMA)."""
+    Weight unpacked to int8; activation quantized to MXINT8 on the fly (IMMA).
+    Column-major wide-load weight unpack by default (the unpack was ~62% exposed);
+    MS_GEMM_ROWMAJOR=1 forces the legacy row-major kernel (A/B)."""
     _require()
-    s, up, sh = _weight_planes(p, X_bf16.device)
-    return _OPS.wa_gemm(X_bf16, s, up, sh,
-                        int(X_bf16.shape[0]), int(p["OUT"]), int(p["K"]), int(p["nb"]),
-                        int(p["u"]), int(p["gs"]))
+    dev = X_bf16.device
+    s = torch.from_numpy(p["scale_exp"]).to(dev)
+    args = (int(X_bf16.shape[0]), int(p["OUT"]), int(p["K"]), int(p["nb"]),
+            int(p["u"]), int(p["gs"]))
+    if os.environ.get("MS_GEMM_ROWMAJOR") == "1":
+        s2, up, sh = _weight_planes(p, dev)
+        return _OPS.wa_gemm(X_bf16, s2, up, sh, *args)
+    upc = torch.from_numpy(p["upper_cm"]).to(dev)
+    shc = torch.from_numpy(p["shared_cm"]).to(dev)
+    return _OPS.wa_gemm_cm(X_bf16, s, upc, shc, *args)
 
 
 def kv_decode_attention(q_bf16, pK, pV):
