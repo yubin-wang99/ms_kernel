@@ -218,10 +218,11 @@ def run_scenario(w_path, kv_path, u, gs, B, L_in, L_out, reps=30):
     # PREFILL: W-only uses the pipelined-WMMA tile (MS_TILE_CFG=11); W+A keeps auto. Popped for decode.
     if "wonly" in w_path: os.environ["MS_TILE_CFG"] = "11"
     else: os.environ.pop("MS_TILE_CFG", None)
-    for _ in range(2): m.prefill(ids, caches)            # warmup (alloc / cuBLAS autotune)
+    _fast = os.environ.get("MS_FAST") == "1"             # high-B sweep: long prefill keeps P0 hot
+    for _ in range(1 if _fast else 2): m.prefill(ids, caches)   # warmup (alloc / cuBLAS autotune)
     torch.cuda.synchronize()
     _tt = []
-    for _ in range(3):                                   # min-of-3: single-shot TTFT was ~2x noisy
+    for _ in range(1 if _fast else 3):                   # min-of-3: single-shot TTFT was ~2x noisy (B=1)
         t0 = torch.cuda.Event(True); t1 = torch.cuda.Event(True)
         t0.record(); m.prefill(ids, caches); t1.record(); torch.cuda.synchronize()
         _tt.append(t0.elapsed_time(t1))
@@ -241,10 +242,10 @@ def run_scenario(w_path, kv_path, u, gs, B, L_in, L_out, reps=30):
         torch.cuda.current_stream().wait_stream(s)
         gr = torch.cuda.CUDAGraph()
         with torch.cuda.graph(gr): m.decode_step(x_static, cos, sin, pos, caches)
-        for _ in range(60): gr.replay()          # ramp mem clock to P0 (decode is BW-bound;
+        for _ in range(20 if _fast else 60): gr.replay()   # ramp mem clock to P0 (decode is BW-bound;
         torch.cuda.synchronize()                 # a cold worker starts in a low-power P-state)
         best = float("inf")                       # min over windows = steady-state P0 (drop throttle dips)
-        for _ in range(3):
+        for _ in range(1 if _fast else 3):
             e0 = torch.cuda.Event(True); e1 = torch.cuda.Event(True); e0.record()
             for _ in range(reps): gr.replay()
             e1.record(); torch.cuda.synchronize()
