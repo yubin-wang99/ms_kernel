@@ -86,6 +86,19 @@ torch::Tensor hadamard_rotate_cuda(torch::Tensor x);
 torch::Tensor mxint8_gemv_cuda(
     torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight,
     int64_t OUT, int64_t NB);
+// column-major wide-load variants (matched to the MSAQ wide-load kernels)
+torch::Tensor mxint8_gemv_wide_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight_cm, int64_t OUT, int64_t NB);
+torch::Tensor mxint8_gemv_batched_wide_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight_cm, int64_t M, int64_t OUT, int64_t NB);
+torch::Tensor mxint8_wa_gemv_wide_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight_cm, int64_t OUT, int64_t NB);
+torch::Tensor mxint8_wa_gemv_batched_wide_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight_cm, int64_t M, int64_t OUT, int64_t NB);
+torch::Tensor mxint8_gemm_cm_cuda(
+    torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm, int64_t M, int64_t OUT, int64_t K, int64_t NB);
+torch::Tensor mxint8_wa_gemm_cm_cuda(
+    torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm, int64_t M, int64_t OUT, int64_t K, int64_t NB);
 torch::Tensor mxint8_gemv_batched_cuda(
     torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight,
     int64_t M, int64_t OUT, int64_t NB);
@@ -162,6 +175,18 @@ TORCH_LIBRARY(msaq, m) {
           "int Hkv, int M, int D, int Lk, int NBd) -> Tensor", &qk_wmma_mx_cuda);
     m.def("hadamard_rotate(Tensor x) -> Tensor", &hadamard_rotate_cuda);
     // ---- plain MXINT8 baselines ----
+    m.def("mxint8_gemv_wide(Tensor x, Tensor scale_exp, Tensor qweight_cm, "
+          "int OUT, int NB) -> Tensor", &mxint8_gemv_wide_cuda);
+    m.def("mxint8_gemv_batched_wide(Tensor x, Tensor scale_exp, Tensor qweight_cm, "
+          "int M, int OUT, int NB) -> Tensor", &mxint8_gemv_batched_wide_cuda);
+    m.def("mxint8_wa_gemv_wide(Tensor x, Tensor scale_exp, Tensor qweight_cm, "
+          "int OUT, int NB) -> Tensor", &mxint8_wa_gemv_wide_cuda);
+    m.def("mxint8_wa_gemv_batched_wide(Tensor x, Tensor scale_exp, Tensor qweight_cm, "
+          "int M, int OUT, int NB) -> Tensor", &mxint8_wa_gemv_batched_wide_cuda);
+    m.def("mxint8_gemm_cm(Tensor X, Tensor scale_exp, Tensor qweight_cm, "
+          "int M, int OUT, int K, int NB) -> Tensor", &mxint8_gemm_cm_cuda);
+    m.def("mxint8_wa_gemm_cm(Tensor X, Tensor scale_exp, Tensor qweight_cm, "
+          "int M, int OUT, int K, int NB) -> Tensor", &mxint8_wa_gemm_cm_cuda);
     m.def("mxint8_gemv(Tensor x, Tensor scale_exp, Tensor qweight, "
           "int OUT, int NB) -> Tensor", &mxint8_gemv_cuda);
     m.def("mxint8_gemv_batched(Tensor x, Tensor scale_exp, Tensor qweight, "

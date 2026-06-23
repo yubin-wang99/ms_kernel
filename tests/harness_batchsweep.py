@@ -43,6 +43,7 @@ class QLinear:
             self.Wt = torch.from_numpy(W).to(torch.bfloat16).cuda().t().contiguous()
         elif path.startswith("mxint8"):
             p = pack_weight_mxint8(W); self.s, self.qw = cuda(p["scale_exp"]), cuda(p["qweight"])
+            self.qwc = cuda(p["qweight_cm"])   # column-major twin for the wide-load kernels
         else:
             p = pack_weight(W, u, gs); self.s = cuda(p["scale_exp"])
             self.up, self.sh = cuda(p["upper"]), cuda(p["shared"])
@@ -51,16 +52,16 @@ class QLinear:
     def gemm(self, X):                                   # X [M,K] bf16 -> [M,OUT]
         p, M = self.path, X.shape[0]
         if p == "bf16":          return X @ self.Wt
-        if p == "mxint8_wonly":  return OPS.mxint8_gemm(X, self.s, self.qw, M, self.OUT, self.K, self.nb)
-        if p == "mxint8_wa":     return OPS.mxint8_wa_gemm(X, self.s, self.qw, M, self.OUT, self.K, self.nb)
-        if p == "msaq_wonly":    return OPS.wonly_gemm(X, self.s, self.up, self.sh, M, self.OUT, self.K, self.nb, self.u, self.gs)
-        if p == "msaq_wa":       return OPS.wa_gemm(X, self.s, self.up, self.sh, M, self.OUT, self.K, self.nb, self.u, self.gs)
+        if p == "mxint8_wonly":  return OPS.mxint8_gemm_cm(X, self.s, self.qwc, M, self.OUT, self.K, self.nb)    # WMMA + column-major
+        if p == "mxint8_wa":     return OPS.mxint8_wa_gemm_cm(X, self.s, self.qwc, M, self.OUT, self.K, self.nb)  # IMMA + column-major
+        if p == "msaq_wonly":    return OPS.wonly_gemm_tc(X, self.s, self.upc, self.shc, M, self.OUT, self.K, self.nb, self.u, self.gs)  # WMMA TC + column-major (current best)
+        if p == "msaq_wa":       return OPS.wa_gemm_cm(X, self.s, self.upc, self.shc, M, self.OUT, self.K, self.nb, self.u, self.gs)     # IMMA + column-major (current best)
 
     def gemv(self, x):                                   # x [K] bf16 -> [OUT]
         p = self.path
         if p == "bf16":          return x @ self.Wt
-        if p == "mxint8_wonly":  return OPS.mxint8_gemv(x, self.s, self.qw, self.OUT, self.nb)
-        if p == "mxint8_wa":     return OPS.mxint8_wa_gemv(x, self.s, self.qw, self.OUT, self.nb)
+        if p == "mxint8_wonly":  return OPS.mxint8_gemv_wide(x, self.s, self.qwc, self.OUT, self.nb)
+        if p == "mxint8_wa":     return OPS.mxint8_wa_gemv_wide(x, self.s, self.qwc, self.OUT, self.nb)
         if p == "msaq_wonly":    return OPS.wonly_gemv_wide(x, self.s, self.upc, self.shc, self.OUT, self.nb, self.u, self.gs)
         if p == "msaq_wa":       return OPS.wa_gemv(x, self.s, self.upc, self.shc, self.OUT, self.nb, self.u, self.gs)
 
@@ -69,9 +70,9 @@ class QLinear:
         if B == 1: return self.gemv(X[0])[None]          # B=1 -> wide GEMV
         # B>1 W-only -> batched-decode GEMV (amortize weight read over B); else GEMM
         if p == "msaq_wonly":   return OPS.wonly_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
-        if p == "mxint8_wonly": return OPS.mxint8_gemv_batched(X, self.s, self.qw, B, self.OUT, self.nb)
+        if p == "mxint8_wonly": return OPS.mxint8_gemv_batched_wide(X, self.s, self.qwc, B, self.OUT, self.nb)
         if p == "msaq_wa":      return OPS.wa_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
-        if p == "mxint8_wa":    return OPS.mxint8_wa_gemv_batched(X, self.s, self.qw, B, self.OUT, self.nb)
+        if p == "mxint8_wa":    return OPS.mxint8_wa_gemv_batched_wide(X, self.s, self.qwc, B, self.OUT, self.nb)
         return self.gemm(X)                              # bf16 (cuBLAS)
 
 
@@ -217,10 +218,14 @@ def run_scenario(w_path, kv_path, u, gs, B, L_in, L_out, reps=30):
     # PREFILL: W-only uses the pipelined-WMMA tile (MS_TILE_CFG=11); W+A keeps auto. Popped for decode.
     if "wonly" in w_path: os.environ["MS_TILE_CFG"] = "11"
     else: os.environ.pop("MS_TILE_CFG", None)
-    m.prefill(ids, caches); torch.cuda.synchronize()
-    t0 = torch.cuda.Event(True); t1 = torch.cuda.Event(True)
-    t0.record(); m.prefill(ids, caches); t1.record(); torch.cuda.synchronize()
-    ttft = t0.elapsed_time(t1)
+    for _ in range(2): m.prefill(ids, caches)            # warmup (alloc / cuBLAS autotune)
+    torch.cuda.synchronize()
+    _tt = []
+    for _ in range(3):                                   # min-of-3: single-shot TTFT was ~2x noisy
+        t0 = torch.cuda.Event(True); t1 = torch.cuda.Event(True)
+        t0.record(); m.prefill(ids, caches); t1.record(); torch.cuda.synchronize()
+        _tt.append(t0.elapsed_time(t1))
+    ttft = min(_tt)
     os.environ.pop("MS_TILE_CFG", None)                  # decode: M-adaptive default
 
     offs = sorted({o for o in CKPT_OFF if o <= L_out} | {L_out})
@@ -236,11 +241,15 @@ def run_scenario(w_path, kv_path, u, gs, B, L_in, L_out, reps=30):
         torch.cuda.current_stream().wait_stream(s)
         gr = torch.cuda.CUDAGraph()
         with torch.cuda.graph(gr): m.decode_step(x_static, cos, sin, pos, caches)
-        torch.cuda.synchronize()
-        e0 = torch.cuda.Event(True); e1 = torch.cuda.Event(True); e0.record()
-        for _ in range(reps): gr.replay()
-        e1.record(); torch.cuda.synchronize()
-        gtpot[off] = e0.elapsed_time(e1) / reps; del gr
+        for _ in range(60): gr.replay()          # ramp mem clock to P0 (decode is BW-bound;
+        torch.cuda.synchronize()                 # a cold worker starts in a low-power P-state)
+        best = float("inf")                       # min over windows = steady-state P0 (drop throttle dips)
+        for _ in range(3):
+            e0 = torch.cuda.Event(True); e1 = torch.cuda.Event(True); e0.record()
+            for _ in range(reps): gr.replay()
+            e1.record(); torch.cuda.synchronize()
+            best = min(best, e0.elapsed_time(e1) / reps)
+        gtpot[off] = best; del gr
     peak = torch.cuda.max_memory_allocated() / 1e9
     del m, caches; gc.collect(); torch.cuda.empty_cache()
     return dict(ttft=ttft, curve=sorted(gtpot.items()), peak_gb=peak)

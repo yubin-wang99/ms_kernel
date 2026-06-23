@@ -231,9 +231,13 @@ def pack_weight_mxint8(W):
     s, q = _quant_mxint8_blocks(blocks)
     exp = np.rint(np.log2(s.reshape(-1))).astype(np.int64).reshape(OUT, nb)
     q = q.reshape(OUT, nb, BLOCK)
+    qw = np.ascontiguousarray(q.transpose(1, 2, 0).astype(np.int8))      # [nb, 32, OUT]
     return dict(
         scale_exp=np.ascontiguousarray(exp.T.astype(np.int8)),          # [nb, OUT]
-        qweight=np.ascontiguousarray(q.transpose(1, 2, 0).astype(np.int8)),  # [nb, 32, OUT]
+        qweight=qw,                                                     # [nb, 32, OUT] row-major
+        # column-major twin [nb, OUT, 32]: a column's 32 int8 bytes are CONTIGUOUS, so the
+        # decode/GEMM kernels wide-load them (1 int4x2) instead of 32 strided 1-byte reads.
+        qweight_cm=np.ascontiguousarray(q.transpose(1, 0, 2).astype(np.int8)),  # [nb, OUT, 32]
         OUT=OUT, K=K, nb=nb,
     )
 

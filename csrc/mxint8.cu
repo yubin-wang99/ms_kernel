@@ -169,6 +169,115 @@ __global__ void mxint8_wa_gemv_kernel(
     partial[(long)sp * OUT + o] = acc;
 }
 
+// ==== COLUMN-MAJOR WIDE-LOAD decode (matched to the MSAQ wide-load kernels) =========
+//   qweight_cm [nb,OUT,32]: a column's 32 int8 are CONTIGUOUS -> wide-load 32 bytes
+//   (2x int4) into registers per block instead of 32 strided 1-byte reads. The narrow
+//   path left the kernel latency-bound (ncu: SM/DRAM/L1 all ~35%); the wide load cuts
+//   the per-block load count 32->2 and reaches DRAM. Bit-identical (same int8 codes).
+__device__ __forceinline__ void mx_load_col32(const int8_t* __restrict__ qcm, long base, int8_t (&wbuf)[32]) {
+    *reinterpret_cast<int4*>(wbuf)      = __ldg(reinterpret_cast<const int4*>(qcm + base * 32));
+    *reinterpret_cast<int4*>(wbuf + 16) = __ldg(reinterpret_cast<const int4*>(qcm + base * 32 + 16));
+}
+
+__global__ void mxint8_gemv_wide_kernel(
+        const __nv_bfloat16* __restrict__ x, const int8_t* __restrict__ scale_exp,
+        const int8_t* __restrict__ qweight_cm, float* __restrict__ partial,
+        int OUT, int NB, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        int8_t wbuf[32]; mx_load_col32(qweight_cm, (long)blk * OUT + o, wbuf);
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k)
+            acc += ((float)wbuf[k] * scale) * __bfloat162float(x[blk * BLOCK + k]);
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
+template<int MR>
+__global__ void mxint8_gemv_batched_wide_kernel(
+        const __nv_bfloat16* __restrict__ x, const int8_t* __restrict__ scale_exp,
+        const int8_t* __restrict__ qweight_cm, float* __restrict__ partial,
+        int M, int OUT, int NB, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        int8_t wbuf[32]; mx_load_col32(qweight_cm, (long)blk * OUT + o, wbuf);
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            const float wf = (float)wbuf[k] * scale; const int kk = blk * BLOCK + k;
+            #pragma unroll
+            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += wf * __bfloat162float(x[(long)m * K + kk]); }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+}
+
+__global__ void mxint8_wa_gemv_wide_kernel(
+        const int8_t* __restrict__ qx, const int8_t* __restrict__ sa_exp,
+        const int8_t* __restrict__ scale_exp, const int8_t* __restrict__ qweight_cm,
+        float* __restrict__ partial, int OUT, int NB, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const float sa = ms::e8m0_to_scale(sa_exp[blk]);
+        int8_t wbuf[32]; mx_load_col32(qweight_cm, (long)blk * OUT + o, wbuf);
+        int idot = 0;
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) idot += (int)wbuf[k] * (int)qx[blk * BLOCK + k];
+        acc += (float)idot * sw * sa;
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
+template<int MR>
+__global__ void mxint8_wa_gemv_batched_wide_kernel(
+        const int8_t* __restrict__ qx, const int8_t* __restrict__ sa_exp,
+        const int8_t* __restrict__ scale_exp, const int8_t* __restrict__ qweight_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        int8_t wbuf[32]; mx_load_col32(qweight_cm, (long)blk * OUT + o, wbuf);
+        int idot[MR];
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) idot[j] = 0;
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            const int kk = blk * BLOCK + k;
+            #pragma unroll
+            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) idot[j] += (int)wbuf[k] * (int)qx[(long)m * K + kk]; }
+        }
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += (float)idot[j] * sw * ms::e8m0_to_scale(sa_exp[m * NB + blk]); }
+    }
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+}
+
 // ---- W-only prefill GEMM — SHARED-MEMORY TILED, matched to wa_gemm.cu --------
 //   Same tiling as the MSAQ kernel; only the B-tile load differs (direct int8 vs
 //   unpack), keeping the comparison matched.
@@ -305,6 +414,7 @@ __global__ void mxint8_gemm_wmma(
 // ---- W-only WMMA, SOFTWARE-PIPELINED — matched to wonly_gemm_wmma_pipe --------
 //   Same double-buffered overlap (next tile staged while current tile's MMA runs);
 //   only the B-tile load differs (direct int8 vs MSAQ unpack). Opt-in MS_TILE_CFG=11.
+template<bool CM>
 __global__ void mxint8_gemm_wmma_pipe(
         const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
         const int8_t* __restrict__ qweight, __nv_bfloat16* __restrict__ Y,
@@ -327,12 +437,27 @@ __global__ void mxint8_gemm_wmma_pipe(
             As[buf][m][k] = (m0 + m < M) ? X[(long)(m0 + m) * K + b * BLOCK + k]
                                          : __float2bfloat16(0.0f);
         }
-        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
-            const int oc = idx / BLOCK, k = idx % BLOCK, o = o0 + oc;
-            float v = 0.0f;
-            if (o < OUT) v = (float)qweight[(b * BLOCK + k) * OUT + o]
-                           * ms::e8m0_to_scale(scale_exp[b * OUT + o]);
-            Bs[buf][oc][k] = __float2bfloat16(v);
+        if constexpr (CM) {                          // column-major wide-load per column
+            for (int oc = tid; oc < 64; oc += 128) {
+                const int o = o0 + oc;
+                if (o >= OUT) {
+                    #pragma unroll
+                    for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = __float2bfloat16(0.0f);
+                    continue;
+                }
+                const float sc = ms::e8m0_to_scale(scale_exp[b * OUT + o]);
+                int8_t wbuf[32]; mx_load_col32(qweight, (long)b * OUT + o, wbuf);
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = __float2bfloat16((float)wbuf[k] * sc);
+            }
+        } else {
+            for (int idx = tid; idx < 64 * BLOCK; idx += 128) {
+                const int oc = idx / BLOCK, k = idx % BLOCK, o = o0 + oc;
+                float v = 0.0f;
+                if (o < OUT) v = (float)qweight[(b * BLOCK + k) * OUT + o]
+                               * ms::e8m0_to_scale(scale_exp[b * OUT + o]);
+                Bs[buf][oc][k] = __float2bfloat16(v);
+            }
         }
     };
 
@@ -375,6 +500,7 @@ __global__ void mxint8_gemm_wmma_pipe(
 // ---- W+A pure-int8 IMMA GEMM (activation pre-quantized) — matched to wa_imma --
 //   Same 2-stage structure; B-stage reads int8 qweight DIRECTLY (no unpack), so
 //   the MSAQ/MXINT8 delta is exactly the weight unpack. (change.md P26.)
+template<bool CM>
 __global__ void mxint8_wa_imma(
         const int8_t* __restrict__ qX, const int8_t* __restrict__ sa_exp,
         const int8_t* __restrict__ scale_exp, const int8_t* __restrict__ qweight,
@@ -394,9 +520,23 @@ __global__ void mxint8_wa_imma(
             const int m = idx >> 5, k = idx & 31;
             As[buf][m][k] = (m0 + m < M) ? qX[(long)(m0 + m) * K + blk * BLOCK + k] : (int8_t)0;
         }
-        for (int idx = tid; idx < 64 * BLOCK; idx += 128) {       // B-stage: direct int8
-            const int oc = idx >> 5, k = idx & 31, o = o0 + oc;
-            Bs[buf][oc][k] = (o < OUT) ? qweight[(long)(blk * BLOCK + k) * OUT + o] : (int8_t)0;
+        if constexpr (CM) {                                       // column-major wide-load
+            for (int oc = tid; oc < 64; oc += 128) {
+                const int o = o0 + oc;
+                if (o >= OUT) {
+                    #pragma unroll
+                    for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = (int8_t)0;
+                    continue;
+                }
+                int8_t wbuf[32]; mx_load_col32(qweight, (long)blk * OUT + o, wbuf);
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = wbuf[k];
+            }
+        } else {
+            for (int idx = tid; idx < 64 * BLOCK; idx += 128) {   // B-stage: direct int8
+                const int oc = idx >> 5, k = idx & 31, o = o0 + oc;
+                Bs[buf][oc][k] = (o < OUT) ? qweight[(long)(blk * BLOCK + k) * OUT + o] : (int8_t)0;
+            }
         }
         if (tid < 64) {
             const int o = o0 + tid;
@@ -853,7 +993,7 @@ torch::Tensor mxint8_gemm_cuda(
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB
     if (tile_cfg((int)M) == 11)     // BF16 WMMA software-pipelined, matched to MSAQ
-        mxint8_gemm_wmma_pipe<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
+        mxint8_gemm_wmma_pipe<false><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
     else if (tile_cfg((int)M) == 10)  // BF16 tensor-core (WMMA), matched to MSAQ
         mxint8_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
     else
@@ -882,9 +1022,130 @@ torch::Tensor mxint8_wa_gemm_cuda(
     auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
     ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
                         qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
-    mxint8_wa_imma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+    mxint8_wa_imma<false><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
         qweight.data_ptr<int8_t>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, (int)K, (int)NB);
+    return Y;
+}
+
+// ==== COLUMN-MAJOR WIDE-LOAD hosts (qweight_cm [nb,OUT,32]) — matched to MSAQ wide ====
+torch::Tensor mxint8_gemv_wide_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t OUT, int64_t NB) {
+    auto y = torch::empty({OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);   // wide wants more splits
+    auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
+    mxint8_gemv_wide_kernel<<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), qweight_cm.data_ptr<int8_t>(),
+        partial.data_ptr<float>(), (int)OUT, (int)NB, splitK);
+    mxint8_gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+
+torch::Tensor mxint8_gemv_batched_wide_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t M, int64_t OUT, int64_t NB) {
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto launch = [&](auto MRtag) {
+        mxint8_gemv_batched_wide_kernel<decltype(MRtag)::value><<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), qweight_cm.data_ptr<int8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+    };
+    switch (MR) { case 1: launch(std::integral_constant<int,1>{}); break;
+        case 2: launch(std::integral_constant<int,2>{}); break;
+        case 4: launch(std::integral_constant<int,4>{}); break;
+        case 8: launch(std::integral_constant<int,8>{}); break;
+        case 16: launch(std::integral_constant<int,16>{}); break;
+        default: launch(std::integral_constant<int,32>{}); break; }
+    mxint8_gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)M, (int)OUT, splitK);
+    return y;
+}
+
+torch::Tensor mxint8_wa_gemv_wide_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t OUT, int64_t NB) {
+    const int K = (int)NB * BLOCK;
+    auto qx = torch::empty({K}, x.options().dtype(torch::kInt8));
+    auto sa_exp = torch::empty({NB}, x.options().dtype(torch::kInt8));
+    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                        qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), 1, K, (int)NB);
+    auto y = torch::empty({OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
+    mxint8_wa_gemv_wide_kernel<<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+        qweight_cm.data_ptr<int8_t>(), partial.data_ptr<float>(), (int)OUT, (int)NB, splitK);
+    mxint8_gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+
+torch::Tensor mxint8_wa_gemv_batched_wide_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t M, int64_t OUT, int64_t NB) {
+    const int K = (int)NB * BLOCK;
+    auto qx = torch::empty({M, K}, x.options().dtype(torch::kInt8));
+    auto sa_exp = torch::empty({M, NB}, x.options().dtype(torch::kInt8));
+    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                        qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), (int)M, K, (int)NB);
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto launch = [&](auto MRtag) {
+        mxint8_wa_gemv_batched_wide_kernel<decltype(MRtag)::value><<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+            qweight_cm.data_ptr<int8_t>(), partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+    };
+    switch (MR) { case 1: launch(std::integral_constant<int,1>{}); break;
+        case 2: launch(std::integral_constant<int,2>{}); break;
+        case 4: launch(std::integral_constant<int,4>{}); break;
+        case 8: launch(std::integral_constant<int,8>{}); break;
+        case 16: launch(std::integral_constant<int,16>{}); break;
+        default: launch(std::integral_constant<int,32>{}); break; }
+    mxint8_gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)M, (int)OUT, splitK);
+    return y;
+}
+
+torch::Tensor mxint8_gemm_cm_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB) {       // BF16 WMMA pipe + column-major
+    auto Y = torch::empty({M, OUT}, X.options());
+    mxint8_gemm_wmma_pipe<true><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), qweight_cm.data_ptr<int8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), (int)M, (int)OUT, (int)K, (int)NB);
+    return Y;
+}
+
+torch::Tensor mxint8_wa_gemm_cm_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB) {       // INT8 IMMA + column-major
+    auto Y = torch::empty({M, OUT}, X.options());
+    auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
+    auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
+    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+                        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
+    mxint8_wa_imma<true><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+        qweight_cm.data_ptr<int8_t>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
         (int)M, (int)OUT, (int)K, (int)NB);
     return Y;
 }
