@@ -348,6 +348,46 @@ __global__ void wonly_gemv_wide_uspec(
     partial[(long)sp * OUT + o] = acc;
 }
 
+// ---- (u,gs)-specialized streaming unpack, shared by the batched/wa specialized kernels.
+//   Same rolling bit-buffer as wonly_gemv_wide_uspec, factored into a device helper that
+//   invokes `per_elem(k, word)` for each of the 32 reconstructed words. Compile-time U/GS
+//   keep the buffer schedule static (ureg register-resident) and shifts/masks constant; the
+//   callback is force-inlined so each caller's accumulation fuses back in (no word[32] spill).
+template<int U_, int GS_, typename F>
+__device__ __forceinline__ void ms_stream_block_uspec(
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        long base, F per_elem) {
+    constexpr int WBITS = 8 - U_;
+    constexpr int UBc = BLOCK * WBITS / 8;
+    constexpr int SBc = ((BLOCK / GS_) * U_ + 7) / 8;
+    constexpr int NW  = UBc / 4;
+    constexpr int NSW = (SBc + 3) / 4 > 0 ? (SBc + 3) / 4 : 1;
+    constexpr uint32_t umask = (1u << WBITS) - 1u, usign = 1u << (WBITS - 1);
+    constexpr uint32_t smask = (1u << U_) - 1u, ssign = 1u << (U_ - 1);
+    constexpr int gsmask = GS_ - 1;
+    uint32_t sreg[NSW] = {0u};
+    #pragma unroll
+    for (int i = 0; i < SBc; ++i) sreg[i >> 2] |= (uint32_t)shared_cm[base * SBc + i] << (8 * (i & 3));
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UBc);
+    uint32_t ureg[NW];
+    #pragma unroll
+    for (int i = 0; i < NW; ++i) ureg[i] = src[i];
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) {
+        if (unb < WBITS) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+        ubuf >>= WBITS; unb -= WBITS;
+        if ((k & gsmask) == 0) {
+            if (snb < U_) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+            sbuf >>= U_; snb -= U_;
+        }
+        per_elem(k, up_code * (1 << U_) + sh_code);
+    }
+}
+
 // ---- BATCHED-DECODE W-only GEMV (M=B small): amortize the weight read over B rows --
 //   The B=1 wide GEMV is memory-bound on the weight (the column read dominates; the
 //   activation is tiny). At decode batch M=B the SAME weight column serves all B rows,
@@ -412,6 +452,36 @@ __global__ void wonly_gemv_batched_kernel(
                 for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += wf * __bfloat162float(x[(long)m * K + kk]); }
             }
         }
+    }
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+}
+
+// (u,gs)-specialized batched W-only (u<4). Same as wonly_gemv_batched_kernel<false,MR>
+// but U/GS are compile-time -> register-resident streaming unpack via the helper.
+template<int U_, int GS_, int MR>
+__global__ void wonly_gemv_batched_uspec(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const long base = (long)blk * OUT + o;
+        ms_stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+            const float wf = (float)word * scale;
+            const int kk = blk * BLOCK + k;
+            #pragma unroll
+            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += wf * __bfloat162float(x[(long)m * K + kk]); }
+        });
     }
     #pragma unroll
     for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
@@ -599,6 +669,71 @@ __global__ void wa_gemv_batched_kernel(
     for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
 }
 
+// (u,gs)-specialized W+A decode (u<4): same as wa_gemv_wide_kernel<false> with a
+// compile-time register-resident unpack feeding the int dot.
+template<int U_, int GS_>
+__global__ void wa_gemv_wide_uspec(
+        const int8_t*  __restrict__ qx, const int8_t* __restrict__ sa_exp,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int OUT, int NB, int splitK) {
+    const int o   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp  = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK;
+    const int b0  = sp * per, b1 = min(b0 + per, NB);
+    extern __shared__ int8_t qx_sh[];
+    const int slice = (b1 - b0) * BLOCK;
+    for (int i = threadIdx.x; i < slice; i += blockDim.x) qx_sh[i] = qx[b0 * BLOCK + i];
+    __syncthreads();
+    if (o >= OUT) return;
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const float sa = ms::e8m0_to_scale(sa_exp[blk]);
+        const long base = (long)blk * OUT + o;
+        const int8_t* qxb = qx_sh + (blk - b0) * BLOCK;
+        int idot = 0;
+        ms_stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+            idot += word * (int)qxb[k];
+        });
+        acc += (float)idot * sw * sa;
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
+// (u,gs)-specialized batched W+A (u<4): compile-time unpack + MR int dots.
+template<int U_, int GS_, int MR>
+__global__ void wa_gemv_batched_uspec(
+        const int8_t* __restrict__ qx, const int8_t* __restrict__ sa_exp,
+        const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const long base = (long)blk * OUT + o;
+        int idot[MR];
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) idot[j] = 0;
+        ms_stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+            const int kk = blk * BLOCK + k;
+            #pragma unroll
+            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) idot[j] += word * (int)qx[(long)m * K + kk]; }
+        });
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += (float)idot[j] * sw * ms::e8m0_to_scale(sa_exp[m * NB + blk]); }
+    }
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+}
+
 } // namespace
 
 // Host launcher. Signature matches ms_lib.ops.wonly_gemv / the pybind schema.
@@ -725,6 +860,13 @@ torch::Tensor wonly_gemv_batched_cuda(
             scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
             partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
     };
+    auto launch_spec = [&](auto Ut, auto Gt, auto MRtag) {
+        wonly_gemv_batched_uspec<decltype(Ut)::value, decltype(Gt)::value, decltype(MRtag)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+    };
 #define MRDISP(U4) switch (MR) { \
         case 1:  launch(U4, std::integral_constant<int,1>{});  break; \
         case 2:  launch(U4, std::integral_constant<int,2>{});  break; \
@@ -732,8 +874,25 @@ torch::Tensor wonly_gemv_batched_cuda(
         case 8:  launch(U4, std::integral_constant<int,8>{});  break; \
         case 16: launch(U4, std::integral_constant<int,16>{}); break; \
         default: launch(U4, std::integral_constant<int,32>{}); break; }
-    if ((int)u == 4) { MRDISP(std::true_type{}); } else { MRDISP(std::false_type{}); }
+#define MRDISP_SPEC(UU,GG) switch (MR) { \
+        case 1:  launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,1>{});  break; \
+        case 2:  launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,2>{});  break; \
+        case 4:  launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,4>{});  break; \
+        case 8:  launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,8>{});  break; \
+        case 16: launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,16>{}); break; \
+        default: launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,32>{}); break; }
+    const bool nospec = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+    bool launched = false;
+    if ((int)u == 4) { MRDISP(std::true_type{}); launched = true; }
+    else if (!nospec) {
+        if      ((int)u==2 && (int)gs==8)  { MRDISP_SPEC(2,8);  launched = true; }
+        else if ((int)u==3 && (int)gs==8)  { MRDISP_SPEC(3,8);  launched = true; }
+        else if ((int)u==2 && (int)gs==16) { MRDISP_SPEC(2,16); launched = true; }
+        else if ((int)u==3 && (int)gs==16) { MRDISP_SPEC(3,16); launched = true; }
+    }
+    if (!launched) { MRDISP(std::false_type{}); }
 #undef MRDISP
+#undef MRDISP_SPEC
     gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
         (int)M, (int)OUT, splitK);
@@ -773,8 +932,23 @@ torch::Tensor wa_gemv_cuda(
             upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
             partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
     };
-    if ((int)u == 4) launch(std::true_type{});
-    else             launch(std::false_type{});
+    auto launch_spec = [&](auto Ut, auto Gt) {
+        wa_gemv_wide_uspec<decltype(Ut)::value, decltype(Gt)::value><<<dim3(blocks, splitK), threads, smem, at::cuda::getCurrentCUDAStream()>>>(
+            qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)OUT, (int)NB, splitK);
+    };
+    const bool nospec = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+    bool launched = false;
+    if ((int)u == 4) { launch(std::true_type{}); launched = true; }
+    else if (!nospec) {
+        #define SPEC(UU,GG) if (!launched && (int)u==UU && (int)gs==GG) { \
+            launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}); launched = true; }
+        SPEC(2,8) SPEC(2,16) SPEC(2,4) SPEC(2,32)
+        SPEC(3,8) SPEC(3,16) SPEC(3,4) SPEC(3,32)
+        #undef SPEC
+    }
+    if (!launched) launch(std::false_type{});
 
     gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
@@ -811,6 +985,13 @@ torch::Tensor wa_gemv_batched_cuda(
             upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
             partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
     };
+    auto launch_spec = [&](auto Ut, auto Gt, auto MRtag) {
+        wa_gemv_batched_uspec<decltype(Ut)::value, decltype(Gt)::value, decltype(MRtag)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+    };
 #define MRDISP(U4) switch (MR) { \
         case 1:  launch(U4, std::integral_constant<int,1>{});  break; \
         case 2:  launch(U4, std::integral_constant<int,2>{});  break; \
@@ -818,8 +999,25 @@ torch::Tensor wa_gemv_batched_cuda(
         case 8:  launch(U4, std::integral_constant<int,8>{});  break; \
         case 16: launch(U4, std::integral_constant<int,16>{}); break; \
         default: launch(U4, std::integral_constant<int,32>{}); break; }
-    if ((int)u == 4) { MRDISP(std::true_type{}); } else { MRDISP(std::false_type{}); }
+#define MRDISP_SPEC(UU,GG) switch (MR) { \
+        case 1:  launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,1>{});  break; \
+        case 2:  launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,2>{});  break; \
+        case 4:  launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,4>{});  break; \
+        case 8:  launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,8>{});  break; \
+        case 16: launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,16>{}); break; \
+        default: launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,32>{}); break; }
+    const bool nospec = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+    bool launched = false;
+    if ((int)u == 4) { MRDISP(std::true_type{}); launched = true; }
+    else if (!nospec) {
+        if      ((int)u==2 && (int)gs==8)  { MRDISP_SPEC(2,8);  launched = true; }
+        else if ((int)u==3 && (int)gs==8)  { MRDISP_SPEC(3,8);  launched = true; }
+        else if ((int)u==2 && (int)gs==16) { MRDISP_SPEC(2,16); launched = true; }
+        else if ((int)u==3 && (int)gs==16) { MRDISP_SPEC(3,16); launched = true; }
+    }
+    if (!launched) { MRDISP(std::false_type{}); }
 #undef MRDISP
+#undef MRDISP_SPEC
     gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
         (int)M, (int)OUT, splitK);

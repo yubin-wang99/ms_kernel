@@ -498,5 +498,23 @@ Q10(a)가 가리킨 runtime-generality 병목을 확인하고 고쳤다: generic
 상수 `WBITS`/`U`/`GS`가 상수 마스크 + **상수폭 shift**(런타임 가변 shift 대신)를 주고, `UB/4` word-load를
 `i<SB`/`i<UB>>2` 경계 분기 없이 완전 unroll하며, k-loop을 `#pragma unroll`하면 **rolling-buffer 스케줄이
 정적 해소**되어 `ureg[uwi]`가 레지스터 상주(런타임-WBITS 커널은 불가: refill 주기가 데이터 의존). +8 regs(완전
-unroll) 비용은 있으나 occupancy는 ~56% warps-active 유지. (W-only decode GEMV만 특수화; 배치/`wa` 경로는
-아직 generic이라 같은 처리 여지 있음.)
+unroll) 비용은 있으나 occupancy는 ~56% warps-active 유지.
+
+### Q12. 특수화를 배치 + W+A 경로로 확장 (리빌드, 테스트 통과)
+
+같은 `(u,gs)` 특수화를 공유 `template<int U_,int GS_,typename F>` device 헬퍼(`ms_stream_block_uspec`,
+원소별 콜백, `--expt-extended-lambda`)로 묶어 나머지 세 u<4 decode 커널에 적용: `wonly_gemv_batched_uspec`,
+`wa_gemv_wide_uspec`, `wa_gemv_batched_uspec`. 각 host launcher가 핫 조합(u∈{2,3} × gs∈{8,16}, 배치는 × 모든
+MR)을 특수화 커널로 dispatch하고 나머지는 generic fallback; `MS_GEMV_NOSPEC=1`로 generic 강제. 비트 동일
+(`max|spec−generic| = 0`, u2/u3 × gs{8,16} × M{1,4,8}); `tests/test_w.py` + `tests/test_wa.py` 전부 통과.
+
+| 경로 (u2/gs8, 4096²) | generic | **specialized** | speedup |
+|---|---|---|---|
+| `wa_gemv` (M=1, W+A decode) | 43.7 µs | **27.4 µs** | **1.59×** |
+| `wonly_gemv_batched` (M=8) | 134.5 µs | **82.0 µs** | **1.64×** |
+| `wa_gemv_batched` (M=8) | 125.0 µs | **93.5 µs** | **1.34×** |
+
+`wa_gemv` ncu(커널 단독): 46.2→25.3 µs, **DRAM 33→69%**, 명령수 **11.4 M→5.4 M**(절반), regs 46→36 — W-only
+커널과 같은 SM-bound → BW-bound 뒤집힘. (Q10에서 *naive 배치* 경로는 B-loop 연산-bound라 했지만, per-block
+weight 언팩이 그 연산의 실질 일부라 배치에도 특수화가 1.3–1.6× 도움이 된다 — 다만 큰 B에선 여전히 텐서코어
+IMMA가 답이다.)

@@ -344,5 +344,24 @@ algorithm. Why it works: constant `WBITS`/`U`/`GS` give constant masks + **const
 variable shifts), fully-unrolled `UB/4` word-loads with no `i<SB`/`i<UB>>2` bounds branch, and — with the k-loop
 `#pragma unroll`ed — a **statically-resolved rolling-buffer schedule** so `ureg[uwi]` is register-resident (the
 runtime-WBITS kernel can't: its refill cadence is data-dependent). Costs +8 regs (full unroll) but occupancy stays
-~56% warps-active. (Only the W-only decode GEMV is specialized; the batched/`wa` paths still use the generic
-kernel and could get the same treatment.)
+~56% warps-active.
+
+## 13. Extended the specialization to the batched + W+A paths (rebuilt, tests pass)
+
+The same `(u,gs)` specialization, factored into a shared `template<int U_,int GS_,typename F>` device helper
+(`ms_stream_block_uspec`, callback per element, `--expt-extended-lambda`), now covers the other three u<4
+decode kernels: `wonly_gemv_batched_uspec`, `wa_gemv_wide_uspec`, `wa_gemv_batched_uspec`. Each host launcher
+dispatches the hot combos (u∈{2,3} × gs∈{8,16}, the batched ones × all MR) to the specialized kernel and falls
+back to the generic kernel otherwise; `MS_GEMV_NOSPEC=1` forces generic. Bit-identical (`max|spec−generic| = 0`
+across u2/u3 × gs{8,16} × M{1,4,8}); `tests/test_w.py` + `tests/test_wa.py` all pass.
+
+| path (u2/gs8, 4096²) | generic | **specialized** | speedup |
+|---|---|---|---|
+| `wa_gemv` (M=1, W+A decode) | 43.7 µs | **27.4 µs** | **1.59×** |
+| `wonly_gemv_batched` (M=8) | 134.5 µs | **82.0 µs** | **1.64×** |
+| `wa_gemv_batched` (M=8) | 125.0 µs | **93.5 µs** | **1.34×** |
+
+ncu of `wa_gemv` (kernel only): 46.2→25.3 µs, **DRAM 33→69%**, instructions **11.4 M→5.4 M** (halved), regs 46→36
+— the same SM-bound → BW-bound flip as the W-only kernel. (Earlier §11 found the *naive batched* path
+compute-bound on the B-loop; the specialization still helps batched because per-block weight unpack is a real
+slice of that compute — 1.3–1.6× — though tensor-core IMMA remains the answer for large B.)
