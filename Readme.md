@@ -192,7 +192,25 @@ activation; quantizing the prefill-attention matmuls too — where *both* operan
 `u2/gs8`** (attention activations are quant-tolerant at u2, like KV: u2/gs8 +1.59% → **+2.47%**, still
 < 3.5%) but spends ~+0.9–1.0 pp of the PPL budget and pushes `u3` firmly out (`u3/gs2` +3.71% → +5.48%).
 So the W+A robust frontier stays hard-pinned at `u2`; the dominant cap is the linear-activation×weight
-path, not the attention matmuls. (`precision/aa_attn_results.md`; accuracy-only — not in the latency harness.)
+path, not the attention matmuls. (`precision/aa_attn_results.md`.)
+
+The AA kernel was also **built and measured** (documented-negative; `tests/aa_kernel_bench.py`, change.md
+Phase 49). **Prefill AA loses** to bf16 flash (2.1–2.7× at L=512–2048): it must materialize the `[H,L,L]`
+scores and **quantize the L×L softmax matrix P — O(L²) work** (tax 0.4→11.7 ms) that fused flash avoids
+entirely. **Decode AA+KV** (Q,K,V quantized; the kernel reads Q bf16 so AA latency = the KV-decode) at the
+**robust `u2/gs8`** config:
+
+| Lk | bf16 | MXINT8 | AA+KV (MSAQ u2/gs8) |
+|---|---|---|---|
+| 1024 | 190µs | 26.7µs | 31.5µs — **0.17× bf16**, 1.18× mx |
+| 4096 | 608µs | 94µs | 117.9µs — **0.19× bf16**, 1.25× mx |
+| 16384 | 2309µs | 383µs | 511µs — **0.22× bf16**, 1.34× mx |
+
+So robust AA+KV decode is **4.5–6× faster than bf16** but **loses to the matched MXINT8** (1.18–1.34×): at
+`u2` (non-nibble) the streaming unpack costs more than MXINT8's direct int8 read and the ~0.81× byte saving
+can't overcome it. Beating MXINT8 needs the `u4` nibble (0.81–0.91× mx) — which full-AA accuracy can't
+tolerate (rel ~5.6e-2). **The MSAQ-over-MXINT8 edge (needs u4) and the AA accuracy bar (needs u2) are
+mutually exclusive**; the attention win regime is decode (memory-bound), not prefill.
 
 ## Where to look (results + design)
 
@@ -207,6 +225,7 @@ path, not the attention matmuls. (`precision/aa_attn_results.md`; accuracy-only 
 | **u=4 accuracy robustness per scope** (block/scale/rotation/MX two-level) | [`precision/u4_robustness_study.md`](precision/u4_robustness_study.md) |
 | per-scope max-aggressive robust (u,gs) + PPL method (teacher forcing) | [`precision/scope_uvgs_results.md`](precision/scope_uvgs_results.md) |
 | attention activation×activation quant — robust (u,gs) shift | [`precision/aa_attn_results.md`](precision/aa_attn_results.md) |
+| AA kernel latency (prefill documented-negative / decode AA+KV vs bf16,mxint8) | `tests/aa_kernel_bench.py`, [`change.md`](change.md) Phase 49 |
 | Hadamard K-rotation (accuracy + ≈free online cost) | [`precision/rot_results.md`](precision/rot_results.md), [`precision/rot_kv_latency.md`](precision/rot_kv_latency.md) |
 | **phase-by-phase design history** (every kernel decision incl. Phase 47 batched-decode) | [`change.md`](change.md) |
 | serving workload spec (B, L_in/L_out axes) | [`kernel_ver2.md`](kernel_ver2.md) §3 |
