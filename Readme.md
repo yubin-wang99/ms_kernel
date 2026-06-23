@@ -186,6 +186,14 @@ So the **latency headline uses `u4/gs2` everywhere**; **accuracy then says which
 levers: [`precision/u4_robustness_study.md`](precision/u4_robustness_study.md),
 [`precision/rot_results.md`](precision/rot_results.md).
 
+**Attention activation×activation (Q·Kᵀ, P·V) quantization.** W+A only quantizes weight × linear-input
+activation; quantizing the prefill-attention matmuls too — where *both* operands are activations
+(quantize **Q, K, V and the softmax probs P**) — keeps the fewest-bits robust config **unchanged at
+`u2/gs8`** (attention activations are quant-tolerant at u2, like KV: u2/gs8 +1.59% → **+2.47%**, still
+< 3.5%) but spends ~+0.9–1.0 pp of the PPL budget and pushes `u3` firmly out (`u3/gs2` +3.71% → +5.48%).
+So the W+A robust frontier stays hard-pinned at `u2`; the dominant cap is the linear-activation×weight
+path, not the attention matmuls. (`precision/aa_attn_results.md`; accuracy-only — not in the latency harness.)
+
 ## Where to look (results + design)
 
 | topic | file |
@@ -197,6 +205,8 @@ levers: [`precision/u4_robustness_study.md`](precision/u4_robustness_study.md),
 | weight-matmul kernel wins (GEMV/GEMM/W+A) | [`weight_scope_results.md`](weight_scope_results.md) |
 | KV-read decode win (nibble u4/gs2 + sepsc + vpack) | [`kv_read_attempts.md`](kv_read_attempts.md), [`tests/kv_pack_results.md`](tests/kv_pack_results.md) |
 | **u=4 accuracy robustness per scope** (block/scale/rotation/MX two-level) | [`precision/u4_robustness_study.md`](precision/u4_robustness_study.md) |
+| per-scope max-aggressive robust (u,gs) + PPL method (teacher forcing) | [`precision/scope_uvgs_results.md`](precision/scope_uvgs_results.md) |
+| attention activation×activation quant — robust (u,gs) shift | [`precision/aa_attn_results.md`](precision/aa_attn_results.md) |
 | Hadamard K-rotation (accuracy + ≈free online cost) | [`precision/rot_results.md`](precision/rot_results.md), [`precision/rot_kv_latency.md`](precision/rot_kv_latency.md) |
 | **phase-by-phase design history** (every kernel decision incl. Phase 47 batched-decode) | [`change.md`](change.md) |
 | serving workload spec (B, L_in/L_out axes) | [`kernel_ver2.md`](kernel_ver2.md) §3 |
