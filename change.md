@@ -1902,3 +1902,36 @@ STEP 4 — FINAL RECOMBINATION  (how MXINT(8-u) and the u-bit INT are merged)
   unsigned low-bit sharing (naive_ms L67-78), where the low u bits are simply substituted (OR) with no
   sign and no carry. Net: MSAQ-signed reconstructs an 8-bit MXINT8 value = (upper<<u + signed-share)*E8M0,
   with the bottom u bits replaced by one signed, group-averaged (dithered/centered) residual code.
+
+## MSAQ-unsigned (floor) variant — sign-free shared residual, OR-combine
+A variant that keeps the shared code SIGN-FREE. Trick: make the residual one-sided by FLOORing the upper
+quantization (round-to-nearest leaves a +/- residual; floor leaves a >=0 residual). Then the group mean is
+unsigned and the recombine degenerates from an arithmetic ADD (with carry) to a pure bit-OR (concatenation).
+Shorthand: usat_u(v) = clamp(round(v), 0, 2^u-1)   # "unsigned u-bit saturating round-to-nearest", == ⌊v⌉_0^{2^u-1}
+
+ENCODE (per block of BLOCK=32, group gs=mg)
+  s_base = E8M0 = 2^(floor(log2(max|x|)) - 6)               # one 8-bit scale exponent / block
+  s_un   = s_base * 2^u
+  q_un   = floor(x / s_un).clamp(-2^(7-u), 2^(7-u)-1)        # signed (8-u)-bit UPPER, FLOOR (not round)
+  res    = x - q_un * s_un                                   # in [0, s_un)  -> ALWAYS >= 0 (incl. negatives)
+  shared = usat_u( mean_over_mg(res) / s_base )              # group mean -> UNSIGNED u-bit, one per group
+
+DECODE / RECOMBINE
+  x_hat  = ( (q_un << u) | shared ) * s_base                 # OR-fill the low u bits, then * scale
+         = ( q_un * 2^u + shared ) * s_base                  # (== an ADD, but no carry since low bits are 0)
+
+WHY THE 4 PARTS MATTER (vs the naive one-liner "subtract and store unsigned")
+  1. FLOOR upper  -> residual is one-sided (>=0) -> the share can be genuinely sign-free. (round-to-nearest
+     would give a signed +/- residual, which CANNOT be stored unsigned without an offset/bias or a separate
+     sign bit -- see MSAQ-signed reference above.)
+  2. usat_u(res/s_base) -> the continuous FP residual must be QUANTIZED to an integer; clamp(0,2^u-1)
+     handles the round-up-to-2^u edge (else it overflows u bits / would carry into the upper code).
+  3. mean_over_mg  -> THIS is the sharing/compression: one u-bit code per group of mg, so SB shrinks to
+     u*ceil(BLOCK/mg). Without the mean it is per-element (8-u)+u = 8 bits/elem = plain MXINT8, zero saving.
+  4. * s_base  -> the E8M0 block scale, applied once on dequant; stored once (8 bits) per block.
+
+TRADEOFF vs MSAQ-signed
+  Combine is cheaper (OR-concat, no carry) and the share needs no sign plane. But FLOOR drops round-to-
+  nearest on the upper bits (a systematic +s_un/2 bias) AND the unsigned residual can only correct UPWARD
+  within the floored cell -- it cannot borrow downward the way the signed two's-complement share does. That
+  one-directional, biased correction is exactly the accuracy gap (cf. naive_ms < msaq in the QSNR table).
