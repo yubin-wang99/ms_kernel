@@ -1745,3 +1745,35 @@ bf16 at B=1 / KV-cache / W-only+KV-long-output. Beating bf16 cuBLAS on pure W-on
 SUB-BYTE STRUCTURAL LIMIT (tensor-core staging wall OR scalar compute wall; bf16 has neither), not a
 tuning gap -- consistent with Phase 32-37. wonly_gemv_tc kept as the documented-negative artifact +
 the decode-regime split-K WMMA reference. B>=64 OOM (3090 24GB, 32-layer KV + prefill activation).
+
+# Phase 48 — Accuracy-grounded E2E: per-scope max-aggressive robust (u,gs), and what actually wins
+
+Phase 43-47 measured E2E latency at a single uniform config (u4/gs2 — kernel-optimal nibble). But u4 is
+NOT accuracy-robust for every scope, so those weight-scope wins were at a config that wouldn't ship. This
+phase pins each scope to its **max-aggressive (u,gs) within 3.5% wikitext PPL** (plain MSAQ, block=32, no
+rotation/two-level) and re-measures E2E there.
+
+**Per-scope robust sweep (`precision/scope_uvgs_sweep.py`, BF16 6.5684, 30 windows, u{2,3,4}×gs{2,4,8,16,32}):**
+  S1 weight       u3/gs16  +3.36%  5.50 b/elem   (u4 fails +6.04%)
+  S2 weight+act   u2/gs8   +1.59%  6.50          (u4 fails)
+  S3 KV           u3/gs16  +1.35%  5.50  -- and u4/gs2 +2.89% IS robust (only scope tolerating u=4)
+  S4 weight+KV    u2/gs8   +1.12%  6.50          (u4 fails)
+  S5 weight+act+KV u2/gs8  +1.93%  6.50          (u4 fails)
+KV is most quant-tolerant (u4 nibble OK); weight caps at u3, W+A at u2 (activation error compounds). The
+PPL is TEACHER-FORCED (HF sliding-window NLL; quant applied inside the full-context forward, not
+autoregressive decode). (precision/scope_uvgs_results.md.)
+
+**E2E at those configs (harness_batchsweep --perscope; S3 uses u4 per the "u=4 where robust" rule):**
+- KV-cache (S3, u4/gs2) is the ONLY clean fast-and-accurate win: decode 0.39-0.65x bf16 (grows with B and
+  L_out), total 0.51x @L_out3880, tie vs MXINT8 -- its kernel-optimal config IS accuracy-valid.
+- B=1 GEMV decode wins vs bf16 at every scope (0.81-0.94x).
+- weight/W+A pinned to u2/u3 (non-nibble): byte saving shrinks (u2 ~0.79x MXINT8 bytes) AND the streaming
+  sub-byte unpack is heavier than direct int8 -> decode mq/mx often >1 at B>1 (S2/S5 1.05-1.64; S1/S4 win
+  only at B=32, 0.58-0.60); vs bf16 they lose at B>1. At S4 long-output MXINT8 beats bf16 (0.76) but
+  MSAQ-u2 does not (1.07) -- the unpack overhead.
+
+**Takeaway (no-fake-win):** under an accuracy bar, MSAQ's E2E latency advantage concentrates in the
+KV-cache scope (u4-nibble-robust) + the B=1 decode; the uniform-u4/gs2 weight-scope wins (mq/mx 0.35-0.44
+@B32) were at a non-weight-accurate config. Closing weight/W+A needs u4 made weight-robust (rotation / MX
+two-level -- accuracy-only so far) or a faster non-nibble decode unpack. Results in
+tests/harness_perscope_results.md (vs the uniform-config tests/harness_batchsweep_results.md).
