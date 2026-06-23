@@ -12,7 +12,7 @@ Run: CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tests/aa_kernel_bench.py
 """
 import sys, os, time, numpy as np, torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "precision"))
-from ms_lib.pack import pack_kv, pack_kv_mxint8, dequant_weight
+from ms_lib.pack import pack_kv, pack_kv_mxint8, dequant_weight  # noqa
 from ms_lib import ops; assert ops.available()
 from lightms_qsnr import msaq_signed
 OPS = torch.ops.msaq
@@ -67,7 +67,7 @@ def prefill(H, L, D, u=4, gs=2, seed=0):
 
 
 def decode(Hq, Hkv, Lk, D, u=4, gs=2, seed=0):
-    """decode attention (AA+KV): K,V MSAQ cache + Q (AA) quantized."""
+    """decode AA+KV: K,V MSAQ cache + Q (AA) quantized. vs MXINT8 KV and bf16."""
     rng = np.random.default_rng(seed); nb = D // 32
     K = (rng.standard_normal((Hkv, Lk, D)) * 0.5).astype(np.float32)
     V = (rng.standard_normal((Hkv, Lk, D)) * 0.5).astype(np.float32)
@@ -75,22 +75,25 @@ def decode(Hq, Hkv, Lk, D, u=4, gs=2, seed=0):
     pk, pv = pack_kv(K, u, gs), pack_kv(V, u, gs)
     ks, ku, kh = (cuda(pk[k]) for k in ("scale_exp", "upper", "shared"))
     vs, vu, vh = (cuda(pv[k]) for k in ("scale_exp", "upper", "shared"))
+    xk, xv = pack_kv_mxint8(K), pack_kv_mxint8(V)
+    kxs, kxq = cuda(xk["scale_exp"]), cuda(xk["qweight"]); vxs, vxq = cuda(xv["scale_exp"]), cuda(xv["qweight"])
     qa = qmsaq(q, u, gs)
     g = Hq // Hkv
     Kb = cuda(K).to(torch.bfloat16).repeat_interleave(g, 0); Vb = cuda(V).to(torch.bfloat16).repeat_interleave(g, 0)
-    msaq_kv = lambda: OPS.kv_decode_attention(q, ks, ku, kh, vs, vu, vh, Hq, Hkv, Lk, D, nb, u, gs, Lk)
     msaq_aa = lambda: OPS.kv_decode_attention(qa, ks, ku, kh, vs, vu, vh, Hq, Hkv, Lk, D, nb, u, gs, Lk)
+    mx = lambda: OPS.mxint8_kv_decode(q, kxs, kxq, vxs, vxq, Hq, Hkv, Lk, D, nb, Lk)
     bf16 = lambda: torch.nn.functional.scaled_dot_product_attention(q[:, None, :], Kb, Vb)
-    for f in (msaq_kv, msaq_aa, bf16): f()
-    tk = min(_t(msaq_kv), _t(msaq_kv)); ta = min(_t(msaq_aa), _t(msaq_aa)); tb = min(_t(bf16), _t(bf16))
-    print(f"  Lk={Lk:>5} u{u}/gs{gs} | bf16 {tb*1e3:6.1f}us | KV-only {tk*1e3:6.1f}us ({tk/tb:.2f}x) | "
-          f"AA+KV {ta*1e3:6.1f}us ({ta/tb:.2f}x)")
+    for f in (msaq_aa, mx, bf16): f()
+    ta = min(_t(msaq_aa), _t(msaq_aa)); tx = min(_t(mx), _t(mx)); tb = min(_t(bf16), _t(bf16))
+    print(f"  Lk={Lk:>5} u{u}/gs{gs} | bf16 {tb*1e3:6.1f}us | mxint8 {tx*1e3:6.1f}us ({tx/tb:.2f}x) | "
+          f"AA+KV(msaq) {ta*1e3:6.1f}us ({ta/tb:.2f}x bf / {ta/tx:.2f}x mx)")
 
 
 if __name__ == "__main__":
     print("=== PREFILL AA self-attention (H=8, D=128): qk_wmma+pv_wmma vs bf16 SDPA ===")
     for L in (512, 1024, 2048):
         prefill(8, L, 128)
-    print("\n=== DECODE AA+KV (Hq=32,Hkv=8,D=128): kv_decode (Q bf16=KV-only / Q quant=AA+KV) vs bf16 ===")
-    for Lk in (1024, 4096, 16384):
-        decode(32, 8, Lk, 128)
+    print("\n=== DECODE AA+KV (Hq=32,Hkv=8,D=128) vs bf16 & MXINT8 — u2/gs8 (robust AA) and u4/gs2 ===")
+    for cfg in ((2, 8), (4, 2)):
+        for Lk in (1024, 4096, 16384):
+            decode(32, 8, Lk, 128, u=cfg[0], gs=cfg[1])

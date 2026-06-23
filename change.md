@@ -1838,3 +1838,15 @@ the solid signals are the O(L^2) P-quant tax and the decode result.)
 CONFIRMED WIN (decode AA+KV): 0.06-0.13x bf16 — the memory-bound KV-read regime; Q-quant is free (the
 kernel reads Q bf16), so AA+KV == KV-only. The attention win lives in decode, not prefill — as designed.
 (AA relerr ~5.6e-2 at u4: full-AA accuracy needs u2, per Phase 49 / aa_attn_results.md; this bench is latency.)
+
+## Phase 49 addendum 2 — AA+KV decode at the robust u2/gs8 vs BF16 and MXINT8
+Decode AA+KV (Q,K,V quantized; the kernel reads Q bf16 so AA latency == KV-decode), u2/gs8 (the AA-robust
+config) and u4/gs2 (nibble), RTX 3090:
+  u2/gs8 : Lk1024 0.17x bf / 1.18x mx | Lk4096 0.19x bf / 1.25x mx | Lk16384 0.22x bf / 1.34x mx
+  u4/gs2 : Lk1024 0.13x bf / 0.91x mx | Lk4096 0.13x bf / 0.81x mx | Lk16384 0.14x bf / 0.86x mx
+Finding: at the accuracy-robust AA config **u2/gs8, AA+KV WINS vs bf16 (0.17-0.22x) but LOSES vs MXINT8
+(1.18-1.34x)** -- u2 is non-nibble, so the streaming unpack costs more than MXINT8's direct int8 read and
+the small byte saving (u2 ~0.81x int8) doesn't overcome it. The format win over MXINT8 needs the u4 nibble
+(0.81-0.91x mx), which full-AA accuracy does NOT tolerate (rel ~5.6e-2; AA-robust is u2, aa_attn_results.md).
+So robust AA+KV is fast vs bf16 but not vs the matched MXINT8 baseline -- the MSAQ-over-MXINT8 edge and the
+AA accuracy bar are mutually exclusive here (need u4 for the former, u2 for the latter).
