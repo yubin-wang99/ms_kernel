@@ -1850,3 +1850,18 @@ the small byte saving (u2 ~0.81x int8) doesn't overcome it. The format win over 
 (0.81-0.91x mx), which full-AA accuracy does NOT tolerate (rel ~5.6e-2; AA-robust is u2, aa_attn_results.md).
 So robust AA+KV is fast vs bf16 but not vs the matched MXINT8 baseline -- the MSAQ-over-MXINT8 edge and the
 AA accuracy bar are mutually exclusive here (need u4 for the former, u2 for the latter).
+
+## Phase 49 addendum 3 — u4 nibble AA+KV accuracy: end-to-end PPL confirms the exclusion
+The "u4 doesn't tolerate AA" claim above was head-level relerr (~5.6e-2). Now measured end-to-end via
+wikitext-2 teacher-forced PPL, Llama-3.1-8B, attention Q,K,V,P MSAQ-quantized (= AA+KV), weights/linear-act
+BF16 (precision/aa_u4_ppl.py, isolates the attention path so the u4 result isn't masked by weight-u4
+failure). BF16 PPL 6.5684:
+  u4/gs2   7.1232   +8.45%   FAIL      u3/gs8   6.7593   +2.91%   OK
+  u4/gs4   7.6429  +16.36%   FAIL      u2/gs8   6.6174   +0.75%   OK
+  u4/gs8   8.0578  +22.68%   FAIL
+Finding: **every u4 config FAILs the 3.5% bar** -- even the least-shared u4/gs2 overshoots by >2x (+8.45%),
+and it worsens monotonically as gs grows (more elements share the upper code). The softmax P (wide dynamic
+range, outlier-heavy) cannot survive 4-bit codes. Only u3/u2 clear the bar. This is the SAME u4/gs2 that is
+the lone latency-winning config vs MXINT8 (addendum 2, 0.91x mx) -> that config is accuracy-dead. The
+MSAQ-over-MXINT8 edge (u4) and the AA accuracy bar (u2) are mutually exclusive -- now proven at BOTH
+head-level relerr AND end-to-end PPL. (precision/aa_u4_ppl.txt)

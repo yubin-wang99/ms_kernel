@@ -208,9 +208,14 @@ entirely. **Decode AA+KV** (Q,K,V quantized; the kernel reads Q bf16 so AA laten
 
 So robust AA+KV decode is **4.5–6× faster than bf16** but **loses to the matched MXINT8** (1.18–1.34×): at
 `u2` (non-nibble) the streaming unpack costs more than MXINT8's direct int8 read and the ~0.81× byte saving
-can't overcome it. Beating MXINT8 needs the `u4` nibble (0.81–0.91× mx) — which full-AA accuracy can't
-tolerate (rel ~5.6e-2). **The MSAQ-over-MXINT8 edge (needs u4) and the AA accuracy bar (needs u2) are
-mutually exclusive**; the attention win regime is decode (memory-bound), not prefill.
+can't overcome it. Beating MXINT8 needs the `u4` nibble (0.81–0.91× mx) — which AA accuracy can't
+tolerate. **End-to-end PPL confirms it** (`precision/aa_u4_ppl.py`; attention Q,K,V,P quantized, weights
+bf16): every `u4` config FAILs — `u4/gs2` **+8.45%**, `u4/gs4` +16.36%, `u4/gs8` +22.68% over bf16 — while
+only `u3/gs8` (+2.91%) and `u2/gs8` (+0.75%) clear the 3.5% bar. The `u4` nibble overshoots by >2× because
+the softmax `P` (wide dynamic range, outlier-heavy) cannot survive 4-bit codes. So the lone latency-winning
+config (`u4/gs2`) is accuracy-dead. **The MSAQ-over-MXINT8 edge (needs u4) and the AA accuracy bar (needs
+u2) are mutually exclusive** — proven now at both head-level relerr *and* end-to-end PPL; the attention win
+regime is decode (memory-bound), not prefill.
 
 ## Where to look (results + design)
 
