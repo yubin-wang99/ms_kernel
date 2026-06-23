@@ -1777,3 +1777,40 @@ KV-cache scope (u4-nibble-robust) + the B=1 decode; the uniform-u4/gs2 weight-sc
 @B32) were at a non-weight-accurate config. Closing weight/W+A needs u4 made weight-robust (rotation / MX
 two-level -- accuracy-only so far) or a faster non-nibble decode unpack. Results in
 tests/harness_perscope_results.md (vs the uniform-config tests/harness_batchsweep_results.md).
+
+# Phase 49 — Attention activation×activation (AA): accuracy result + quantized-attention kernel design
+
+So far only weight×activation paths were quantized (W+A). This phase asks the accuracy question for the
+prefill-attention internal matmuls — Q·Kᵀ and P·V, where BOTH operands are activations — and designs the
+kernel that would realize them, in the project's current ethos (sub-byte reuse, no-fake-win, honest walls).
+
+**Accuracy (precision/aa_attn_ppl.py, manual SDPA quantizing Q,K,V and softmax P; wikitext-2, BF16 6.5684,
+30 windows, teacher-forced, plain MSAQ block=32):**
+  W+A (attn fp)              max-aggressive robust = u2/gs8 (+1.59%); u3/gs2 +3.71% FAIL
+  W+A+AA (Q,K,V,P quantized) max-aggressive robust = u2/gs8 (+2.47%); u3/gs2 +5.48% FAIL
+- The fewest-bits robust CONFIG is UNCHANGED (u2/gs8, 6.50 b/elem): attention activations (Q,K,V,P) are
+  individually quant-tolerant at u2 (like KV). But AA spends ~+0.9-1.0pp of the PPL budget across u2
+  configs and pushes u3 from borderline-fail (+3.71%) to firmly out (+5.48%). The W+A cap stays the
+  linear-activation×weight path, not the attention matmuls. (precision/aa_attn_results.md.)
+
+**Kernel design (quantized prefill attention, MSAQ Q·Kᵀ + P·V).** Flash-attention-style, reusing the
+existing primitives — qk_wmma / pv_wmma (already do sub-byte K / V tensor-core attention) extended to
+quantize Q and P too, with the W+A 2-stage IMMA pattern (unpack sub-byte operand -> int8 tile in shared
+-> IMMA int32 -> fold the two E8M0 block scales in the epilogue):
+  Stage-0: Q,K,V -> MSAQ-s (int8 word + E8M0 per 32-block along head_dim), token-major planes (= kv_write).
+  Per (query-tile q, key-tile k), online-softmax loop (running m,l like kv_decode_combine):
+    1. Q·Kᵀ : IMMA(unpack Q_int8, unpack K_int8) -> int32 -> x (sq*sk) -> fp32 scores  (contract head_dim, 32-blocks)
+    2. softmax tile (fp32) with the running max/sum rescale
+    3. P·V  : quantize this tile's P -> MSAQ int8 (along the key axis, 32-block; key-len zero-padded to %32),
+              IMMA(P_int8, unpack V_int8) -> int32 -> x (sp*sv) -> accumulate output
+  GQA: K/V repeated to the query heads (or one block per kv-head over the G queries, as in the GQA decode kernel).
+
+**Verdict (no-fake-win, consistent with Phase 32-37/47).** This is a DESIGN, not a built kernel, because
+the analysis says it cannot win latency at prefill: prefill attention is O(L^2 D) **compute-bound** (tensor-
+core territory), and feeding tensor cores forces materializing an int8 tile (unpack Q,K,V + quantize P +
+shared staging) whose on-chip cost ~ the full int8 traffic -> the sub-byte DRAM saving is cancelled at the
+staging (the exact Phase 37/47 wall). The accuracy bar makes it worse: AA survives only at u2 (~0.81x int8
+bytes), so even the Q,K,V DRAM read (O(LD), tiny vs the O(L^2 D) compute) saves ~nothing. So the attention
+win stays where it is memory-bound — the DECODE KV-read (already won, nibble u4/gs2 + vpack) — not prefill
+AA. Building the AA kernel would be another documented-negative; the design is recorded here for when a
+quantized-attention regime (e.g. extreme-long-context where attention is memory-bound) actually warrants it.
