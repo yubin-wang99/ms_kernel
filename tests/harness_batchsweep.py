@@ -265,6 +265,7 @@ def build_args():
     ap.add_argument("--wpath"); ap.add_argument("--kvpath"); ap.add_argument("--tag", default="")
     ap.add_argument("--B", type=int, default=1); ap.add_argument("--lin", type=int, default=1024)
     ap.add_argument("--lout", type=int, default=512)
+    ap.add_argument("--perscope", action="store_true")   # use PERSCOPE_CFG (robust u/gs per scope)
     ap.add_argument("--out", default="harness_batchsweep_results.jsonl")
     return ap.parse_args()
 
@@ -290,8 +291,12 @@ def spawn(a, w, kv, u, gs, B, lin, lout, tag):
     return {"err": out.stderr[-500:]}
 
 
-def variants():                                          # (fmt,u,gs) one MSAQ config (u4/gs2, the KV winner)
-    return [("bf16", 4, 2), ("mxint8", 4, 2), ("msaq", 4, 2)]
+def variants(u=4, gs=2):                                 # (fmt,u,gs); only MSAQ uses u/gs (mx/bf ignore)
+    return [("bf16", u, gs), ("mxint8", u, gs), ("msaq", u, gs)]
+
+# per-scope max-aggressive robust config (scope_uvgs_results.md; S3 uses the u=4 nibble since robust)
+PERSCOPE_CFG = {"S1 W-only": (3, 16), "S2 W+A": (2, 8), "S3 KV-only": (4, 2),
+                "S4 W-only+KV": (2, 8), "S5 W+A+KV": (2, 8)}
 
 
 def fmt_paths(fmt, wstyle, kvq):
@@ -333,7 +338,9 @@ def main():
     jf = open(outp, "w")
     BATCHES = [1, 8, 32, 64, 128, 256]
     LOUTS = [128, 512, 1024, 2048, 3880]
-    print(f"[harness_batchsweep] {torch.cuda.get_device_name(0)} | MSAQ u{a.u}/gs{a.gs} | "
+    cfgdesc = "per-scope robust (S1 u3/gs16, S2/S4/S5 u2/gs8, S3 u4/gs2)" if a.perscope else f"u{a.u}/gs{a.gs}"
+    scope_cfg = lambda scn: PERSCOPE_CFG[scn] if a.perscope else (a.u, a.gs)
+    print(f"[harness_batchsweep] {torch.cuda.get_device_name(0)} | MSAQ {cfgdesc} | "
           f"Llama-3.1-8B {Cfg.layers}L | ratios <1 = faster (mq=msaq, mx=mxint8, bf=bf16)", flush=True)
 
     def emit(scn, wstyle, kvq, fmt, u, gs, B, lin, lout):
@@ -346,17 +353,19 @@ def main():
     # ---- batch sweep at canonical (1024, 512) ----
     print("\n==================== BATCH SWEEP  (L_in=1024, L_out=512) ====================", flush=True)
     for scn, wstyle, kvq in SCENARIOS:
-        print(f"\n--- {scn} ---", flush=True); print(_hdr("B"), flush=True)
+        cu, cg = scope_cfg(scn)
+        print(f"\n--- {scn} (MSAQ u{cu}/gs{cg}) ---", flush=True); print(_hdr("B"), flush=True)
         for B in BATCHES:
-            row = {f: emit(scn, wstyle, kvq, f, u, gs, B, 1024, 512) for f, u, gs in variants()}
+            row = {f: emit(scn, wstyle, kvq, f, u, gs, B, 1024, 512) for f, u, gs in variants(cu, cg)}
             _print_row(str(B), _ratiorow(row["bf16"], row["mxint8"], row["msaq"], 512))
 
     # ---- output sweep at fixed B=8 (L_in=1024, L_out varies; bf16 baseline must fit) ----
     OB = 8
     print(f"\n==================== OUTPUT SWEEP  (L_in=1024, B={OB}) ====================", flush=True)
     for scn, wstyle, kvq in SCENARIOS:
-        rows = {f: emit(scn, wstyle, kvq, f, u, gs, OB, 1024, 3880) for f, u, gs in variants()}
-        print(f"\n--- {scn} ---", flush=True); print(_hdr("L_out"), flush=True)
+        cu, cg = scope_cfg(scn)
+        rows = {f: emit(scn, wstyle, kvq, f, u, gs, OB, 1024, 3880) for f, u, gs in variants(cu, cg)}
+        print(f"\n--- {scn} (MSAQ u{cu}/gs{cg}) ---", flush=True); print(_hdr("L_out"), flush=True)
         for lo in LOUTS:
             _print_row(str(lo), _ratiorow(rows["bf16"], rows["mxint8"], rows["msaq"], lo))
     jf.close()

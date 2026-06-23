@@ -1,0 +1,102 @@
+[harness_batchsweep] NVIDIA GeForce RTX 3090 | MSAQ per-scope robust (S1 u3/gs16, S2/S4/S5 u2/gs8, S3 u4/gs2) | Llama-3.1-8B 32L | ratios <1 = faster (mq=msaq, mx=mxint8, bf=bf16)
+
+==================== BATCH SWEEP  (L_in=1024, L_out=512) ====================
+
+--- S1 W-only (MSAQ u3/gs16) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    0.98   4.85   4.93 |    0.85   0.84   0.98 |    0.86   0.92   1.07
+     8 |    0.98   4.57   4.69 |    1.19   1.60   1.35 |    1.14   1.83   1.60
+    32 |    0.97   4.84   4.99 |    0.60   2.77   4.59 |    0.65   3.03   4.64
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+--- S2 W+A (MSAQ u2/gs8) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    0.92   7.01   7.65 |    1.05   0.84   0.80 |    1.03   0.98   0.95
+     8 |    0.96   6.80   7.07 |    1.08   1.58   1.47 |    1.05   1.98   1.90
+    32 |    0.99   7.34   7.41 |    1.44   3.70   2.58 |    1.31   4.15   3.17
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+--- S3 KV-only (MSAQ u4/gs2) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    1.01   1.02   1.01 |    1.01   0.94   0.93 |    1.01   0.94   0.93
+     8 |    1.00   1.01   1.01 |    0.98   0.65   0.66 |    0.98   0.68   0.69
+    32 |    1.00   1.01   1.01 |    1.00   0.39   0.39 |    1.00   0.47   0.47
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+--- S4 W-only+KV (MSAQ u2/gs8) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    1.00   5.01   5.02 |    0.92   0.84   0.92 |    0.93   0.93   1.01
+     8 |    0.99   4.67   4.70 |    1.39   1.37   0.98 |    1.28   1.62   1.27
+    32 |    0.99   4.91   4.98 |    0.58   2.31   4.00 |    0.64   2.63   4.12
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+--- S5 W+A+KV (MSAQ u2/gs8) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    0.91   7.00   7.65 |    1.10   0.81   0.74 |    1.07   0.94   0.88
+     8 |    0.96   6.83   7.09 |    1.20   1.33   1.11 |    1.12   1.76   1.57
+    32 |    0.99   7.31   7.40 |    1.64   3.22   1.97 |    1.41   3.72   2.63
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+==================== OUTPUT SWEEP  (L_in=1024, B=8) ====================
+
+--- S1 W-only (MSAQ u3/gs16) ---
+ L_out |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+   128 |    0.97   4.58   4.70 |    1.20   1.65   1.38 |    1.08   2.43   2.25
+   512 |    0.97   4.58   4.70 |    1.19   1.61   1.35 |    1.14   1.84   1.61
+  1024 |    0.97   4.58   4.70 |    1.18   1.56   1.33 |    1.15   1.67   1.45
+  2048 |    0.97   4.58   4.70 |    1.16   1.48   1.28 |    1.15   1.53   1.34
+  3880 |    0.97   4.58   4.70 |    1.13   1.39   1.22 |    1.13   1.41   1.25
+
+--- S2 W+A (MSAQ u2/gs8) ---
+ L_out |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+   128 |    0.96   6.78   7.05 |    1.09   1.63   1.50 |    1.01   3.00   2.97
+   512 |    0.96   6.78   7.05 |    1.08   1.59   1.47 |    1.05   1.99   1.90
+  1024 |    0.96   6.78   7.05 |    1.08   1.54   1.43 |    1.06   1.73   1.64
+  2048 |    0.96   6.78   7.05 |    1.07   1.46   1.37 |    1.06   1.55   1.46
+  3880 |    0.96   6.78   7.05 |    1.06   1.37   1.30 |    1.05   1.41   1.34
+
+--- S3 KV-only (MSAQ u4/gs2) ---
+ L_out |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+   128 |    1.00   1.01   1.00 |    0.98   0.68   0.69 |    0.99   0.77   0.78
+   512 |    1.00   1.01   1.00 |    0.98   0.65   0.67 |    0.98   0.68   0.69
+  1024 |    1.00   1.01   1.00 |    0.97   0.62   0.64 |    0.97   0.63   0.65
+  2048 |    1.00   1.01   1.00 |    0.97   0.57   0.59 |    0.97   0.57   0.59
+  3880 |    1.00   1.01   1.00 |    0.96   0.50   0.53 |    0.96   0.51   0.53
+
+--- S4 W-only+KV (MSAQ u2/gs8) ---
+ L_out |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+   128 |    0.99   4.65   4.70 |    1.38   1.44   1.05 |    1.14   2.30   2.01
+   512 |    0.99   4.65   4.70 |    1.39   1.37   0.99 |    1.27   1.63   1.28
+  1024 |    0.99   4.65   4.70 |    1.40   1.30   0.93 |    1.33   1.43   1.07
+  2048 |    0.99   4.65   4.70 |    1.41   1.19   0.84 |    1.38   1.24   0.90
+  3880 |    0.99   4.65   4.70 |    1.44   1.05   0.73 |    1.42   1.07   0.76
+
+--- S5 W+A+KV (MSAQ u2/gs8) ---
+ L_out |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+   128 |    0.96   6.80   7.05 |    1.20   1.41   1.18 |    1.04   2.84   2.74
+   512 |    0.96   6.80   7.05 |    1.21   1.34   1.11 |    1.12   1.77   1.57
+  1024 |    0.96   6.80   7.05 |    1.22   1.28   1.05 |    1.17   1.48   1.27
+  2048 |    0.96   6.80   7.05 |    1.24   1.17   0.94 |    1.21   1.26   1.04
+  3880 |    0.96   6.80   7.05 |    1.28   1.03   0.81 |    1.26   1.07   0.85
+
+[harness_batchsweep] wrote /home/yubin/ssnf/ms/tests/harness_perscope_results.jsonl
