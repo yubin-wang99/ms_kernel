@@ -105,8 +105,23 @@ CM=true는 column-major 평면을 컬럼별 wide-load + register streaming-unpac
 | `wa_gemm` u2 | 512 | 5254 µs | **3757 µs** | **1.40×** |
 | `wa_gemm` u4 | 256 | 2680 µs | **2324 µs** | 1.15× |
 
-즉 prefill의 W-only·W+A **둘 다** 언팩-로드를 coalesce해 고쳤다. (W-only는 여전히 scalar FP32 GEMM이라
-텐서코어가 남은 직교 레버; W+A는 이미 IMMA 텐서코어 위에서 노출 언팩만 고친 것.)
+즉 prefill의 W-only·W+A **둘 다** 언팩-로드를 coalesce해 고쳤다.
+
+**W-only prefill에 BF16 WMMA 텐서코어까지 적용 — scalar 대비 1.9× (landed).** 위 scalar FP32 GEMM이 남은
+직교 레버였던 것을, software-pipelined WMMA(`wonly_gemm_wmma_pipe`)와 그 dequant 헬퍼
+(`dequant_col_stream_bf16`)를 `<bool CM>`로 템플릿화해 **텐서코어 + column-major wide-load dequant**(언팩이
+MMA와 overlap)를 결합. 새 op `wonly_gemm_tc`, `ops.wonly_gemm` 기본 경로(`MS_GEMM_SCALAR=1`→scalar cm,
+`MS_GEMM_ROWMAJOR=1`→구 row-major). bf16 연산(fp32 누산)이지만 **정확도 동일**(rel ~3.6e-3 = scalar fp32와
+같음; bf16 반올림 < K=4096 reduction 오차), `test_w.py` 통과:
+
+| 경로 (u2, 4096²) | M | scalar cm | **WMMA tc** | speedup |
+|---|---|---|---|---|
+| `wonly_gemm` | 256 | 1201 µs | **634 µs** | **1.90×** |
+| `wonly_gemm` | 512 | 2139 µs | **1123 µs** | **1.91×** |
+
+원 row-major scalar(≈1565 µs) 대비 ~2.5×, row-major WMMA pipe(894 µs) 대비 coalesced 언팩이 1.41× 더.
+(단 raw bf16 cuBLAS 133 µs와는 여전히 거리 — MSAQ의 가치는 weight 바이트 절감이고, 이 크기에선 dequant가
+지배. weight-DRAM-bound 영역/디코드에서 진가.)
 
 ## 3. 일반 교훈 — 특수화가 먹히는 조건
 
@@ -128,13 +143,15 @@ CM=true는 column-major 평면을 컬럼별 wide-load + register streaming-unpac
   - decode (u,gs) 특수화: `csrc/w_gemv.cu`(4커널), `ms::stream_block_uspec`(`csrc/core/ms_utils.cuh`),
     `setup.py`(`--expt-extended-lambda`). 1.34–1.86×.
   - KV-decode (u,gs) 특수화: `csrc/kv_attention.cu`(`kv_decode_wide_kernel<…,U_,GS_>`). 1.31×.
-  - prefill column-major wide-load: `csrc/wa_gemm.cu`(W-only `wonly_gemm_tiled_cm`+`wonly_gemm_cm`;
-    W+A `wa_imma<true>`+`wa_gemm_cm`), `csrc/pybind.cpp`, `ms_lib/ops.py`(둘 다 기본 경로).
-    W-only 1.2–1.26×, W+A 1.15–1.40×.
+  - prefill column-major wide-load: `csrc/wa_gemm.cu`(W-only scalar `wonly_gemm_tiled_cm`+`wonly_gemm_cm`;
+    W+A `wa_imma<true>`+`wa_gemm_cm`), `csrc/pybind.cpp`, `ms_lib/ops.py`. W-only scalar 1.2–1.26×, W+A 1.15–1.40×.
+  - prefill W-only **WMMA 텐서코어 + column-major**: `wonly_gemm_wmma_pipe<true>`+`wonly_gemm_tc` op
+    (`ms_lib.ops.wonly_gemm` 기본). scalar 대비 **1.9×**.
 - **미적용(documented negative)**: prefill (u,gs) 연산 특수화(load-bound, reverted), KV-append(launch-bound).
-- **토글**: `MS_GEMV_NOSPEC=1`(decode/KV generic), `MS_GEMM_ROWMAJOR=1`(prefill 구 row-major).
+- **토글**: `MS_GEMV_NOSPEC=1`(decode/KV generic), `MS_GEMM_ROWMAJOR=1`(prefill 구 row-major),
+  `MS_GEMM_SCALAR=1`(W-only prefill scalar cm, WMMA 대신).
 - **검증**: 전 경로 `max|spec−generic|=0` / `max|cm−row|=0`; `test_w`+`test_wa`+`test_kv` 통과.
 - **문서**: [compile_time_optimization.md](EN+KO, 메커니즘), [packing_explained.md] §7–§13 /
   [packing_explained_korean.md] Q5–Q12(전 과정), 본 파일(요약).
-- **남은 후과제**: prefill에 텐서코어(WMMA/IMMA)를 기본화(현재 scalar FP32 GEMM이 직교 병목); W+A
-  prefill(`wa_imma`)/wmma override도 column-major wide-load 적용 여지.
+- **남은 후과제**: MSAQ prefill은 raw bf16 cuBLAS와 아직 거리(dequant 지배) — weight-DRAM-bound 영역/배치
+  decode에서 진가; CUTLASS custom-iterator로 dequant를 prologue에 녹이면 더 좁힐 여지.
