@@ -196,3 +196,153 @@ cleanly-aligned `uint4`+`uint2` loads, but at single-request decode that doesn't
 not an implementation artifact: any non-power-of-2 code split into aligned sub-fields must be reassembled, and
 the reassembly is the cost. The genuine lever remains **u=4** (the upper code IS 4 bits, so no reassembly:
 single `bfe`, fewest bytes, best sector-util — the 1.34× winner in §7).
+
+## 9. "Not BW-bound" ⇒ can we drive it INTO the BW-bound region? (measured)
+
+If single-request decode is latency/occupancy-bound (§7), the natural idea is: push it toward the BW roofline by
+fetching more. The subtlety: **you can't fetch *more* — the byte count is fixed** (each weight is read exactly
+once: 13.6 MB for this u2 GEMV). The real lever is not bigger fetches but **more concurrent in-flight requests**
+(occupancy / split-K / MLP / batching) to hide DRAM latency so the fixed bytes stream faster. Sweeping split-K on
+the §8 prototype (concurrency knob; same kernel, same bytes):
+
+| split-K | time | DRAM% | SM% | warp-occ% | DRAM bytes |
+|---|---|---|---|---|---|
+| 1  | 136 µs | 11.1 | 8.5 | 16.7 | 13.64 MB |
+| 8  | 27.2 µs | 59.1 | 46.5 | 25.7 | 13.70 MB |
+| 32 | **25.8 µs** | **68.0** | 55.7 | 73.7 | 13.82 MB |
+| — BW roofline (13.6 MB / 936 GB/s) | **14.6 µs** | 100 | — | — | — |
+
+Reading:
+1. **The intuition is right (in direction).** More concurrency drove DRAM 11→68% and time 136→26 µs (5.3×):
+   latency-bound → toward BW-bound, exactly as hoped.
+2. **But "fetch more" is the wrong mental model — bytes are FIXED.** `dram__bytes` is ~constant (13.64→13.82 MB)
+   across all split-K; the win came from occupancy (16.7→73.7%), i.e. more *concurrent* fetches of the *same*
+   bytes, not larger ones. (Per-thread width is already maxed at `uint4`=16 B; going wider isn't one instruction
+   and would cut occupancy.)
+3. **It plateaus at ~68% DRAM / 26 µs — ~1.8× short of the 14.6 µs roofline.** The wall is **sector utilization**:
+   u2-streaming delivers only 15.7% useful bytes per 32 B sector, so the L1TEX/L2 pipe saturates moving
+   half-wasted sectors before DRAM hits 100%. *This* is where "more useful bytes per transaction" (alignment —
+   what split4's `uint4`+`uint2` raised to 48%) actually lifts the ceiling; it just didn't matter at B=1 where the
+   kernel re-hit an instruction wall (§8).
+
+So the levers that genuinely move the roofline (vs. just reaching it): (a) **sector-utilization** (alignment / less
+waste per fetch) raises the plateau; (b) **batch B>1** reuses each weight across tokens → arithmetic intensity up →
+ride the roofline until compute-bound (the repo's batched-decode path); (c) **fewer bits/elem (u4)** lowers the
+roofline itself (14.6 → ~9 µs). Note the production `wonly_gemv` measured 50 µs / DRAM 31% (§7) vs this lean
+prototype's 26 µs / DRAM 68% at split-K 32 — the production kernel (sepsc path, 96 regs, lower occupancy) leaves
+BW on the table, so raising its occupancy / trimming per-thread ALU is real, untapped headroom.
+
+## 10. Occupancy bump + sector-util max — why neither helps the u2 GEMV (measured)
+
+Three follow-ups, all measured on the production/prototype u2 GEMV.
+
+**(a) Why is per-sector useful-bytes so low (15.7%)?** Column-major `upper_cm[nb,OUT,UB]`: thread `o` owns
+column `o`, its `UB` bytes contiguous. But `UB=24` is not a power-of-2 vector width, so the block loads as
+6× `uint32`. Within *one* word-load instruction, lane `o` addresses `base + o*24 + i*4` → the warp's 32 lanes
+are **strided by 24 bytes** (4 useful bytes each), spanning ~24 sectors of 32 B → 128 useful / 768 fetched =
+**16.7%** per instruction. u4 escapes this: `UB=16` = one `uint4`, lane stride 16 = load width → 32 lanes cover
+512 contiguous bytes → high util.
+
+**(b) Maximize sector-util — `bytesplit` (the "load the block, split in registers" idea, done right).** A literal
+single fat plane can't coalesce (stride 24/26 ≠ power-of-2). The fix is to split the 24 **bytes** (not the codes)
+into a 16 B + 8 B plane so each plane's per-thread stride equals its load width (`uint4`=16, `uint2`=8), then run
+the **same** rolling 6-bit unpack over the 6 registers — codes straddle the 16/24 boundary naturally, so **no
+reassembly** (unlike split4). Measured at split-K 32:
+
+| kernel | sector-util% | DRAM% | DRAM bytes | inst | regs | time |
+|---|---|---|---|---|---|---|
+| streaming (6× uint32) | 15.7 | 67.2 | 13.76 MB | 5.47 M | 39 | 26.3 µs |
+| **bytesplit (uint4+uint2)** | **48.3** | 68.4 | 13.67 MB | **5.41 M** | 38 | 26.0 µs |
+| split4 (semantic split) | 48.3 | 58.4 | 13.80 MB | 6.49 M | 40 | 26.1 µs |
+
+`bytesplit` gets split4's coalescing at streaming's instruction count (bit-identical output) — mechanically the
+best of both. **But time is unchanged.** Why: `dram__bytes` is the *same* for all three. The "wasted" sector bytes
+in streaming's strided loads are immediately reused by the next of the 6 word-loads (all 6 words of all 32 columns
+live in one 768 B run → L2 serves them once). So low sector-util inflated only L1 *request* count, not DRAM
+traffic, and the kernel isn't L1-request-bound. **Sector-util is a red herring for the column-major weight GEMV**
+(it bit because L2 absorbs the redundancy) — unlike KV token-major, where each thread reads a distinct key once and
+the half-wasted sector is never reused (there raising sector-util is a real win).
+
+**(c) Bump production occupancy + re-measure.** Knobs are env-only (`MS_GEMV_SPLITK_MULT`, `MS_GEMV_SEPSC`; no
+rebuild). Full-op u2 timing (kernel+combine): default `MULT=16`→44.9 µs, `32`→43.8 µs, `64`→48.0 µs (over-split
+hurts). ncu of the wide kernel (`MULT=32`): **warps-active 71.7%** (already high, reg-limited at 48 regs),
+**SM 61.5% vs DRAM 33%**, sector-util 15.7%. So production u2 is **SM/issue-bound at high occupancy — not
+occupancy-bound and not memory-bound.** Bumping split-K therefore can't help; the limiter is per-element ALU
+(unpack + separated-scale accumulation). `sepsc=1` (48.8 µs) does beat `sepsc=0` (53.8 µs), as its comment claims.
+
+**Synthesis across §7–10.** u2/u3 GEMV decode is fundamentally **SM/ALU-bound** at single-request sizes. None of
+{more occupancy, better coalescing/sector-util, straddle removal} helps, because none reduces per-element ALU. The
+only levers that move it are **fewer bytes + fewer unpack ops simultaneously** — i.e. **u=4** (one `bfe`, 16 B, no
+reassembly: 33–38 µs vs u2's 44–50 µs) — or **batch B>1** to amortize. (A *lean* u2 kernel can reach 26 µs /
+68% DRAM, so production's u2 wide kernel — 2× that, SM-bound — has headroom, but in ALU/registers, not occupancy.)
+
+## 11. Is sepsc the bloat? + batch scaling (measured)
+
+**(a) sepsc is NOT the production bloat.** Added the separated-scale accumulate to the *lean* u2 kernel
+(`gemv_u2_sepsc`, bytesplit loads) and compared to the per-element path, same config:
+
+| lean variant (split-K 32) | time | vs streaming |
+|---|---|---|
+| streaming (per-elem) | 32.5 µs | 1.00× |
+| bytesplit (per-elem) | 32.8 µs | 0.99× |
+| sepsc (separated-scale) | 31.9 µs | 1.02× |
+
+All within noise → **sepsc neither helps nor hurts in the lean kernel.** So the production 48 µs vs lean 26–32 µs gap
+is *not* sepsc. The remaining suspect is **runtime-generality**: production passes `u,gs,UB,SB` as runtime ints
+(variable-width shifts, extra registers, no clean unroll), while the lean kernel hardcodes u2/gs8 at compile time.
+Specializing the production kernel per-(u,gs) is the likely headroom — not occupancy, not sepsc.
+
+**(b) Batch scaling.** Batched kernel unpacks each weight once per block and reuses it across B tokens (amortizes
+weight-DRAM + unpack-ALU). Sweep vs dense bf16 matmul (cuBLAS, tensor cores):
+
+| B | naive-MSAQ µs | µs/tok | bf16 µs | bf16 µs/tok |
+|---|---|---|---|---|
+| 1  | 35.5 | 35.5 | 44.0 | 44.0 |
+| 2  | 35.5 | 17.8 | 44.1 | 22.1 |
+| 4  | 59.8 | 15.0 | 44.2 | 11.0 |
+| 8  | 111  | 13.9 | 44.2 | 5.5 |
+| 16 | 179  | 11.2 | 44.8 | 2.8 |
+| 32 | 369  | 11.5 | 44.7 | 1.4 |
+
+Reading: **MSAQ µs/token does fall with B** (35→11.5: weight-read amortization works, as §9 predicted). **But total
+time grows ~linearly past B=2, and MSAQ loses to bf16 per-token beyond B≈2.** Why: the naive kernel reuses the
+*weight* but does the B dot-products as **scalar fp32 madds on CUDA cores**, and the `x[b*K+…]` activation reads
+stride by K (uncoalesced) — so compute, not weight-BW, dominates as B grows. bf16 matmul is flat ~44 µs (B≈free)
+because cuBLAS rides **tensor cores**. The lesson: amortizing the weight read is necessary but not sufficient — a
+competitive batched path must feed **tensor cores** (INT8 IMMA), i.e. the repo's `wa_gemm`/batched-decode path, not
+a scalar reuse loop. (`wa_gemm` was verified correct here (rel ~3%) but showed a flat ~600 µs per-call fixed
+overhead in this isolated microbench, unrepresentative of its tuned regime — proper batched eval belongs in the
+repo's batched harness.) Net: single-token decode favors the byte/ALU-lean MSAQ kernel; once B grows past ~2,
+tensor-core paths win and the right comparison is INT8-IMMA-MSAQ vs bf16, not scalar MSAQ.
+
+## 12. Landed: (u,gs)-specialized production kernel — 1.8× (rebuilt, tests pass)
+
+§11(a) pointed at runtime-generality as the production bloat. Confirmed and fixed: added
+`wonly_gemv_wide_uspec<int U, int GS>` (compile-time `U/GS/WBITS/UB/SB`) next to the generic
+`wonly_gemv_wide_kernel<false>`, with `wonly_gemv_wide_cuda` dispatching known combos to it and falling back to
+the generic kernel otherwise (`MS_GEMV_NOSPEC=1` forces generic for A/B). Bit-identical (`max|spec−generic| = 0`
+across u2/u3 × gs8/16); all 45 `tests/test_w.py` pass.
+
+| config | generic (full op) | **specialized** | speedup |
+|---|---|---|---|
+| u2/gs8 | 45.1 µs | **25.7 µs** | **1.76×** |
+| u3/gs8 | 43.9 µs | **23.6 µs** | **1.86×** |
+
+ncu of the specialized u2 kernel vs the generic (§10c):
+
+| | generic | specialized |
+|---|---|---|
+| time (kernel) | 48.8 µs | **25.3 µs** (1.93×) |
+| SM% | 61.5 | 52.6 |
+| DRAM% | 33.3 | **65.6** |
+| instructions | 5.47 M | 5.33 M |
+| regs/thread | 48 | 56 |
+
+The kernel **flipped from SM-bound (61% SM / 33% DRAM) to BW-bound (53% SM / 66% DRAM)** — i.e. it now reaches the
+~68% DRAM plateau the lean prototype hit (§9), confirming the gap was compile-time-resolvable overhead, not
+algorithm. Why it works: constant `WBITS`/`U`/`GS` give constant masks + **constant-width shifts** (vs runtime
+variable shifts), fully-unrolled `UB/4` word-loads with no `i<SB`/`i<UB>>2` bounds branch, and — with the k-loop
+`#pragma unroll`ed — a **statically-resolved rolling-buffer schedule** so `ureg[uwi]` is register-resident (the
+runtime-WBITS kernel can't: its refill cadence is data-dependent). Costs +8 regs (full unroll) but occupancy stays
+~56% warps-active. (Only the W-only decode GEMV is specialized; the batched/`wa` paths still use the generic
+kernel and could get the same treatment.)

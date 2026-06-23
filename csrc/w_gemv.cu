@@ -283,6 +283,71 @@ __global__ void wonly_gemv_wide_kernel(
     partial[(long)sp * OUT + o] = acc;
 }
 
+// ---- (u,gs)-SPECIALIZED wide GEMV (u<4): same streaming unpack as the generic kernel
+//   above, but U/GS/WBITS/UB/SB are COMPILE-TIME constants. That lets the compiler (a)
+//   use constant masks + constant-width shifts (vs runtime variable shifts), (b) fully
+//   unroll the UB/4 word-loads with no `i<SB`/`i<UB>>2` bounds branch, and (c) with the
+//   k-loop unrolled, STATICALLY resolve the rolling bit-buffer refill schedule so `ureg`
+//   is register-resident (the runtime-WBITS kernel can't — the refill cadence depends on
+//   wbits). Measured lean-prototype evidence: this takes u2 from ~48 us to ~26-32 us
+//   (BW-bound) on a 4096^2 GEMV. Bit-identical to wonly_gemv_wide_kernel<false>.
+template<int U_, int GS_>
+__global__ void wonly_gemv_wide_uspec(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial,
+        int OUT, int NB, int splitK, int sepsc) {
+    constexpr int WBITS = 8 - U_;
+    constexpr int UBc = BLOCK * WBITS / 8;               // u2:24 u3:20
+    constexpr int SBc = ((BLOCK / GS_) * U_ + 7) / 8;
+    constexpr int NW  = UBc / 4;                          // upper words: u2:6 u3:5
+    constexpr int NSW = (SBc + 3) / 4 > 0 ? (SBc + 3) / 4 : 1;
+    constexpr uint32_t umask = (1u << WBITS) - 1u, usign = 1u << (WBITS - 1);
+    constexpr uint32_t smask = (1u << U_) - 1u, ssign = 1u << (U_ - 1);
+    constexpr int gsmask = GS_ - 1;
+    const int o  = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK;
+    const int b0 = sp * per, b1 = min(b0 + per, NB);
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const long sbase = ((long)blk * OUT + o) * SBc;
+        uint32_t sreg[NSW] = {0u};
+        #pragma unroll
+        for (int i = 0; i < SBc; ++i) sreg[i >> 2] |= (uint32_t)shared_cm[sbase + i] << (8 * (i & 3));
+        const uint32_t* srcp = reinterpret_cast<const uint32_t*>(
+                                   upper_cm + ((long)blk * OUT + o) * UBc);
+        uint32_t ureg[NW];
+        #pragma unroll
+        for (int i = 0; i < NW; ++i) ureg[i] = srcp[i];
+        uint64_t ubuf = 0; int unb = 0, uwi = 0;
+        uint64_t sbuf = 0; int snb = 0, swi = 0;
+        int sh_code = 0;
+        float bup = 0.0f, bsh = 0.0f, xsum = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {                 // unrolled -> static buffer schedule
+            if (unb < WBITS) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+            const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+            ubuf >>= WBITS; unb -= WBITS;
+            const float xk = __bfloat162float(x[blk * BLOCK + k]);
+            if ((k & gsmask) == 0) {
+                if (sepsc && k > 0) bsh += sh_code * xsum;
+                if (snb < U_) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+                sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+                sbuf >>= U_; snb -= U_; xsum = 0.0f;
+            }
+            if (sepsc) { bup += up_code * xk; xsum += xk; }
+            else acc += (static_cast<float>(up_code * (1 << U_) + sh_code) * scale) * xk;
+        }
+        if (sepsc) { bsh += sh_code * xsum; acc += scale * ((float)(1 << U_) * bup + bsh); }
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
 // ---- BATCHED-DECODE W-only GEMV (M=B small): amortize the weight read over B rows --
 //   The B=1 wide GEMV is memory-bound on the weight (the column read dominates; the
 //   activation is tiny). At decode batch M=B the SAME weight column serves all B rows,
@@ -611,8 +676,27 @@ torch::Tensor wonly_gemv_wide_cuda(
             upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
             partial.data_ptr<float>(), (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK, sepsc);
     };
-    if ((int)u == 4) launch(std::true_type{});
-    else             launch(std::false_type{});
+    // (u,gs)-specialized fast path for u<4 (compile-time constants); the generic kernel
+    // is the fallback for any combo not instantiated below. Bit-identical either way.
+    // MS_GEMV_NOSPEC=1 forces the generic path (for A/B timing).
+    auto launch_spec = [&](auto Ut, auto Gt) {
+        wonly_gemv_wide_uspec<decltype(Ut)::value, decltype(Gt)::value><<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)OUT, (int)NB, splitK, sepsc);
+    };
+    const bool nospec = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+    bool launched = false;
+    if ((int)u == 4) { launch(std::true_type{}); launched = true; }
+    else if (!nospec) {
+        #define SPEC(UU, GG) if (!launched && (int)u == UU && (int)gs == GG) { \
+            launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}); launched = true; }
+        SPEC(2, 8) SPEC(2, 16) SPEC(2, 4) SPEC(2, 32)
+        SPEC(3, 8) SPEC(3, 16) SPEC(3, 4) SPEC(3, 32)
+        #undef SPEC
+    }
+    if (!launched) launch(std::false_type{});   // generic u<4 fallback
 
     gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
@@ -713,7 +797,10 @@ torch::Tensor wa_gemv_batched_cuda(
     auto y = torch::empty({M, OUT}, x.options());
     const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
     const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
-    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    // W+A holds idot[MR] (int) + acc[MR] (float) -> 2x the accumulators of W-only, so MR=32
+    // spills; cap MR (tile M) to stay in registers. Default 8 (env MS_WA_MR to tune).
+    int mrcap = 8; if (const char* e = getenv("MS_WA_MR")) mrcap = atoi(e);
+    int MR = 1; while (MR < (int)M && MR < mrcap) MR <<= 1;
     const int nTiles = (int)((M + MR - 1) / MR);
     auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
     dim3 grid(blocks, splitK, nTiles);
