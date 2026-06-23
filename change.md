@@ -1865,3 +1865,40 @@ range, outlier-heavy) cannot survive 4-bit codes. Only u3/u2 clear the bar. This
 the lone latency-winning config vs MXINT8 (addendum 2, 0.91x mx) -> that config is accuracy-dead. The
 MSAQ-over-MXINT8 edge (u4) and the AA accuracy bar (u2) are mutually exclusive -- now proven at BOTH
 head-level relerr AND end-to-end PPL. (precision/aa_u4_ppl.txt)
+
+## MSAQ-signed format reference — the residual/share formats and final recombination
+(Grounded in precision/lightms_qsnr.py: msaq_signed L33-40, _unshared L26-31, kernel-int form L52-65;
+bit accounting single_level_mantissa_sharing.py:642.) Per block of BLOCK=32, group size gs=mg.
+
+STEP 1 — base scale + unshared upper (the "MXINT (8-u)" part)
+  s_base = E8M0 = 2^(floor(log2(max|x|)) - 6)        # one 8-bit scale exponent per block
+  s_un   = s_base * 2^u                               # unshared quantum = base LSB shifted up by u
+  q_un   = round(x / s_un).clamp(-(2^(7-u)-1), 2^(7-u)-1)
+  x_un   = q_un * s_un
+  -> q_un is an (8-u)-bit SIGNED two's-complement code (UB = (8-u) bits/elem). This is the MXINT upper.
+
+STEP 2 — the DIFFERENCE  res = x - x_un  (BF16 original minus the MXINT-upper dequant)
+  Format: a SIGNED full-precision (FP) residual. Because x_un is round-to-nearest, |res| <= s_un/2 =
+  s_base*2^(u-1), i.e. in base-LSB units res/s_base lies in (-2^(u-1), +2^(u-1)] -- it occupies exactly
+  the LOW u BITS of the MXINT8 grid, carrying a sign. Not an integer yet: it is signed FP.
+
+STEP 3 — group mean -> quantize the difference (the "u-bit INT" share)
+  res_avg = mean over the mg elements of the group            # still signed FP, one value per group
+  shared  = round(res_avg / s_base).clamp(-(2^(u-1)), 2^(u-1)-1)
+  -> shared is a u-bit SIGNED two's-complement integer (range [-2^(u-1), 2^(u-1)-1]). One code per group.
+  SIGN: yes, signed; the sign is the MSB of the u-bit code, INCLUDED in u (u = 1 sign + (u-1) magnitude).
+  SB storage = u * ceil(BLOCK/mg) bits/block -> SB COUNTS the sign (encoding='twos_complement', no
+  separate sign plane; sign_magnitude would instead store +1 sign bit/elem -- not what MSAQ-signed uses).
+
+STEP 4 — FINAL RECOMBINATION  (how MXINT(8-u) and the u-bit INT are merged)
+  x_hat = x_un + shared * s_base
+        = q_un*s_base*2^u + shared*s_base
+        = ( q_un * 2^u + shared ) * s_base               # == kernel form (qu*pw + shared)*s, L65
+        = ( (q_un << u) + shared ) * s_base
+  The upper code q_un is shifted up by u bit-positions and the SIGNED u-bit share is ARITHMETICALLY ADDED
+  (not OR'd / not bit-concatenated). full_code = (q_un << u) + shared is an 8-bit SIGNED integer on the
+  MXINT8 grid whose low u bits are the per-group shared value. Because `shared` is signed it can be
+  negative, so the add can borrow/carry into the upper bits -- this is the key difference from naive
+  unsigned low-bit sharing (naive_ms L67-78), where the low u bits are simply substituted (OR) with no
+  sign and no carry. Net: MSAQ-signed reconstructs an 8-bit MXINT8 value = (upper<<u + signed-share)*E8M0,
+  with the bottom u bits replaced by one signed, group-averaged (dithered/centered) residual code.
