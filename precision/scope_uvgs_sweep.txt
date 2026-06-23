@@ -1,0 +1,71 @@
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 75.30it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tok | BF16 PPL = 6.5684 | max_win=30 | criterion <= +3.5% | baseline pass 16s
+
+=== S1 weight ===
+   u2/gs2  :  +0.37%  OK  (7.25 b/elem)
+   u2/gs4  :  +0.64%  OK  (6.75 b/elem)
+   u2/gs8  :  +0.79%  OK  (6.50 b/elem)
+   u2/gs16 :  +0.92%  OK  (6.50 b/elem)
+   u2/gs32 :  +0.83%  OK  (6.50 b/elem)
+   u3/gs2  :  +1.92%  OK  (6.75 b/elem)
+   u3/gs4  :  +2.77%  OK  (6.00 b/elem)
+   u3/gs8  :  +2.92%  OK  (5.75 b/elem)
+   u3/gs16 :  +3.36%  OK  (5.50 b/elem)
+   u3/gs32 :  +3.53%  FAIL  (5.50 b/elem)
+   u4/gs2  :  +6.04%  FAIL  (6.25 b/elem)
+   -> MAX-aggressive robust: u3/gs16 (+3.36%, 5.50 b/elem)
+
+=== S2 weight+act ===
+   u2/gs2  :  +0.79%  OK  (7.25 b/elem)
+   u2/gs4  :  +1.47%  OK  (6.75 b/elem)
+   u2/gs8  :  +1.59%  OK  (6.50 b/elem)
+   u2/gs16 :  +1.77%  OK  (6.50 b/elem)
+   u2/gs32 :  +1.73%  OK  (6.50 b/elem)
+   u3/gs2  :  +3.71%  FAIL  (6.75 b/elem)
+   -> MAX-aggressive robust: u2/gs8 (+1.59%, 6.50 b/elem)
+
+=== S3 KV ===
+   u2/gs2  :  +0.21%  OK  (7.25 b/elem)
+   u2/gs4  :  +0.18%  OK  (6.75 b/elem)
+   u2/gs8  :  +0.23%  OK  (6.50 b/elem)
+   u2/gs16 :  +0.29%  OK  (6.50 b/elem)
+   u2/gs32 :  +0.30%  OK  (6.50 b/elem)
+   u3/gs2  :  +0.60%  OK  (6.75 b/elem)
+   u3/gs4  :  +0.86%  OK  (6.00 b/elem)
+   u3/gs8  :  +1.25%  OK  (5.75 b/elem)
+   u3/gs16 :  +1.35%  OK  (5.50 b/elem)
+   u3/gs32 :  +1.33%  OK  (5.50 b/elem)
+   u4/gs2  :  +2.89%  OK  (6.25 b/elem)
+   u4/gs4  :  +4.26%  FAIL  (5.25 b/elem)
+   -> MAX-aggressive robust: u3/gs16 (+1.35%, 5.50 b/elem)
+
+=== S4 weight+KV ===
+   u2/gs2  :  +0.58%  OK  (7.25 b/elem)
+   u2/gs4  :  +0.91%  OK  (6.75 b/elem)
+   u2/gs8  :  +1.12%  OK  (6.50 b/elem)
+   u2/gs16 :  +1.29%  OK  (6.50 b/elem)
+   u2/gs32 :  +1.11%  OK  (6.50 b/elem)
+   u3/gs2  :  +2.78%  OK  (6.75 b/elem)
+   u3/gs4  :  +4.22%  FAIL  (6.00 b/elem)
+   u4/gs2  :  +9.32%  FAIL  (6.25 b/elem)
+   -> MAX-aggressive robust: u2/gs8 (+1.12%, 6.50 b/elem)
+
+=== S5 weight+act+KV ===
+   u2/gs2  :  +1.21%  OK  (7.25 b/elem)
+   u2/gs4  :  +1.63%  OK  (6.75 b/elem)
+   u2/gs8  :  +1.93%  OK  (6.50 b/elem)
+   u2/gs16 :  +2.04%  OK  (6.50 b/elem)
+   u2/gs32 :  +2.07%  OK  (6.50 b/elem)
+   u3/gs2  :  +4.68%  FAIL  (6.75 b/elem)
+   -> MAX-aggressive robust: u2/gs8 (+1.93%, 6.50 b/elem)
+
+============================================================
+SUMMARY — most-aggressive robust (u,gs) per scope (<=+3.5% PPL)
+  S1 weight         : u3/gs16  (+3.36%, 5.50 bits/elem)
+  S2 weight+act     : u2/gs8  (+1.59%, 6.50 bits/elem)
+  S3 KV             : u3/gs16  (+1.35%, 5.50 bits/elem)
+  S4 weight+KV      : u2/gs8  (+1.12%, 6.50 bits/elem)
+  S5 weight+act+KV  : u2/gs8  (+1.93%, 6.50 bits/elem)
+
+total 1347s
