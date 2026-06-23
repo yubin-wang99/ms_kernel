@@ -1,6 +1,13 @@
-# MSAQ-unsigned (floor) variant — sign-free shared residual, OR-combine
+# MSAQ recombination: signed (ADD) vs unsigned (OR) shared residual
 
-A variant of MSAQ-signed that keeps the **shared residual code sign-free**. The trick is to make the
+Two ways to merge the unshared MXINT upper `(8-u)` bits with the shared `u`-bit residual code:
+
+- **MSAQ-signed (deployed)** — round-to-nearest upper, *signed* share, combine by **arithmetic ADD**
+  (carry/borrow both ways). Better accuracy. See *Baseline* below.
+- **MSAQ-unsigned (rtni)** — round-toward-−∞ upper, *unsigned* share, combine by **bit-OR** (concatenation,
+  no carry). Cheaper combine, no sign plane, but worse accuracy. See *Variant* below.
+
+The unsigned variant keeps the **shared residual code sign-free**. The trick is to make the
 residual one-sided by quantizing the upper with **round toward −∞** (mathematical floor `⌊·⌋`, = the
 quotient of *Euclidean* division — **not** truncation toward zero): round-to-nearest leaves a `±` residual
 (which needs a sign), but round-toward-−∞ leaves a `≥ 0` residual. The group mean is then a plain unsigned
@@ -26,6 +33,42 @@ usat_u(v) = clamp(round(v), 0, 2^u - 1)     # "unsigned u-bit saturating round-t
 
 Per block of `BLOCK = 32` elements, group size `gs = mg`. `u` = shared lower-bit width; the unshared upper
 keeps `8-u` signed bits.
+
+---
+
+## Baseline — MSAQ-signed (signed share, ADD-combine)
+
+The deployed scheme (`precision/lightms_qsnr.py:msaq_signed`). The upper is **round-to-nearest**, so the
+residual is two-sided (`±`) and the shared code is a **signed** `u`-bit two's-complement integer. Combine
+is therefore an **arithmetic ADD**, not an OR — because a negative share must be able to **borrow down**
+into the upper code.
+
+Notation: `ssat_u(v) = clamp(round(v), -2^(u-1), 2^(u-1)-1)`   # signed u-bit two's-complement, round-nearest
+
+Encode:
+
+```
+s_base = E8M0 = 2^(floor(log2(max|x|)) - 6)
+s_un   = s_base * 2^u
+q_un   = round(x / s_un).clamp(-(2^(7-u)-1), 2^(7-u)-1)   # round-to-NEAREST, signed (8-u)-bit UPPER
+res    = x - q_un * s_un                                  # SIGNED, in [-s_un/2, +s_un/2]
+shared = ssat_u( mean_over_mg(res) / s_base )             # group mean -> SIGNED u-bit, one code per group
+```
+
+Decode / recombine:
+
+```
+x_hat = ( (q_un << u) + shared ) * s_base                 # arithmetic ADD (shared may be < 0 -> borrow)
+      = ( q_un * 2^u + shared ) * s_base
+```
+
+This is a true add, **not** a bit-OR: `shared ∈ [-2^(u-1), 2^(u-1)-1]` can be negative, so the low-`u`-bit
+add can borrow/carry into the upper `(8-u)` bits. That two-directional correction (up *and* down) is what
+lets the signed share land closer to the original `x` — the source of its accuracy edge below.
+
+---
+
+## Variant — MSAQ-unsigned (rtni)
 
 ## Encode
 
