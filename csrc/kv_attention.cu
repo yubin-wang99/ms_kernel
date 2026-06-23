@@ -332,7 +332,7 @@ __global__ void kv_decode_cpasync_kernel(
 //   Templated on U4 with `if constexpr` so each instantiation drops the other
 //   path's registers (a merged runtime branch bloated u4 regs -> killed its
 //   occupancy). -----------------------------------------------------------------
-template<bool U4, bool VPACK>
+template<bool U4, bool VPACK, int U_, int GS_>
 __global__ void kv_decode_wide_kernel(
         const __nv_bfloat16* __restrict__ q,
         const int8_t*  __restrict__ ks, const uint8_t* __restrict__ ku,
@@ -438,7 +438,13 @@ __global__ void kv_decode_wide_kernel(
                             dot += q_sh[blk * BLOCK + kd] * ((up_code * 16 + sh_code) * ksc);
                         }
                     }
-                } else {                                    // u2/u3: STREAMING bit-buffer unpack
+                } else if constexpr (U_ > 0) {              // u2/u3 (u,gs)-SPECIALIZED streaming
+                    // compile-time U_/GS_: register-resident rolling buffer + constant
+                    // masks/shifts (the W-only GEMV compile-time win, ported to the KV read).
+                    ms::stream_block_uspec<U_, GS_>(ku, kh, kbase, [&](int kd, int w) {
+                        dot += q_sh[blk * BLOCK + kd] * (w * ksc);
+                    });
+                } else {                                    // u2/u3: runtime STREAMING bit-buffer unpack
                     // thread-per-key unpacks ALL 32 codes of its key sequentially, so the
                     // rolling 64-bit buffer (one shift+mask per code, refill a word only when
                     // low) replaces the per-code straddle funnel-shift -> ~the W-only GEMV
@@ -1820,9 +1826,13 @@ torch::Tensor kv_decode_attention_cuda(
                             : (v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB)));
         const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
                             + (size_t)NB * BLOCK * sizeof(float) + stageB;   // +qg_sh
-        auto launch = [&](auto U4tag) {
+        // (u,gs)-specialized u<4 K-stream unpack (compile-time); u4 uses bfe (no
+        // streaming) so passes <-1,-1>. MS_GEMV_NOSPEC=1 forces the runtime path.
+        const bool kv_nospec = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+        auto launch = [&](auto U4tag, auto Utag, auto Gtag) {
           auto run = [&](auto VPtag) {
-            auto k = kv_decode_wide_kernel<decltype(U4tag)::value, decltype(VPtag)::value>;
+            auto k = kv_decode_wide_kernel<decltype(U4tag)::value, decltype(VPtag)::value,
+                                           decltype(Utag)::value, decltype(Gtag)::value>;
             if (smem_w > 48 * 1024)   // opt in to >48KB dynamic smem (e.g. D=256: staged V)
                 cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_w);
             k<<<dim3((int)H, S), threads, smem_w, at::cuda::getCurrentCUDAStream()>>>(
@@ -1834,8 +1844,15 @@ torch::Tensor kv_decode_attention_cuda(
           };
           if (vpack) run(std::true_type{}); else run(std::false_type{});
         };
-        if ((int)u == 4) launch(std::true_type{});
-        else             launch(std::false_type{});
+        #define IC(n) std::integral_constant<int,n>{}
+        if ((int)u == 4) { launch(std::true_type{},  IC(-1), IC(-1)); }
+        else if (kv_nospec)                       { launch(std::false_type{}, IC(-1), IC(-1)); }
+        else if ((int)u==2 && (int)gs==8)         { launch(std::false_type{}, IC(2),  IC(8)); }
+        else if ((int)u==3 && (int)gs==8)         { launch(std::false_type{}, IC(3),  IC(8)); }
+        else if ((int)u==2 && (int)gs==16)        { launch(std::false_type{}, IC(2),  IC(16)); }
+        else if ((int)u==3 && (int)gs==16)        { launch(std::false_type{}, IC(3),  IC(16)); }
+        else                                      { launch(std::false_type{}, IC(-1), IC(-1)); }
+        #undef IC
     } else if (cpasync) {           // hide K/V unpack behind cp.async prefetch
         const size_t smem_cp = (size_t)((int)D + CP_CHUNK) * sizeof(float)
                              + (size_t)2 * 2 * (NB * CP_CHUNK * (UB + SB));   // 2 buf x (K+V)(up+sh)
@@ -1903,9 +1920,11 @@ torch::Tensor kv_decode_attention_batched_cuda(
                         : (v8 ? (size_t)NB * chunk * BLOCK : (size_t)NB * chunk * (UB + SB)));
     const size_t smem_w = (size_t)((int)D + chunk) * sizeof(float)
                         + (size_t)NB * BLOCK * sizeof(float) + stageB;   // +qg_sh
-    auto launch = [&](auto U4tag) {
+    const bool kv_nospec = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+    auto launch = [&](auto U4tag, auto Utag, auto Gtag) {
       auto run = [&](auto VPtag) {
-        auto k = kv_decode_wide_kernel<decltype(U4tag)::value, decltype(VPtag)::value>;
+        auto k = kv_decode_wide_kernel<decltype(U4tag)::value, decltype(VPtag)::value,
+                                       decltype(Utag)::value, decltype(Gtag)::value>;
         if (smem_w > 48 * 1024)
             cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_w);
         k<<<dim3((int)H, S, (int)B), threads, smem_w, at::cuda::getCurrentCUDAStream()>>>(
@@ -1917,7 +1936,15 @@ torch::Tensor kv_decode_attention_batched_cuda(
       };
       if (vpack) run(std::true_type{}); else run(std::false_type{});
     };
-    if ((int)u == 4) launch(std::true_type{}); else launch(std::false_type{});
+    #define IC(n) std::integral_constant<int,n>{}
+    if ((int)u == 4) { launch(std::true_type{},  IC(-1), IC(-1)); }
+    else if (kv_nospec)                { launch(std::false_type{}, IC(-1), IC(-1)); }
+    else if ((int)u==2 && (int)gs==8)  { launch(std::false_type{}, IC(2),  IC(8)); }
+    else if ((int)u==3 && (int)gs==8)  { launch(std::false_type{}, IC(3),  IC(8)); }
+    else if ((int)u==2 && (int)gs==16) { launch(std::false_type{}, IC(2),  IC(16)); }
+    else if ((int)u==3 && (int)gs==16) { launch(std::false_type{}, IC(3),  IC(16)); }
+    else                               { launch(std::false_type{}, IC(-1), IC(-1)); }
+    #undef IC
     kv_decode_combine_kernel<<<dim3((int)H, (int)B), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), (int)H, (int)D, S);

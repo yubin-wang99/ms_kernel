@@ -142,6 +142,49 @@ __device__ __forceinline__ int unpack_ms_weight_elem(
 #endif
 }
 
+// --- (u,gs)-SPECIALIZED streaming block unpack (u<4), shared by the wide-load GEMV
+//   and the KV-decode K read. One 32-element block whose UBc bytes are CONTIGUOUS at
+//   `upper_cm + base*UBc` (column-major weight: base=blk*OUT+o; token-major KV:
+//   base=(hk*NB+blk)*Lcap+key); per_elem(k, word) called for each reconstructed word.
+//   With U_/GS_ compile-time, WBITS/UBc/SBc and the masks/shifts are constants and the
+//   k-loop unroll makes the rolling-buffer schedule static -> ureg register-resident.
+//   Bit-exact to the runtime streaming unpack. (kernel_ver3.md / compile_time_optimization.md.)
+template<int U_, int GS_, typename F>
+__device__ __forceinline__ void stream_block_uspec(
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        long base, F per_elem) {
+    constexpr int MXB = 32;
+    constexpr int WBITS = 8 - U_;
+    constexpr int UBc = MXB * WBITS / 8;
+    constexpr int SBc = ((MXB / GS_) * U_ + 7) / 8;
+    constexpr int NW  = UBc / 4;
+    constexpr int NSW = (SBc + 3) / 4 > 0 ? (SBc + 3) / 4 : 1;
+    constexpr uint32_t umask = (1u << WBITS) - 1u, usign = 1u << (WBITS - 1);
+    constexpr uint32_t smask = (1u << U_) - 1u, ssign = 1u << (U_ - 1);
+    constexpr int gsmask = GS_ - 1;
+    uint32_t sreg[NSW] = {0u};
+    #pragma unroll
+    for (int i = 0; i < SBc; ++i) sreg[i >> 2] |= (uint32_t)shared_cm[base * SBc + i] << (8 * (i & 3));
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UBc);
+    uint32_t ureg[NW];
+    #pragma unroll
+    for (int i = 0; i < NW; ++i) ureg[i] = src[i];
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < MXB; ++k) {
+        if (unb < WBITS) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+        ubuf >>= WBITS; unb -= WBITS;
+        if ((k & gsmask) == 0) {
+            if (snb < U_) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+            sbuf >>= U_; snb -= U_;
+        }
+        per_elem(k, up_code * (1 << U_) + sh_code);
+    }
+}
+
 // --- KV variant: TOKEN-MAJOR planes [H, nb, L, BYTES] (BYTES innermost; Stage
 //     4a). base_u/base_h fold in the per-head + per-block offset (= same value as
 //     the old [.,BYTES,L] base since UB*L == L*UB); a block's BYTES bytes for a

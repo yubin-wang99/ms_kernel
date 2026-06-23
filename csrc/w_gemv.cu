@@ -348,46 +348,6 @@ __global__ void wonly_gemv_wide_uspec(
     partial[(long)sp * OUT + o] = acc;
 }
 
-// ---- (u,gs)-specialized streaming unpack, shared by the batched/wa specialized kernels.
-//   Same rolling bit-buffer as wonly_gemv_wide_uspec, factored into a device helper that
-//   invokes `per_elem(k, word)` for each of the 32 reconstructed words. Compile-time U/GS
-//   keep the buffer schedule static (ureg register-resident) and shifts/masks constant; the
-//   callback is force-inlined so each caller's accumulation fuses back in (no word[32] spill).
-template<int U_, int GS_, typename F>
-__device__ __forceinline__ void ms_stream_block_uspec(
-        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
-        long base, F per_elem) {
-    constexpr int WBITS = 8 - U_;
-    constexpr int UBc = BLOCK * WBITS / 8;
-    constexpr int SBc = ((BLOCK / GS_) * U_ + 7) / 8;
-    constexpr int NW  = UBc / 4;
-    constexpr int NSW = (SBc + 3) / 4 > 0 ? (SBc + 3) / 4 : 1;
-    constexpr uint32_t umask = (1u << WBITS) - 1u, usign = 1u << (WBITS - 1);
-    constexpr uint32_t smask = (1u << U_) - 1u, ssign = 1u << (U_ - 1);
-    constexpr int gsmask = GS_ - 1;
-    uint32_t sreg[NSW] = {0u};
-    #pragma unroll
-    for (int i = 0; i < SBc; ++i) sreg[i >> 2] |= (uint32_t)shared_cm[base * SBc + i] << (8 * (i & 3));
-    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UBc);
-    uint32_t ureg[NW];
-    #pragma unroll
-    for (int i = 0; i < NW; ++i) ureg[i] = src[i];
-    uint64_t ubuf = 0; int unb = 0, uwi = 0;
-    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
-    #pragma unroll
-    for (int k = 0; k < BLOCK; ++k) {
-        if (unb < WBITS) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
-        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
-        ubuf >>= WBITS; unb -= WBITS;
-        if ((k & gsmask) == 0) {
-            if (snb < U_) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
-            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
-            sbuf >>= U_; snb -= U_;
-        }
-        per_elem(k, up_code * (1 << U_) + sh_code);
-    }
-}
-
 // ---- BATCHED-DECODE W-only GEMV (M=B small): amortize the weight read over B rows --
 //   The B=1 wide GEMV is memory-bound on the weight (the column read dominates; the
 //   activation is tiny). At decode batch M=B the SAME weight column serves all B rows,
@@ -476,7 +436,7 @@ __global__ void wonly_gemv_batched_uspec(
     for (int blk = b0; blk < b1; ++blk) {
         const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
         const long base = (long)blk * OUT + o;
-        ms_stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+        ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
             const float wf = (float)word * scale;
             const int kk = blk * BLOCK + k;
             #pragma unroll
@@ -693,7 +653,7 @@ __global__ void wa_gemv_wide_uspec(
         const long base = (long)blk * OUT + o;
         const int8_t* qxb = qx_sh + (blk - b0) * BLOCK;
         int idot = 0;
-        ms_stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+        ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
             idot += word * (int)qxb[k];
         });
         acc += (float)idot * sw * sa;
@@ -722,7 +682,7 @@ __global__ void wa_gemv_batched_uspec(
         int idot[MR];
         #pragma unroll
         for (int j = 0; j < MR; ++j) idot[j] = 0;
-        ms_stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+        ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
             const int kk = blk * BLOCK + k;
             #pragma unroll
             for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) idot[j] += word * (int)qx[(long)m * K + kk]; }
