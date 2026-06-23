@@ -138,6 +138,28 @@ over the B rows in registers) replaces it for both W-only and W+A.
   staging wall; `change.md` Phase 47, documented-negative). `B≥64` OOM on the 3090 (24 GB, 32-layer KV).
   Full ratio tables (prefill/decode/total × mq/mx·mq/bf·mx/bf) in [`tests/harness_batchsweep_results.md`](tests/harness_batchsweep_results.md).
 
+**Accuracy-grounded E2E (each scope at its robust `(u,gs)`).** The sweep above fixes `u4/gs2` everywhere
+(kernel-optimal, but `u4` is **not weight-accurate**). Re-running each scope at its **max-aggressive config
+within 3.5% PPL** (`precision/scope_uvgs_results.md`: S1 `u3/gs16`, S2/S4/S5 `u2/gs8`, **S3 `u4/gs2`** —
+only KV tolerates the u4 nibble) gives the honest fast-**and**-accurate picture:
+
+| scope (robust cfg) | decode mq/bf B=1 | B=8 mq/mx·mq/bf | B=32 mq/mx·mq/bf | total mq/bf @L3880 |
+|---|---|---|---|---|
+| **S3 KV** (u4/gs2) | 0.94 | 0.98 · **0.65** | 1.00 · **0.39** | **0.51** |
+| S1 W-only (u3/gs16) | **0.84** | 1.19 · 1.60 | 0.60 · 2.77 | 1.41 |
+| S2 W+A (u2/gs8) | **0.84** | 1.08 · 1.58 | 1.44 · 3.70 | 1.41 |
+| S4 W-only+KV (u2/gs8) | **0.84** | 1.39 · 1.37 | 0.58 · 2.31 | 1.07 |
+| S5 W+A+KV (u2/gs8) | **0.81** | 1.20 · 1.33 | 1.64 · 3.22 | 1.07 |
+
+- **Under the 3.5% PPL bar, the clean fast-and-accurate win is KV-cache (S3)** — it tolerates the u4
+  nibble so its kernel-optimal config is accuracy-valid: decode 0.39–0.65× bf16 (grows with B and L_out),
+  tie vs MXINT8. Plus **B=1 GEMV decode wins vs bf16 at every scope** (0.81–0.94×).
+- **Weight / W+A are accuracy-pinned to `u2/u3` (non-nibble)** — the byte saving shrinks (u2 ≈ 0.79× MXINT8
+  bytes) and the streaming sub-byte unpack is heavier than direct int8, so decode `mq/mx` often **> 1** at
+  B>1 (win only at B=32). So the earlier uniform-`u4/gs2` W-only win (mq/mx 0.35–0.44 @B32) was at a
+  config that is **not** weight-accurate; only KV's win is simultaneously fast and accurate.
+  Full tables: [`tests/harness_perscope_results.md`](tests/harness_perscope_results.md).
+
 ## `u` / `gs` per scope (our setup)
 
 MSAQ is parameterized by `u` (per-element *unshared* upper bits — fewer `u` ⇒ fewer bytes ⇒ more
@@ -168,7 +190,9 @@ levers: [`precision/u4_robustness_study.md`](precision/u4_robustness_study.md),
 
 | topic | file |
 |---|---|
-| **E2E batched latency** (prefill/decode/total × ratios) | [`tests/harness_batchsweep_results.md`](tests/harness_batchsweep_results.md), harness `tests/harness_batchsweep.py` |
+| **E2E batched latency** (uniform u4/gs2, prefill/decode/total × ratios) | [`tests/harness_batchsweep_results.md`](tests/harness_batchsweep_results.md), harness `tests/harness_batchsweep.py` |
+| **E2E at accuracy-robust (u,gs) per scope** (`--perscope`) | [`tests/harness_perscope_results.md`](tests/harness_perscope_results.md) |
+| packing/unpacking format (planes, u4-nibble vs u<4-straddle, unpack ops) | [`packing_explained.md`](packing_explained.md) |
 | E2E batch-1 (TTFT/TPOT, 4 scenarios × 3 models) | [`harness_results.md`](harness_results.md), `tests/harness.py` |
 | weight-matmul kernel wins (GEMV/GEMM/W+A) | [`weight_scope_results.md`](weight_scope_results.md) |
 | KV-read decode win (nibble u4/gs2 + sepsc + vpack) | [`kv_read_attempts.md`](kv_read_attempts.md), [`tests/kv_pack_results.md`](tests/kv_pack_results.md) |

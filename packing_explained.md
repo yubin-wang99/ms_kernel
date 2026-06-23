@@ -129,3 +129,70 @@ reverse: `buf[by] |= code<<off; if(off+width>8) buf[by+1] |= code>>(8−off)`). 
 — files: `ms_lib/pack.py` (`decompose`, `pack_weight`, `_pack_codes_lsb`, `dequant_weight`, `weight_int8`),
 `csrc/core/ms_utils.cuh` (`unpack_ms_weight_elem`, `unpack_ms_kv_elem`, `unpack_ms_kv_elem_u4`,
 `extract_code`, `bfe_s32`, `sign_extend`, `decompose_ms_block`, `pack_codes_lsb`).
+
+## 7. Profiling — is u2/u3 decode actually BW-bound? (measured)
+
+We measured the wide-load decode kernels with Nsight Compute to test the common assumption that
+"decode is DRAM-bandwidth-bound, so simplifying the unpack (e.g. removing byte straddle) cannot help."
+**The assumption is false at single-request decode sizes.**
+
+Setup: RTX 3090 (Ampere sm_86), Nsight Compute 2022.1, split-K wide-load kernels, single-request decode
+(GEMV: OUT=K=4096 / KV: Lk=4680, H=8). Repro: `tests/ncu_uprobe.py` (GEMV), `tests/kv_ncu_driver.py` (KV).
+Metrics are each unit's throughput as % of peak; `sector-util` = useful bytes per global-load sector
+(lower ⇒ more wasted sector traffic).
+
+| path | u | **SM%** | DRAM% | L2% | L1% | sector-util% | time(µs) |
+|---|---|---|---|---|---|---|---|
+| GEMV | u2/gs8 | **57.7** | 30.9 | 14.3 | 28.5 | 15.7 | 50.9 |
+| GEMV | u3/gs8 | **54.6** | 27.1 | 12.6 | 28.2 | 18.3 | 50.1 |
+| GEMV | u4/gs8 | 68.3 | 31.7 | 20.6 | **68.3** | 39.6 | **37.5** |
+| KV   | u3   | **33.0** | 10.2 | 5.0 | 29.5 | 27.2 | 77.0 |
+| KV   | u4   | 37.7 | 13.3 | 7.5 | **35.3** | 49.6 | **50.0** |
+
+Reading:
+1. **Not DRAM-bandwidth-bound.** DRAM% never exceeds ~32% (KV: 10–13%). All SOL units sit <70% → this is the
+   **latency/occupancy-bound** regime (the problem is too small to saturate any unit).
+2. **u2/u3 GEMV is SM-bound** (SM 54–58% is the top unit; DRAM/L1 ~28%). The streaming-unpack shift/mask/OR
+   (unpack ALU+LSU) is plausibly on the critical path — ALU-leaning, **not** memory-leaning.
+3. **u4 is faster everywhere** (GEMV 1.34×, KV 1.54×) with much higher sector-util. But u4's edge bundles three
+   things — fewer bytes (UB=16<20/24), no straddle, AND a single-`bfe` unpack — so it over-states the value of
+   straddle removal alone.
+4. KV's "BW-bound" (Phase 17/18 comments) is really **effective-BW / sector-utilization** bound, not DRAM
+   saturation: DRAM% is low; the limiter is the L1TEX pipe moving half-wasted sectors (sector-util 27% → 50% u4).
+
+**Implication for the 4-plane idea (split the straddling (8−u)-bit upper into a 4-bit nibble plane + a (4−u)-bit
+plane).** Because decode is SM/issue-bound (not DRAM-bound), cutting unpack instruction count is a *real* lever —
+the earlier "coalesced-load split gave ZERO speedup" experiment only optimized the memory side, which was never
+the wall. But the upside is bounded: the 4-plane repack keeps u2's byte count, so it captures only the
+unpack-ALU share of u4's 1.34× gap (not the byte/sector share), and adds plane-count overhead. See §8 for the
+prototype that measures this directly.
+
+## 8. Prototype — 4-plane u2 repack, measured (the idea does NOT pay off)
+
+We built the 4-plane u2 repack and benchmarked it against the 3-plane streaming u2, in one JIT harness with an
+**identical** launch config so the only difference is the unpack (`tests/proto_split4_u2.py`):
+- **streaming** (3-plane): `upper_cm` 24 B → 6× `uint32`, rolling 6-bit straddle extract.
+- **split4** (4-plane): nibble `[16 B]` `uint4` + low-2 `[8 B]` `uint2` (both straddle-free shift+mask), then
+  **reassemble** the 6-bit signed `q_upper = sign6((top4<<2)|lo2)`. Same total bytes/block.
+
+Bit-exactness: `max|streaming−split4| = 0` (identical math); both match the fp reference to 1.6e-7 rel.
+
+| metric (RTX 3090, ncu single launch) | streaming (3-plane) | split4 (4-plane) |
+|---|---|---|
+| **instructions executed** | 5.35 M | **6.37 M (+19%)** |
+| sector-util% (global ld) | 15.7 | **48.3** |
+| DRAM% | 61.8 | 51.4 |
+| L1% | 49.1 | 36.7 |
+| SM% | 50.0 | 50.9 |
+| registers/thread | 39 | 40 |
+| time — 300-iter bench | 33.1 µs | 32.5 µs (**1.018×**) |
+
+**Verdict: the 4-plane split does not speed up decode (~±2%, a wash).** The hypothesis's premise — that byte
+straddle is expensive — is wrong: the rolling-buffer straddle is already ~1 shift+mask per code (refill
+amortized). Splitting a 6-bit code into 4+2 aligned fields forces a **per-element reassembly**
+(`(top4<<2)|lo2`) from two separately-loaded registers, which costs *more* ALU than the straddle it removes —
+hence **+19% instructions**, not fewer. The split's only real win is **sector utilization (15.7→48.3%)** from the
+cleanly-aligned `uint4`+`uint2` loads, but at single-request decode that doesn't dominate. This is structural,
+not an implementation artifact: any non-power-of-2 code split into aligned sub-fields must be reassembled, and
+the reassembly is the cost. The genuine lever remains **u=4** (the upper code IS 4 bits, so no reassembly:
+single `bfe`, fewest bytes, best sector-util — the 1.34× winner in §7).
