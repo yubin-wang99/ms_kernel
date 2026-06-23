@@ -174,6 +174,101 @@ __global__ void wonly_gemm_tiled(
     }
 }
 
+// COLUMN-MAJOR wide-load W-only prefill GEMM. Same tiling/GEMM as wonly_gemm_tiled,
+// but the Bs (weight) stage reads the COLUMN-MAJOR planes upper_cm/shared_cm [nb,OUT,*]:
+// each thread owns whole columns and wide-loads a column's UB bytes (contiguous; adjacent
+// columns are UB apart -> the warp is coalesced), then STREAMING-unpacks all 32 codes from
+// registers. Replaces the per-element random-access extract_code (sector-util ~12%, the
+// L1-load bottleneck of the row-major path) with one coalesced wide load per column.
+template<int TBM, int TBN, int RTM, int RTN>
+__global__ void wonly_gemm_tiled_cm(
+        const __nv_bfloat16* __restrict__ X,
+        const int8_t*  __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper_cm,    // [nb, OUT, UB]
+        const uint8_t* __restrict__ shared_cm,   // [nb, OUT, SB]
+        __nv_bfloat16* __restrict__ Y,
+        int M, int OUT, int K, int NB, int u, int gs, int UB, int SB) {
+    constexpr int TNT = TBN / RTN;
+    constexpr int NT  = (TBM / RTM) * TNT;
+    __shared__ float As[TBK][TBM];
+    __shared__ float Bs[TBK][TBN];
+    const int m0 = blockIdx.y * TBM, o0 = blockIdx.x * TBN;
+    const int tid = threadIdx.x, tRow = tid / TNT, tCol = tid % TNT;
+    const int wbits = 8 - u, gsmask = gs - 1;
+    const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+    const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+
+    float acc[RTM][RTN];
+    #pragma unroll
+    for (int i = 0; i < RTM; ++i)
+        #pragma unroll
+        for (int j = 0; j < RTN; ++j) acc[i][j] = 0.0f;
+
+    for (int blk = 0; blk < NB; ++blk) {
+        for (int idx = tid; idx < TBM * TBK; idx += NT) {
+            const int m = idx / TBK, k = idx % TBK;
+            As[k][m] = (m0 + m < M)
+                     ? __bfloat162float(X[(long)(m0 + m) * K + blk * TBK + k]) : 0.0f;
+        }
+        // per-column wide-load + streaming unpack -> Bs[0..31][oc]
+        for (int oc = tid; oc < TBN; oc += NT) {
+            const int o = o0 + oc;
+            if (o >= OUT) {
+                #pragma unroll
+                for (int k = 0; k < TBK; ++k) Bs[k][oc] = 0.0f;
+                continue;
+            }
+            const float sc = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            uint32_t ureg[6];
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UB);
+            #pragma unroll
+            for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+            uint32_t sreg[3] = {0u, 0u, 0u};
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) if (i < SB) sreg[i >> 2] |= (uint32_t)shared_cm[base * SB + i] << (8 * (i & 3));
+            uint64_t ubuf = 0; int unb = 0, uwi = 0;
+            uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+            #pragma unroll
+            for (int k = 0; k < TBK; ++k) {
+                if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+                const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+                ubuf >>= wbits; unb -= wbits;
+                if ((k & gsmask) == 0) {
+                    if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+                    sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+                    sbuf >>= u; snb -= u;
+                }
+                Bs[k][oc] = (float)(up_code * (1 << u) + sh_code) * sc;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < TBK; ++k) {
+            float a[RTM], b[RTN];
+            #pragma unroll
+            for (int i = 0; i < RTM; ++i) a[i] = As[k][tRow * RTM + i];
+            #pragma unroll
+            for (int j = 0; j < RTN; ++j) b[j] = Bs[k][tCol * RTN + j];
+            #pragma unroll
+            for (int i = 0; i < RTM; ++i)
+                #pragma unroll
+                for (int j = 0; j < RTN; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < RTM; ++i) {
+        const int m = m0 + tRow * RTM + i;
+        if (m >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < RTN; ++j) {
+            const int o = o0 + tCol * RTN + j;
+            if (o < OUT) Y[(long)m * OUT + o] = __float2bfloat16(acc[i][j]);
+        }
+    }
+}
+
 // Templated W+A GEMM — same tiling, plus per-(row,block) MXINT8 activation quant.
 // sa, sw are powers of two so folding As=qx*sa, Bs=qw*sw is bit-exact to the
 // per-block int-dot * sa*sw. Activation quant mirrors reference.quant_act.
@@ -701,6 +796,26 @@ torch::Tensor wonly_gemm_cuda(
         wonly_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
     else
         DISPATCH_TILE(wonly_gemm_tiled);
+#undef ARGS
+    return Y;
+}
+
+// Column-major wide-load W-only prefill GEMM (coalesced unpack). Takes the
+// COLUMN-MAJOR planes [nb,OUT,*]; same tile dispatch as wonly_gemm (default
+// cfg 1/5). A/B vs the row-major wonly_gemm.
+torch::Tensor wonly_gemm_cm_cuda(
+        torch::Tensor X, torch::Tensor scale_exp,
+        torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    int UB, SB; gemm_dims(u, gs, UB, SB);
+    auto Y = torch::empty({M, OUT}, X.options());
+#define ARGS \
+    reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), \
+    scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(), \
+    reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
+    (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
+    DISPATCH_TILE(wonly_gemm_tiled_cm);
 #undef ARGS
     return Y;
 }

@@ -16,6 +16,8 @@
 # `available()` reports whether the compiled backend imported; the test suite
 # and benchmark use it to skip GPU work cleanly on a CPU dev box.
 
+import os
+
 _IMPORT_ERROR = None
 try:
     import torch
@@ -93,12 +95,20 @@ def wa_gemv(p, x_bf16):
 
 
 def wonly_gemm(p, X_bf16):
-    """W-only prefill GEMM. p from pack_weight; X_bf16 [M,K] -> Y [M,OUT] bf16."""
+    """W-only prefill GEMM. p from pack_weight; X_bf16 [M,K] -> Y [M,OUT] bf16.
+    Column-major wide-load unpack (coalesced; ~1.2-1.26x over the row-major path).
+    MS_GEMM_ROWMAJOR=1 forces the legacy row-major kernel (A/B)."""
     _require()
-    s, up, sh = _weight_planes(p, X_bf16.device)
-    return _OPS.wonly_gemm(X_bf16, s, up, sh,
-                           int(X_bf16.shape[0]), int(p["OUT"]), int(p["K"]), int(p["nb"]),
-                           int(p["u"]), int(p["gs"]))
+    dev = X_bf16.device
+    s = torch.from_numpy(p["scale_exp"]).to(dev)
+    M = int(X_bf16.shape[0])
+    args = (M, int(p["OUT"]), int(p["K"]), int(p["nb"]), int(p["u"]), int(p["gs"]))
+    if os.environ.get("MS_GEMM_ROWMAJOR") == "1":
+        s2, up, sh = _weight_planes(p, dev)
+        return _OPS.wonly_gemm(X_bf16, s2, up, sh, *args)
+    upc = torch.from_numpy(p["upper_cm"]).to(dev)
+    shc = torch.from_numpy(p["shared_cm"]).to(dev)
+    return _OPS.wonly_gemm_cm(X_bf16, s, upc, shc, *args)
 
 
 def wa_gemm(p, X_bf16):
