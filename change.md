@@ -1814,3 +1814,27 @@ bytes), so even the Q,K,V DRAM read (O(LD), tiny vs the O(L^2 D) compute) saves 
 win stays where it is memory-bound — the DECODE KV-read (already won, nibble u4/gs2 + vpack) — not prefill
 AA. Building the AA kernel would be another documented-negative; the design is recorded here for when a
 quantized-attention regime (e.g. extreme-long-context where attention is memory-bound) actually warrants it.
+
+## Phase 49 addendum — AA kernel IMPLEMENTED + MEASURED (documented-negative)
+Built the AA attention path by composing the existing quantized tensor-core attention kernels
+(qk_wmma + softmax + pv_wmma, K/V in MSAQ planes) and additionally MSAQ-quantizing Q and the softmax
+probs P (tests/aa_kernel_bench.py). Measured on RTX 3090, u4/gs2:
+
+PREFILL self-attention (H=8, D=128), vs bf16 torch-SDPA:
+  L=512  : bf16 288us | qk+pv(K,V quant; Q,P bf16) 190us | AA(Q,K,V,P quant) 595us (2.1x) | P-quant tax 404us
+  L=1024 : bf16 1628us| qk+pv 585us | AA 2247us (1.4x) | P-quant tax 1662us
+  L=2048 : bf16 6330us| qk+pv 5292us| AA 17000us (2.7x)| P-quant tax 11708us
+DECODE AA+KV (Hq32/Hkv8/D128) vs bf16:
+  Lk=1024 : bf16 374us | KV-only 23.9us (0.06x) | AA+KV 23.9us (0.06x)
+  Lk=4096 : bf16 1283us| KV-only 127us (0.10x)  | AA+KV 127us (0.10x)
+  Lk=16384: bf16 4986us| KV-only 648us (0.13x)  | AA+KV 638us (0.13x)
+
+CONFIRMED NEGATIVE (prefill AA): the loss is dominated by quantizing P — the L×L softmax matrix — which
+is O(L^2) work (tax 0.4->11.7ms as L 512->2048) that bf16 flash-attention AVOIDS ENTIRELY (fused, never
+materializes P). On top, the qk+pv path materializes [H,L,L] scores (O(L^2) memory) that flash also avoids.
+So prefill AA is structurally worse than flash bf16, exactly as predicted (compute-bound + the extra P
+quant). (Caveat: torch-SDPA bf16 is below flash peak at H=8, so the qk+pv "0.4-0.8x" is not a real win;
+the solid signals are the O(L^2) P-quant tax and the decode result.)
+CONFIRMED WIN (decode AA+KV): 0.06-0.13x bf16 — the memory-bound KV-read regime; Q-quant is free (the
+kernel reads Q bf16), so AA+KV == KV-only. The attention win lives in decode, not prefill — as designed.
+(AA relerr ~5.6e-2 at u4: full-AA accuracy needs u2, per Phase 49 / aa_attn_results.md; this bench is latency.)
