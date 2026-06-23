@@ -449,6 +449,7 @@ __global__ void wonly_gemm_wmma(
 // codes (shared advanced per group). Cheaper ALU than per-element straddle; uses
 // 64 of 128 threads, but here the stage OVERLAPS the MMA, so its lower width is
 // hidden — the win is the smaller total work. Same dense bytes -> bit-exact.
+template<bool CM>
 __device__ __forceinline__ void dequant_col_stream_bf16(
         const uint8_t* __restrict__ upper, const uint8_t* __restrict__ shared,
         int blk, int o, int OUT, int u, int gs, int UB, int SB,
@@ -458,13 +459,25 @@ __device__ __forceinline__ void dequant_col_stream_bf16(
     const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
     const int gsmask = gs - 1;
     uint32_t ureg[6] = {0u,0u,0u,0u,0u,0u};
-    #pragma unroll
-    for (int bi = 0; bi < 24; ++bi)
-        if (bi < UB) ureg[bi >> 2] |= (uint32_t)upper[((long)blk*UB + bi)*OUT + o] << (8*(bi&3));
     uint32_t sreg[3] = {0u,0u,0u};
-    #pragma unroll
-    for (int bi = 0; bi < 8; ++bi)
-        if (bi < SB) sreg[bi >> 2] |= (uint32_t)shared[((long)blk*SB + bi)*OUT + o] << (8*(bi&3));
+    if constexpr (CM) {
+        // column-major [nb,OUT,UB]: the column's UB bytes are CONTIGUOUS -> wide-load
+        // (adjacent columns UB apart -> the warp coalesces), vs the row-major *OUT stride.
+        const long base = (long)blk * OUT + o;
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(upper + base * UB);
+        #pragma unroll
+        for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+        #pragma unroll
+        for (int bi = 0; bi < 8; ++bi)
+            if (bi < SB) sreg[bi >> 2] |= (uint32_t)shared[base * SB + bi] << (8 * (bi & 3));
+    } else {
+        #pragma unroll
+        for (int bi = 0; bi < 24; ++bi)
+            if (bi < UB) ureg[bi >> 2] |= (uint32_t)upper[((long)blk*UB + bi)*OUT + o] << (8*(bi&3));
+        #pragma unroll
+        for (int bi = 0; bi < 8; ++bi)
+            if (bi < SB) sreg[bi >> 2] |= (uint32_t)shared[((long)blk*SB + bi)*OUT + o] << (8*(bi&3));
+    }
     uint64_t ubuf = 0; int unb = 0, uwi = 0;
     uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
     #pragma unroll
@@ -481,6 +494,7 @@ __device__ __forceinline__ void dequant_col_stream_bf16(
     }
 }
 
+template<bool CM>
 __global__ void wonly_gemm_wmma_pipe(
         const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
         const uint8_t* __restrict__ upper, const uint8_t* __restrict__ shared,
@@ -509,7 +523,7 @@ __global__ void wonly_gemm_wmma_pipe(
             const int o = o0 + oc;
             if (o < OUT) {
                 const float sc = ms::e8m0_to_scale(scale_exp[b * OUT + o]);
-                dequant_col_stream_bf16(upper, shared, b, o, OUT, u, gs, UB, SB, sc, &Bs[buf][oc][0]);
+                dequant_col_stream_bf16<CM>(upper, shared, b, o, OUT, u, gs, UB, SB, sc, &Bs[buf][oc][0]);
             } else {
                 #pragma unroll
                 for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = __float2bfloat16(0.0f);
@@ -562,6 +576,7 @@ __global__ void wonly_gemm_wmma_pipe(
 //   beat bf16 cuBLAS. 4 warps = a 16x64 output tile; weight unpacked to a bf16 tile
 //   (dequant_col_stream_bf16) so the sub-byte read rides the tensor core. partial
 //   [splitK, M, OUT] -> gemv_combine_tc.
+template<bool CM>
 __global__ void wonly_gemv_tc_kernel(
         const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
         const uint8_t* __restrict__ upper, const uint8_t* __restrict__ shared,
@@ -583,7 +598,7 @@ __global__ void wonly_gemv_tc_kernel(
             const int o = o0 + oc;
             if (o < OUT) {
                 const float sc = ms::e8m0_to_scale(scale_exp[b * OUT + o]);
-                dequant_col_stream_bf16(upper, shared, b, o, OUT, u, gs, UB, SB, sc, &Bs[buf][oc][0]);
+                dequant_col_stream_bf16<CM>(upper, shared, b, o, OUT, u, gs, UB, SB, sc, &Bs[buf][oc][0]);
             } else {
                 #pragma unroll
                 for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = __float2bfloat16(0.0f);
@@ -832,7 +847,7 @@ torch::Tensor wonly_gemm_cuda(
     reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()), \
     (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB
     if (tile_cfg((int)M) == 11)     // BF16 WMMA, software-pipelined (unpack hidden behind MMA)
-        wonly_gemm_wmma_pipe<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
+        wonly_gemm_wmma_pipe<false><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
     else if (tile_cfg((int)M) == 10)  // BF16 tensor-core (WMMA) path
         wonly_gemm_wmma<<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(ARGS);
     else
@@ -861,6 +876,25 @@ torch::Tensor wonly_gemm_cm_cuda(
     return Y;
 }
 
+// TENSOR-CORE W-only prefill GEMM: BF16 WMMA (software-pipelined) with the weight
+// dequant wide-loading the COLUMN-MAJOR planes (coalesced, overlaps the MMA). Combines
+// tensor cores + coalesced unpack -> the fastest W-only prefill path. bf16 operands
+// (fp32 accumulate); slight precision vs the fp32 scalar path, inherent to WMMA.
+torch::Tensor wonly_gemm_tc_cuda(
+        torch::Tensor X, torch::Tensor scale_exp,
+        torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    int UB, SB; gemm_dims(u, gs, UB, SB);
+    auto Y = torch::empty({M, OUT}, X.options());
+    wonly_gemm_wmma_pipe<true><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
+    return Y;
+}
+
 // decode tensor-core batched GEMV: x [M,K] -> y [M,OUT]. split-K WMMA, weight-DRAM-bound.
 torch::Tensor wonly_gemv_tc_cuda(
         torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
@@ -874,7 +908,7 @@ torch::Tensor wonly_gemv_tc_cuda(
     int splitK = (4 * 82) / (nO * nM); if (splitK < 1) splitK = 1; if (splitK > (int)NB) splitK = (int)NB;
     auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
     dim3 grid(nO, nM, splitK);
-    wonly_gemv_tc_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+    wonly_gemv_tc_kernel<false><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
         partial.data_ptr<float>(), (int)M, (int)OUT, K, (int)NB, (int)u, (int)gs, UB, SB, splitK);

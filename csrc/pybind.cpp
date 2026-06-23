@@ -37,6 +37,9 @@ torch::Tensor wonly_gemm_cuda(
 torch::Tensor wonly_gemm_cm_cuda(
     torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
     int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor wonly_gemm_tc_cuda(
+    torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
 torch::Tensor wa_gemm_cuda(
     torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
     int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
@@ -135,6 +138,8 @@ TORCH_LIBRARY(msaq, m) {
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wonly_gemm_cuda);
     m.def("wonly_gemm_cm(Tensor X, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wonly_gemm_cm_cuda);
+    m.def("wonly_gemm_tc(Tensor X, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wonly_gemm_tc_cuda);
     m.def("wa_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wa_gemm_cuda);
     m.def("wa_gemm_cm(Tensor X, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "

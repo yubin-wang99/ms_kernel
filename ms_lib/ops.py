@@ -96,8 +96,8 @@ def wa_gemv(p, x_bf16):
 
 def wonly_gemm(p, X_bf16):
     """W-only prefill GEMM. p from pack_weight; X_bf16 [M,K] -> Y [M,OUT] bf16.
-    Column-major wide-load unpack (coalesced; ~1.2-1.26x over the row-major path).
-    MS_GEMM_ROWMAJOR=1 forces the legacy row-major kernel (A/B)."""
+    Default: BF16 WMMA tensor cores + column-major wide-load dequant (fastest).
+    MS_GEMM_SCALAR=1 -> scalar fp32 column-major; MS_GEMM_ROWMAJOR=1 -> legacy row-major."""
     _require()
     dev = X_bf16.device
     s = torch.from_numpy(p["scale_exp"]).to(dev)
@@ -108,7 +108,9 @@ def wonly_gemm(p, X_bf16):
         return _OPS.wonly_gemm(X_bf16, s2, up, sh, *args)
     upc = torch.from_numpy(p["upper_cm"]).to(dev)
     shc = torch.from_numpy(p["shared_cm"]).to(dev)
-    return _OPS.wonly_gemm_cm(X_bf16, s, upc, shc, *args)
+    if os.environ.get("MS_GEMM_SCALAR") == "1":
+        return _OPS.wonly_gemm_cm(X_bf16, s, upc, shc, *args)
+    return _OPS.wonly_gemm_tc(X_bf16, s, upc, shc, *args)
 
 
 def wa_gemm(p, X_bf16):
