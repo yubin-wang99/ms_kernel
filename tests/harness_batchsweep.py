@@ -274,7 +274,11 @@ def integ(curve, n):                                     # ms summed over decode
 # scopes: (name, weight-style, kv-quant). S5 = W+A + KV (full quant).
 SCENARIOS = [("S1 W-only", "wonly", False), ("S2 W+A", "wa", False),
              ("S3 KV-only", None, True), ("S4 W-only+KV", "wonly", True),
-             ("S5 W+A+KV", "wa", True)]
+             ("S5 W+A+KV", "wa", True),
+             # S6 = full quant incl. attention activation×activation (Q,K,P,V). At DECODE the
+             # kernel reads Q bf16 -> AA latency == KV-decode (== S5); AA is an ACCURACY scope,
+             # not a decode-latency one. Prefill attention is bf16 SDPA (AA-prefill loses to it).
+             ("S6 W+A+KV+AA", "wa", True)]
 
 
 def build_args():
@@ -316,7 +320,8 @@ def variants(u=4, gs=2):                                 # (fmt,u,gs); only MSAQ
 
 # per-scope max-aggressive robust config (scope_uvgs_results.md; S3 uses the u=4 nibble since robust)
 PERSCOPE_CFG = {"S1 W-only": (3, 16), "S2 W+A": (2, 8), "S3 KV-only": (4, 2),
-                "S4 W-only+KV": (2, 8), "S5 W+A+KV": (2, 8)}
+                "S4 W-only+KV": (2, 8), "S5 W+A+KV": (2, 8),
+                "S6 W+A+KV+AA": (2, 8)}    # AA forces u2 everywhere (u4 nibble accuracy-dead)
 
 
 def fmt_paths(fmt, wstyle, kvq):
