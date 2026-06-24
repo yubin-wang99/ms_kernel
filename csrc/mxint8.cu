@@ -179,6 +179,20 @@ __device__ __forceinline__ void mx_load_col32(const int8_t* __restrict__ qcm, lo
     *reinterpret_cast<int4*>(wbuf + 16) = __ldg(reinterpret_cast<const int4*>(qcm + base * 32 + 16));
 }
 
+// dequant MXINT8 weight -> bf16 [K,OUT] (coalesced) for prefill dequant-once + cuBLAS.
+__global__ void mxint8_dequant_bf16_kernel(
+        const int8_t* __restrict__ scale_exp, const int8_t* __restrict__ qweight_cm,
+        __nv_bfloat16* __restrict__ Wbf, int OUT, int K, int NB) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int blk = blockIdx.y;
+    if (o >= OUT) return;
+    const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+    int8_t wbuf[32]; mx_load_col32(qweight_cm, (long)blk * OUT + o, wbuf);
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k)
+        Wbf[((long)(blk * BLOCK + k)) * OUT + o] = __float2bfloat16((float)wbuf[k] * scale);
+}
+
 __global__ void mxint8_gemv_wide_kernel(
         const __nv_bfloat16* __restrict__ x, const int8_t* __restrict__ scale_exp,
         const int8_t* __restrict__ qweight_cm, float* __restrict__ partial,
@@ -1030,6 +1044,16 @@ torch::Tensor mxint8_wa_gemm_cuda(
 }
 
 // ==== COLUMN-MAJOR WIDE-LOAD hosts (qweight_cm [nb,OUT,32]) — matched to MSAQ wide ====
+torch::Tensor mxint8_dequant_bf16_cuda(
+        torch::Tensor scale_exp, torch::Tensor qweight_cm, int64_t OUT, int64_t K, int64_t NB) {
+    auto W = torch::empty({K, OUT}, torch::dtype(torch::kBFloat16).device(scale_exp.device()));
+    const int threads = 256, blocks = (int)((OUT + threads - 1) / threads);
+    mxint8_dequant_bf16_kernel<<<dim3(blocks, (int)NB), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scale_exp.data_ptr<int8_t>(), qweight_cm.data_ptr<int8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(W.data_ptr<at::BFloat16>()), (int)OUT, (int)K, (int)NB);
+    return W;
+}
+
 torch::Tensor mxint8_gemv_wide_cuda(
         torch::Tensor x, torch::Tensor scale_exp, torch::Tensor qweight_cm,
         int64_t OUT, int64_t NB) {

@@ -694,7 +694,65 @@ __global__ void wa_gemv_batched_uspec(
     for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
 }
 
+// ---- DEQUANT the whole weight to a bf16 [OUT,K] buffer (column-major wide-load) -----
+//   For PREFILL the fused per-tile dequant runs the tensor cores at ~11% (it starves the
+//   MMA and re-dequants the weight M/TBM times). Instead dequant ONCE here (memory-bound,
+//   amortized over the whole GEMM) and let cuBLAS do the bf16 GEMM at full speed. Thread o
+//   owns a column: wide-load its UB bytes/block, streaming-unpack 32 codes, write bf16.
+//   Output is COLUMN-MAJOR-of-the-GEMM: Wbf[K,OUT] (= X[M,K] @ Wbf[K,OUT] with no
+//   transpose). Thread (o, blk=blockIdx.y) writes Wbf[(blk*32+k)*OUT + o] -> consecutive
+//   `o` across the warp = coalesced stores; grid.y over NB gives OUT*NB threads (full
+//   occupancy). Memory-bound (~2.7x weight bytes), one-time before the cuBLAS GEMM.
+__global__ void ms_dequant_bf16_kernel(
+        const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm, __nv_bfloat16* __restrict__ Wbf,
+        int OUT, int K, int NB, int u, int gs, int UB, int SB) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int blk = blockIdx.y;
+    if (o >= OUT) return;
+    const int wbits = 8 - u, gsmask = gs - 1;
+    const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+    const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+    const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+    const long base = (long)blk * OUT + o;
+    uint32_t ureg[6];
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UB);
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+    uint32_t sreg[3] = {0u, 0u, 0u};
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) if (i < SB) sreg[i >> 2] |= (uint32_t)shared_cm[base * SB + i] << (8 * (i & 3));
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) {
+        if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+        ubuf >>= wbits; unb -= wbits;
+        if ((k & gsmask) == 0) {
+            if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+            sbuf >>= u; snb -= u;
+        }
+        Wbf[((long)(blk * BLOCK + k)) * OUT + o] = __float2bfloat16((float)(up_code * (1 << u) + sh_code) * scale);
+    }
+}
+
 } // namespace
+
+// Dequant the MSAQ weight to a bf16 [OUT,K] buffer (for prefill: dequant-once + cuBLAS).
+torch::Tensor ms_dequant_bf16_cuda(
+        torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
+    const int UB = 32 * (8 - (int)u) / 8, SB = ((32 / (int)gs) * (int)u + 7) / 8;
+    auto W = torch::empty({K, OUT}, torch::dtype(torch::kBFloat16).device(scale_exp.device()));  // [K,OUT]
+    const int threads = 256, blocks = (int)((OUT + threads - 1) / threads);
+    ms_dequant_bf16_kernel<<<dim3(blocks, (int)NB), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(W.data_ptr<at::BFloat16>()),
+        (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
+    return W;
+}
 
 // Host launcher. Signature matches ms_lib.ops.wonly_gemv / the pybind schema.
 torch::Tensor wonly_gemv_cuda(

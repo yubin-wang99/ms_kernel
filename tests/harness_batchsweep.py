@@ -52,10 +52,12 @@ class QLinear:
     def gemm(self, X):                                   # X [M,K] bf16 -> [M,OUT]
         p, M = self.path, X.shape[0]
         if p == "bf16":          return X @ self.Wt
-        if p == "mxint8_wonly":  return OPS.mxint8_gemm_cm(X, self.s, self.qwc, M, self.OUT, self.K, self.nb)    # WMMA + column-major
-        if p == "mxint8_wa":     return OPS.mxint8_wa_gemm_cm(X, self.s, self.qwc, M, self.OUT, self.K, self.nb)  # IMMA + column-major
-        if p == "msaq_wonly":    return OPS.wonly_gemm_tc(X, self.s, self.upc, self.shc, M, self.OUT, self.K, self.nb, self.u, self.gs)  # WMMA TC + column-major (current best)
-        if p == "msaq_wa":       return OPS.wa_gemm_cm(X, self.s, self.upc, self.shc, M, self.OUT, self.K, self.nb, self.u, self.gs)     # IMMA + column-major (current best)
+        # PREFILL (compute-bound GEMM): dequant weight ONCE -> bf16 [K,OUT], then cuBLAS X@Wd.
+        # Ties bf16 (the fused per-tile dequant starved the tensor cores ~11% -> ~4x slower).
+        if p == "mxint8_wonly" or p == "mxint8_wa":
+            return X @ OPS.mxint8_dequant_bf16(self.s, self.qwc, self.OUT, self.K, self.nb)
+        if p == "msaq_wonly" or p == "msaq_wa":
+            return X @ OPS.ms_dequant_bf16(self.s, self.upc, self.shc, self.OUT, self.K, self.nb, self.u, self.gs)
 
     def gemv(self, x):                                   # x [K] bf16 -> [OUT]
         p = self.path
