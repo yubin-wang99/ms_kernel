@@ -70,12 +70,16 @@ class QLinear:
     def fwd(self, X):                                    # decode: [B,K]->[B,OUT]
         B, p = X.shape[0], self.path
         if B == 1: return self.gemv(X[0])[None]          # B=1 -> wide GEMV
-        # B>1 W-only: scalar batched GEMV amortizes the weight read but explodes at M>=16
-        # (474us@16, 1867us@32). Route M>=16 to the split-K WMMA tensor-core decode
-        # (wonly_gemv_tc, column-major) -> flat ~188us, still weight-quantized (memory kept).
-        if p == "msaq_wonly":
-            if B >= 16: return OPS.wonly_gemv_tc(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
-            return OPS.wonly_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
+        # B>1 = GEMM regime. The scalar batched GEMV amortizes the weight read but explodes
+        # with M (239us@16, 879us@32, 1604us@64). At B>=16 the best tensor-core path is
+        # dequant-weight-to-bf16 (transient; resident weight stays quantized) + cuBLAS bf16
+        # GEMM -> FLAT ~102us (vs custom WMMA tc 99-364us; cuBLAS *is* tensor-core, and is the
+        # best GEMM). Ties bf16. Same vehicle for every weight scope (W-only & W+A, MSAQ & MX).
+        if B >= 16:
+            if p.startswith("mxint8"): return X @ OPS.mxint8_dequant_bf16(self.s, self.qwc, self.OUT, self.K, self.nb)
+            if p.startswith("msaq"):   return X @ OPS.ms_dequant_bf16(self.s, self.upc, self.shc, self.OUT, self.K, self.nb, self.u, self.gs)
+        # small batch (2..15): weight read still ~free per row, scalar batched is fine
+        if p == "msaq_wonly":   return OPS.wonly_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
         if p == "mxint8_wonly": return OPS.mxint8_gemv_batched_wide(X, self.s, self.qwc, B, self.OUT, self.nb)
         if p == "msaq_wa":      return OPS.wa_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
         if p == "mxint8_wa":    return OPS.mxint8_wa_gemv_batched_wide(X, self.s, self.qwc, B, self.OUT, self.nb)
