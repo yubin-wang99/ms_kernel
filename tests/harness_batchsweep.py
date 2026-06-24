@@ -70,11 +70,13 @@ class QLinear:
     def fwd(self, X):                                    # decode: [B,K]->[B,OUT]
         B, p = X.shape[0], self.path
         if B == 1: return self.gemv(X[0])[None]          # B=1 -> wide GEMV
-        # B>1 = GEMM regime. The scalar batched GEMV amortizes the weight read but explodes
-        # with M (239us@16, 879us@32, 1604us@64). At B>=16 the best tensor-core path is
-        # dequant-weight-to-bf16 (transient; resident weight stays quantized) + cuBLAS bf16
-        # GEMM -> FLAT ~102us (vs custom WMMA tc 99-364us; cuBLAS *is* tensor-core, and is the
-        # best GEMM). Ties bf16. Same vehicle for every weight scope (W-only & W+A, MSAQ & MX).
+        # B>1 = GEMM regime. The SHARED-ACTIVATION batched GEMV (activation staged in shared,
+        # not reloaded per output column -> was L1-bound at 87%) now wins bf16 up to ~M=10
+        # (40us@8 vs bf16 46) and beats dequant+cuBLAS up to ~M=20. Beyond that the cuda-core
+        # MAC compute grows (occupancy-bound at M=32) while bf16 stays tensor-core memory-bound,
+        # so at B>=16 the best MSAQ path is dequant-weight-to-bf16 (transient; resident weight
+        # stays quantized) + cuBLAS bf16 GEMM -> FLAT ~102us, ties bf16. Same vehicle for every
+        # weight scope (W-only & W+A, MSAQ & MX).
         if B >= 16:
             if p.startswith("mxint8"): return X @ OPS.mxint8_dequant_bf16(self.s, self.qwc, self.OUT, self.K, self.nb)
             if p.startswith("msaq"):   return X @ OPS.ms_dequant_bf16(self.s, self.upc, self.shc, self.OUT, self.K, self.nb, self.u, self.gs)

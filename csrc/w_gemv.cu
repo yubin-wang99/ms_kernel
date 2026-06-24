@@ -361,15 +361,24 @@ __global__ void wonly_gemv_batched_kernel(
         const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
         const uint8_t* __restrict__ shared_cm,
         float* __restrict__ partial, int M, int OUT, int NB, int u, int gs, int UB, int SB, int splitK) {
+    // SHARED-ACTIVATION (see wonly_gemv_batched_uspec): stage [MR][BLOCK] activation in
+    // shared once per K-block; the 128 output-column threads broadcast-read it.
+    __shared__ float As[MR][BLOCK];
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= OUT) return;
-    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
     const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
     const int K = NB * BLOCK, gs_shift = __ffs(gs) - 1;
+    const bool active = (o < OUT);
     float acc[MR];
     #pragma unroll
     for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
     for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? __bfloat162float(x[(long)(row0 + m) * K + blk * BLOCK + k]) : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
         const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
         const long base = (long)blk * OUT + o;
         uint8_t sb[8];
@@ -385,9 +394,8 @@ __global__ void wonly_gemv_batched_kernel(
                 const int g = k >> gs_shift;
                 const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
                 const float wf = (float)(up_code * 16 + sh_code) * scale;
-                const int kk = blk * BLOCK + k;
                 #pragma unroll
-                for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += wf * __bfloat162float(x[(long)m * K + kk]); }
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
             }
         } else {
             const int wbits = 8 - u;
@@ -407,14 +415,17 @@ __global__ void wonly_gemv_batched_kernel(
                 const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign; ubuf >>= wbits; unb -= wbits;
                 if ((k & gsmask) == 0) { if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; } sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign; sbuf >>= u; snb -= u; }
                 const float wf = (float)(up_code * (1 << u) + sh_code) * scale;
-                const int kk = blk * BLOCK + k;
                 #pragma unroll
-                for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += wf * __bfloat162float(x[(long)m * K + kk]); }
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
             }
         }
+        }
+        __syncthreads();
     }
-    #pragma unroll
-    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
 }
 
 // (u,gs)-specialized batched W-only (u<4). Same as wonly_gemv_batched_kernel<false,MR>
@@ -425,26 +436,41 @@ __global__ void wonly_gemv_batched_uspec(
         const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
         const uint8_t* __restrict__ shared_cm,
         float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    // SHARED-ACTIVATION decode GEMV. ncu showed the per-column global reload of x[m,kk]
+    // pegged L1 at 87% (DRAM only 17%) -> the activation, not the weight, bounded it.
+    // Stage the [MR][BLOCK] activation tile into shared once per K-block; all threads in
+    // the block (= 128 output columns) then broadcast-read it -> L1 traffic collapses,
+    // leaving the unpack ALU + weight DRAM as the (much smaller) bound.
+    __shared__ float As[MR][BLOCK];
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= OUT) return;
-    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
     const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
     const int K = NB * BLOCK;
+    const bool active = (o < OUT);
     float acc[MR];
     #pragma unroll
     for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
     for (int blk = b0; blk < b1; ++blk) {
-        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
-        const long base = (long)blk * OUT + o;
-        ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
-            const float wf = (float)word * scale;
-            const int kk = blk * BLOCK + k;
-            #pragma unroll
-            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += wf * __bfloat162float(x[(long)m * K + kk]); }
-        });
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? __bfloat162float(x[(long)(row0 + m) * K + blk * BLOCK + k]) : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+                const float wf = (float)word * scale;
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
+            });
+        }
+        __syncthreads();
     }
-    #pragma unroll
-    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
 }
 
 __global__ void gemv_combine_batched_kernel(
@@ -568,15 +594,24 @@ __global__ void wa_gemv_batched_kernel(
         const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
         const uint8_t* __restrict__ shared_cm,
         float* __restrict__ partial, int M, int OUT, int NB, int u, int gs, int UB, int SB, int splitK) {
+    // SHARED-ACTIVATION (see wonly_gemv_batched_uspec): stage int8 [MR][BLOCK] activation
+    // in shared once per K-block; the 128 output-column threads broadcast-read it.
+    __shared__ int8_t As[MR][BLOCK];
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= OUT) return;
-    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
     const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
     const int K = NB * BLOCK, gs_shift = __ffs(gs) - 1;
+    const bool active = (o < OUT);
     float acc[MR];
     #pragma unroll
     for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
     for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? qx[(long)(row0 + m) * K + blk * BLOCK + k] : (int8_t)0;
+        }
+        __syncthreads();
+        if (active) {
         const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
         const long base = (long)blk * OUT + o;
         uint8_t sb[8];
@@ -595,9 +630,8 @@ __global__ void wa_gemv_batched_kernel(
                 const int g = k >> gs_shift;
                 const int sh_code = ms::bfe_s32((int)sb[g >> 1], (g & 1) * 4, 4);
                 const int w = up_code * 16 + sh_code;
-                const int kk = blk * BLOCK + k;
                 #pragma unroll
-                for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) idot[j] += w * (int)qx[(long)m * K + kk]; }
+                for (int j = 0; j < MR; ++j) idot[j] += w * (int)As[j][k];
             }
         } else {
             const int wbits = 8 - u;
@@ -617,16 +651,19 @@ __global__ void wa_gemv_batched_kernel(
                 const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign; ubuf >>= wbits; unb -= wbits;
                 if ((k & gsmask) == 0) { if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; } sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign; sbuf >>= u; snb -= u; }
                 const int w = up_code * (1 << u) + sh_code;
-                const int kk = blk * BLOCK + k;
                 #pragma unroll
-                for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) idot[j] += w * (int)qx[(long)m * K + kk]; }
+                for (int j = 0; j < MR; ++j) idot[j] += w * (int)As[j][k];
             }
         }
         #pragma unroll
         for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += (float)idot[j] * sw * ms::e8m0_to_scale(sa_exp[m * NB + blk]); }
+        }
+        __syncthreads();
     }
-    #pragma unroll
-    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
 }
 
 // (u,gs)-specialized W+A decode (u<4): same as wa_gemv_wide_kernel<false> with a
@@ -668,30 +705,43 @@ __global__ void wa_gemv_batched_uspec(
         const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
         const uint8_t* __restrict__ shared_cm,
         float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    // SHARED-ACTIVATION (see wonly_gemv_batched_uspec): stage the int8 [MR][BLOCK]
+    // activation tile in shared once per K-block so the 128 output-column threads
+    // broadcast-read it instead of each reloading qx[m,kk] from global (L1-bound).
+    __shared__ int8_t As[MR][BLOCK];
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= OUT) return;
-    const int sp = blockIdx.y, row0 = blockIdx.z * MR;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
     const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
     const int K = NB * BLOCK;
+    const bool active = (o < OUT);
     float acc[MR];
     #pragma unroll
     for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
     for (int blk = b0; blk < b1; ++blk) {
-        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
-        const long base = (long)blk * OUT + o;
-        int idot[MR];
-        #pragma unroll
-        for (int j = 0; j < MR; ++j) idot[j] = 0;
-        ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
-            const int kk = blk * BLOCK + k;
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? qx[(long)(row0 + m) * K + blk * BLOCK + k] : (int8_t)0;
+        }
+        __syncthreads();
+        if (active) {
+            const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            int idot[MR];
             #pragma unroll
-            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) idot[j] += word * (int)qx[(long)m * K + kk]; }
-        });
-        #pragma unroll
-        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += (float)idot[j] * sw * ms::e8m0_to_scale(sa_exp[m * NB + blk]); }
+            for (int j = 0; j < MR; ++j) idot[j] = 0;
+            ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) idot[j] += word * (int)As[j][k];
+            });
+            #pragma unroll
+            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += (float)idot[j] * sw * ms::e8m0_to_scale(sa_exp[m * NB + blk]); }
+        }
+        __syncthreads();
     }
-    #pragma unroll
-    for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
 }
 
 // ---- DEQUANT the whole weight to a bf16 [OUT,K] buffer (column-major wide-load) -----
