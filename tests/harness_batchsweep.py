@@ -70,8 +70,12 @@ class QLinear:
     def fwd(self, X):                                    # decode: [B,K]->[B,OUT]
         B, p = X.shape[0], self.path
         if B == 1: return self.gemv(X[0])[None]          # B=1 -> wide GEMV
-        # B>1 W-only -> batched-decode GEMV (amortize weight read over B); else GEMM
-        if p == "msaq_wonly":   return OPS.wonly_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
+        # B>1 W-only: scalar batched GEMV amortizes the weight read but explodes at M>=16
+        # (474us@16, 1867us@32). Route M>=16 to the split-K WMMA tensor-core decode
+        # (wonly_gemv_tc, column-major) -> flat ~188us, still weight-quantized (memory kept).
+        if p == "msaq_wonly":
+            if B >= 16: return OPS.wonly_gemv_tc(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
+            return OPS.wonly_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
         if p == "mxint8_wonly": return OPS.mxint8_gemv_batched_wide(X, self.s, self.qwc, B, self.OUT, self.nb)
         if p == "msaq_wa":      return OPS.wa_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
         if p == "mxint8_wa":    return OPS.mxint8_wa_gemv_batched_wide(X, self.s, self.qwc, B, self.OUT, self.nb)

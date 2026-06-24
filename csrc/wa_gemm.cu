@@ -908,7 +908,7 @@ torch::Tensor wonly_gemv_tc_cuda(
     int splitK = (4 * 82) / (nO * nM); if (splitK < 1) splitK = 1; if (splitK > (int)NB) splitK = (int)NB;
     auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
     dim3 grid(nO, nM, splitK);
-    wonly_gemv_tc_kernel<false><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+    wonly_gemv_tc_kernel<true><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(   // column-major planes
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(),
         partial.data_ptr<float>(), (int)M, (int)OUT, K, (int)NB, (int)u, (int)gs, UB, SB, splitK);
