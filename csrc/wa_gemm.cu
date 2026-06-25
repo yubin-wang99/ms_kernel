@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <mma.h>
+#include <cuda_pipeline.h>
 #include <math.h>
 #include "core/ms_utils.cuh"
 #include <ATen/cuda/CUDAContext.h>
@@ -808,6 +809,304 @@ static inline int tile_cfg(int M) {
     return (M >= 256) ? 5 : 1;
 }
 
+// ===== FUSED SKINNY-M quantized tensor-core GEMM (B>=16 decode) =====
+//   Y[M,OUT] = X[M,K] @ dequant(W)^T, M small (16-32), memory-bound on the 11MB
+//   quantized weight. Reads quantized W (NOT the 34MB bf16), dequants per K-block in
+//   shared, mma.sync. MT=16 (skinny) x NT=64, 4 warps (1 N-subtile each). grid
+//   (OUT/64, ceil(M/16), splitK) for occupancy; partials summed by gemm_skinny_combine.
+//   Phase 1: production unpack_ms_weight_elem (correctness). (bfe/cp.async = Phase 2.)
+//   MT = ceil(M/16) (1 or 2): ONE block handles ALL M rows (weight read once/splitK).
+//   Fast dequant via stream_block_dense_bfe (column-major planes, single bfe/code).
+template<int U_, int GS_, int MT, bool RA = false, int NT = 64>
+__global__ void wonly_gemm_fused_skinny(
+        const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int K, int NB, int splitK) {
+    constexpr int NS = NT / 64;                      // N-subtiles per warp (NT=64->1, 128->2)
+    __shared__ __nv_bfloat16 As[16 * MT][WSK];
+    __shared__ __nv_bfloat16 Bs[NT][WSK];
+    __shared__ float tmp[4][16][16];
+    const int o0 = blockIdx.x * NT, sp = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MT][NS];
+    #pragma unroll
+    for (int mi = 0; mi < MT; ++mi)
+        #pragma unroll
+        for (int ns = 0; ns < NS; ++ns) wmma::fill_fragment(acc[mi][ns], 0.0f);
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < 16 * MT * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (m < M) ? X[(long)m * K + blk * BLOCK + k] : __float2bfloat16(0.0f);
+        }
+        if (tid < NT) {                              // NT threads dequant NT columns (full util at NT=128)
+            const int o = o0 + tid;
+            if (o < OUT) {
+                const float sc = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+                auto emit = [&](int k, int word) { Bs[tid][k] = __float2bfloat16((float)word * sc); };
+                if constexpr (RA) ms::stream_block_ra<U_, GS_>(upper_cm, shared_cm, (long)blk * OUT + o, emit);
+                else              ms::stream_block_dense_bfe<U_, GS_>(upper_cm, shared_cm, (long)blk * OUT + o, emit);
+            } else {
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) Bs[tid][k] = __float2bfloat16(0.0f);
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            #pragma unroll
+            for (int ns = 0; ns < NS; ++ns) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+                wmma::load_matrix_sync(b, &Bs[(warp * NS + ns) * 16][wk * 16], WSK);
+                #pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+                    wmma::load_matrix_sync(a, &As[mi * 16][wk * 16], WSK);
+                    wmma::mma_sync(acc[mi][ns], a, b, acc[mi][ns]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int ns = 0; ns < NS; ++ns) {
+        const int ob = o0 + (warp * NS + ns) * 16;
+        #pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            wmma::store_matrix_sync(wt, acc[mi][ns], 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) {
+                const int m = mi * 16 + e / 16, o = ob + e % 16;
+                if (m < M && o < OUT) partial[((long)sp * M + m) * OUT + o] = wt[e];
+            }
+            __syncwarp();
+        }
+    }
+}
+
+// FAIR MXINT8 twin of the fused skinny GEMM. Same vehicle (read quantized weight
+// direct, dequant per K-block to bf16 in shared, WMMA), so the MSAQ-vs-MXINT8 decode
+// comparison differs ONLY in the weight format: MXINT8 reads 17MB int8 (qweight_cm,
+// 32 contiguous int8 per (blk,o)) vs MSAQ's 11MB sub-byte planes. No sub-byte unpack
+// here (byte-aligned) -> if anything MXINT8 has the cheaper dequant; the only thing
+// left to separate them is bytes-moved = the mantissa-sharing advantage. Adaptive NT.
+template<int MT, int NT = 64>
+__global__ void mxint8_gemm_fused_skinny(
+        const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
+        const int8_t* __restrict__ qweight_cm,
+        float* __restrict__ partial, int M, int OUT, int K, int NB, int splitK) {
+    constexpr int NS = NT / 64;
+    __shared__ __nv_bfloat16 As[16 * MT][WSK];
+    __shared__ __nv_bfloat16 Bs[NT][WSK];
+    __shared__ float tmp[4][16][16];
+    const int o0 = blockIdx.x * NT, sp = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MT][NS];
+    #pragma unroll
+    for (int mi = 0; mi < MT; ++mi)
+        #pragma unroll
+        for (int ns = 0; ns < NS; ++ns) wmma::fill_fragment(acc[mi][ns], 0.0f);
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < 16 * MT * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (m < M) ? X[(long)m * K + blk * BLOCK + k] : __float2bfloat16(0.0f);
+        }
+        if (tid < NT) {
+            const int o = o0 + tid;
+            if (o < OUT) {
+                const float sc = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+                const int8_t* col = qweight_cm + ((long)blk * OUT + o) * BLOCK;   // 32 contiguous int8
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) Bs[tid][k] = __float2bfloat16((float)col[k] * sc);
+            } else {
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) Bs[tid][k] = __float2bfloat16(0.0f);
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            #pragma unroll
+            for (int ns = 0; ns < NS; ++ns) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+                wmma::load_matrix_sync(b, &Bs[(warp * NS + ns) * 16][wk * 16], WSK);
+                #pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+                    wmma::load_matrix_sync(a, &As[mi * 16][wk * 16], WSK);
+                    wmma::mma_sync(acc[mi][ns], a, b, acc[mi][ns]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int ns = 0; ns < NS; ++ns) {
+        const int ob = o0 + (warp * NS + ns) * 16;
+        #pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            wmma::store_matrix_sync(wt, acc[mi][ns], 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) {
+                const int m = mi * 16 + e / 16, o = ob + e % 16;
+                if (m < M && o < OUT) partial[((long)sp * M + m) * OUT + o] = wt[e];
+            }
+            __syncwarp();
+        }
+    }
+}
+
+// cp.async PIPELINED variant (Marlin core): prefetch the next K-block's quantized
+// weight (Wq/Ws) to shared via async copy, overlapping the current block's dequant+mma
+// -> hides the weight load latency (ncu: long_scoreboard 59% + barrier 21%).
+template<int U_, int GS_, int MT>
+__global__ void wonly_gemm_fused_skinny_pipe(
+        const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int K, int NB, int splitK) {
+    constexpr int WBITS = 8 - U_, UBc = BLOCK * WBITS / 8;
+    constexpr int SBc = ((BLOCK / GS_) * U_ + 7) / 8;
+    constexpr int WQB = 64 * UBc, WSB = 64 * SBc;
+    __shared__ uint8_t Wq[2][WQB];
+    __shared__ uint8_t Ws[2][((WSB + 15) / 16) * 16];
+    __shared__ __nv_bfloat16 As[16 * MT][WSK];
+    __shared__ __nv_bfloat16 Bs[64][WSK];
+    __shared__ float tmp[4][16][16];
+    const int o0 = blockIdx.x * 64, sp = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MT];
+    #pragma unroll
+    for (int mi = 0; mi < MT; ++mi) wmma::fill_fragment(acc[mi], 0.0f);
+    auto prefetch = [&](int blk, int buf) {
+        const uint8_t* us = upper_cm + (long)(blk * OUT + o0) * UBc;
+        const uint8_t* ss = shared_cm + (long)(blk * OUT + o0) * SBc;
+        // per-block weight (64 cols * UBc) is 16-byte aligned -> 16-byte cp.async (Marlin alignment lesson)
+        for (int i = tid * 16; i < WQB; i += 128 * 16) __pipeline_memcpy_async(&Wq[buf][i], us + i, 16);
+        for (int i = tid * 16; i < WSB; i += 128 * 16) __pipeline_memcpy_async(&Ws[buf][i], ss + i, 16);
+        __pipeline_commit();
+    };
+    const int nblk = b1 - b0;
+    if (nblk > 0) prefetch(b0, 0);
+    for (int i = 0; i < nblk; ++i) {
+        const int blk = b0 + i, buf = i & 1;
+        if (i + 1 < nblk) prefetch(blk + 1, (i + 1) & 1);
+        __pipeline_wait_prior(i + 1 < nblk ? 1 : 0);
+        __syncthreads();
+        for (int idx = tid; idx < 16 * MT * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (m < M) ? X[(long)m * K + blk * BLOCK + k] : __float2bfloat16(0.0f);
+        }
+        if (tid < 64) {
+            const int o = o0 + tid;
+            const float sc = (o < OUT) ? ms::e8m0_to_scale(scale_exp[blk * OUT + o]) : 0.0f;
+            ms::stream_block_dense_bfe<U_, GS_>(Wq[buf], Ws[buf], (long)tid,
+                [&](int k, int word) { Bs[tid][k] = __float2bfloat16((float)word * sc); });
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int wk = 0; wk < BLOCK / 16; ++wk) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+            wmma::load_matrix_sync(b, &Bs[warp * 16][wk * 16], WSK);
+            #pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+                wmma::load_matrix_sync(a, &As[mi * 16][wk * 16], WSK);
+                wmma::mma_sync(acc[mi], a, b, acc[mi]);
+            }
+        }
+        __syncthreads();
+    }
+    const int ob = o0 + warp * 16;
+    float* wt = &tmp[warp][0][0];
+    #pragma unroll
+    for (int mi = 0; mi < MT; ++mi) {
+        wmma::store_matrix_sync(wt, acc[mi], 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int m = mi * 16 + e / 16, o = ob + e % 16;
+            if (m < M && o < OUT) partial[((long)sp * M + m) * OUT + o] = wt[e];
+        }
+        __syncwarp();
+    }
+}
+
+// INT8-IMMA fused W+A GEMM (QServe): activation is int8 (qx from quant_act), weight is
+// reconstructed to int8 (no per-element I2F/scale), INT8 tensor core (IMMA) accumulates
+// int32 PER 32-K-block, then scaled by sa[m,blk]*sw[o,blk] into a float accumulator
+// (E8M0 is per-block, so the scale can't leave the K-loop fully -- it's applied to the
+// 16x16 OUTPUT tile, not to every weight element -> far fewer scale ops than bf16 dequant).
+template<int U_, int GS_, int MT>
+__global__ void wa_gemm_fused_imma(
+        const int8_t* __restrict__ qx, const int8_t* __restrict__ sa_exp,
+        const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm, float* __restrict__ partial,
+        int M, int OUT, int K, int NB, int splitK) {
+    constexpr int WI = BLOCK + 16;                       // int8 shared stride (pad)
+    __shared__ int8_t As[16 * MT][WI];
+    __shared__ int8_t Bs[64][WI];
+    __shared__ int32_t iscr[4][16][16];
+    __shared__ float accf[16 * MT][64];
+    __shared__ float swsh[64];          // per-block weight scales (precomputed, no inner exp2f)
+    __shared__ float sash[16 * MT];     // per-block activation scales
+    const int o0 = blockIdx.x * 64, sp = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (int idx = tid; idx < 16 * MT * 64; idx += 128) accf[idx / 64][idx % 64] = 0.0f;
+    __syncthreads();
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < 16 * MT * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (m < M) ? qx[(long)m * K + blk * BLOCK + k] : 0;
+        }
+        if (tid < 64) {
+            const int o = o0 + tid;
+            swsh[tid] = (o < OUT) ? ms::e8m0_to_scale(scale_exp[blk * OUT + o]) : 0.0f;
+            ms::stream_block_dense_bfe<U_, GS_>(upper_cm, shared_cm, (long)blk * OUT + o,
+                [&](int k, int word) { Bs[tid][k] = (int8_t)((o < OUT) ? word : 0); });
+        }
+        if (tid < 16 * MT) sash[tid] = (tid < M) ? ms::e8m0_to_scale(sa_exp[(long)tid * NB + blk]) : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> acc;
+            wmma::fill_fragment(acc, 0);
+            #pragma unroll
+            for (int wk = 0; wk < BLOCK / 16; ++wk) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b;
+                wmma::load_matrix_sync(a, &As[mi * 16][wk * 16], WI);
+                wmma::load_matrix_sync(b, &Bs[warp * 16][wk * 16], WI);
+                wmma::mma_sync(acc, a, b, acc);
+            }
+            wmma::store_matrix_sync(&iscr[warp][0][0], acc, 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) {
+                const int lm = e >> 4, lo = e & 15, m = mi * 16 + lm;
+                accf[m][warp * 16 + lo] += (float)iscr[warp][lm][lo] * sash[m] * swsh[warp * 16 + lo];
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+    for (int idx = tid; idx < 16 * MT * 64; idx += 128) {
+        const int m = idx / 64, oc = idx % 64, o = o0 + oc;
+        if (m < M && o < OUT) partial[((long)sp * M + m) * OUT + o] = accf[m][oc];
+    }
+}
+
+__global__ void gemm_skinny_combine(const float* __restrict__ partial,
+        __nv_bfloat16* __restrict__ Y, int M, int OUT, int splitK) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)M * OUT) return;
+    float s = 0.0f;
+    for (int sp = 0; sp < splitK; ++sp) s += partial[(long)sp * M * OUT + idx];
+    Y[idx] = __float2bfloat16(s);
+}
+
 } // namespace
 
 // Stage-0 launchers. ms_launch_quant_act = plain MXINT8 (used by the MXINT8
@@ -936,6 +1235,117 @@ torch::Tensor wonly_gemm_tc_cuda(
         scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
         (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
+    return Y;
+}
+
+// FUSED SKINNY-M quantized tensor-core GEMM (B>=16 decode). Reads quantized W (row-major
+// upper/shared planes), dequants in shared, mma.sync. splitK for occupancy + combine.
+torch::Tensor wonly_gemm_fused_skinny_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    int NT = ((int)M >= 32) ? 128 : 64;                   // dequant-thread tile width (NT=128 wins at M>=32:
+                                                          // NS=2 accumulator frags/warp add mma ILP -> hides long_sb)
+    if (const char* e = getenv("MS_FUSED_NT")) { int v = atoi(e); NT = (v == 128) ? 128 : (v == 64 ? 64 : NT); }
+    const int MT = ((int)M + 15) / 16, gx = ((int)OUT + NT - 1) / NT;
+    int splitK = ms::gemv_splitk_count(gx, (int)NB, 7);   // ~8x SM blocks (swept optimum)
+    if (const char* e = getenv("MS_FUSED_SPLITK")) { int v = atoi(e); if (v > 0) splitK = v; }
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, X.options().dtype(torch::kFloat32));
+    auto Y = torch::empty({M, OUT}, X.options());
+    const bool pipe = getenv("MS_FUSED_PIPE") && atoi(getenv("MS_FUSED_PIPE")) != 0;
+    const bool ra = getenv("MS_FUSED_RA") && atoi(getenv("MS_FUSED_RA")) != 0;  // upper_cm carries the ra plane
+    auto L = [&](auto Ut, auto Gt, auto MTt) {
+        auto args = std::make_tuple(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)K, (int)NB, splitK);
+        auto go = [&](auto K_) { K_<<<dim3(gx, splitK), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+                std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args),
+                std::get<5>(args), std::get<6>(args), std::get<7>(args), std::get<8>(args), std::get<9>(args)); };
+        if (pipe)         go(wonly_gemm_fused_skinny_pipe<decltype(Ut)::value, decltype(Gt)::value, decltype(MTt)::value>);
+        else if (NT==128) go(wonly_gemm_fused_skinny<decltype(Ut)::value, decltype(Gt)::value, decltype(MTt)::value, false, 128>);
+        else if (ra)      go(wonly_gemm_fused_skinny<decltype(Ut)::value, decltype(Gt)::value, decltype(MTt)::value, true>);
+        else              go(wonly_gemm_fused_skinny<decltype(Ut)::value, decltype(Gt)::value, decltype(MTt)::value, false>); };
+#define FSMT(UU,GG) switch (MT) { \
+        case 1: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{}); break; \
+        case 2: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{}); break; \
+        case 3: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,3>{}); break; \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{}); break; }
+    if      ((int)u==3 && (int)gs==16) { FSMT(3,16); }
+    else if ((int)u==2 && (int)gs==8)  { FSMT(2,8); }
+    else TORCH_CHECK(false, "fused skinny: only u3/gs16, u2/gs8");
+#undef FSMT
+    const int tot = (int)(M * OUT), thr = 256;
+    gemm_skinny_combine<<<(tot + thr - 1) / thr, thr, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return Y;
+}
+
+// FAIR MXINT8 twin host. Same dispatch (adaptive NT, splitK, combine) as the MSAQ
+// fused host -> only the weight format/bytes differ between the two measurements.
+torch::Tensor mxint8_gemm_fused_skinny_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    int NT = ((int)M >= 32) ? 128 : 64;
+    if (const char* e = getenv("MS_FUSED_NT")) { int v = atoi(e); NT = (v == 128) ? 128 : (v == 64 ? 64 : NT); }
+    const int MT = ((int)M + 15) / 16, gx = ((int)OUT + NT - 1) / NT;
+    int splitK = ms::gemv_splitk_count(gx, (int)NB, 7);
+    if (const char* e = getenv("MS_FUSED_SPLITK")) { int v = atoi(e); if (v > 0) splitK = v; }
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, X.options().dtype(torch::kFloat32));
+    auto Y = torch::empty({M, OUT}, X.options());
+    auto L = [&](auto MTt) {
+        auto go = [&](auto K_) { K_<<<dim3(gx, splitK), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()), scale_exp.data_ptr<int8_t>(),
+            qweight_cm.data_ptr<int8_t>(), partial.data_ptr<float>(),
+            (int)M, (int)OUT, (int)K, (int)NB, splitK); };
+        if (NT==128) go(mxint8_gemm_fused_skinny<decltype(MTt)::value, 128>);
+        else         go(mxint8_gemm_fused_skinny<decltype(MTt)::value, 64>); };
+    switch (MT) {
+        case 1: L(std::integral_constant<int,1>{}); break;
+        case 2: L(std::integral_constant<int,2>{}); break;
+        case 3: L(std::integral_constant<int,3>{}); break;
+        default: L(std::integral_constant<int,4>{}); break; }
+    const int tot = (int)(M * OUT), thr = 256;
+    gemm_skinny_combine<<<(tot + thr - 1) / thr, thr, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return Y;
+}
+
+// INT8-IMMA fused W+A GEMM host (QServe): quant_act -> int8 qx, then IMMA kernel.
+torch::Tensor wa_gemm_fused_imma_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    auto qx = torch::empty({M, K}, X.options().dtype(torch::kInt8));
+    auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
+    ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+                             qx.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB, (int)u, (int)gs);
+    const int MT = ((int)M + 15) / 16, gx = ((int)OUT + 63) / 64;
+    int splitK = ms::gemv_splitk_count(gx, (int)NB, 7);
+    if (const char* e = getenv("MS_FUSED_SPLITK")) { int v = atoi(e); if (v > 0) splitK = v; }
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, X.options().dtype(torch::kFloat32));
+    auto Y = torch::empty({M, OUT}, X.options());
+    auto L = [&](auto Ut, auto Gt, auto MTt) {
+        wa_gemm_fused_imma<decltype(Ut)::value, decltype(Gt)::value, decltype(MTt)::value>
+            <<<dim3(gx, splitK), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+            qx.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)K, (int)NB, splitK); };
+#define IMT(UU,GG) switch (MT) { \
+        case 1: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{}); break; \
+        case 2: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{}); break; \
+        case 3: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,3>{}); break; \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{}); break; }
+    if      ((int)u==3 && (int)gs==16) { IMT(3,16); }
+    else if ((int)u==2 && (int)gs==8)  { IMT(2,8); }
+    else TORCH_CHECK(false, "imma: only u3/gs16, u2/gs8");
+#undef IMT
+    const int tot = (int)(M * OUT), thr = 256;
+    gemm_skinny_combine<<<(tot + thr - 1) / thr, thr, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
     return Y;
 }
 

@@ -84,6 +84,19 @@ class QLinear:
         # so at B>=16 the best MSAQ path is dequant-weight-to-bf16 (transient; resident weight
         # stays quantized) + cuBLAS bf16 GEMM -> FLAT ~102us, ties bf16. Same vehicle for every
         # weight scope (W-only & W+A, MSAQ & MX).
+        # fused quantized tensor-core GEMM: wins GEMV from B>=~8 (memory-bound, flat vs GEMV's
+        # compute blowup). MS_FUSED_MINB sets the threshold (default 16); B below uses GEMV.
+        _fminb = int(os.environ.get("MS_FUSED_MINB", "16"))
+        # Fused quantized tensor-core GEMM = the weight-read vehicle. The linear projection is
+        # weight-quant + bf16-activation in EVERY weight scope (W-only S1/S4 and W+A S2/S5/S6 alike;
+        # B>=16 deployed path already fed bf16 X to dequant+cuBLAS for both). KV quant lives in the
+        # attention kernel, not here, so S4/S5/S6 reuse the same fused linear as S1/S2.
+        if p in ("msaq_wonly", "msaq_wa") and os.environ.get("MS_FUSED_B16") == "1" and B >= _fminb:
+            return OPS.wonly_gemm_fused_skinny(X, self.s, self.upc, self.shc, B, self.OUT, self.K, self.nb, self.u, self.gs)
+        # FAIR twin: MXINT8 gets the SAME fused vehicle (read 17MB int8 direct -> dequant -> WMMA).
+        # Only the weight format/bytes differ between mq and mx, so mq/mx isolates mantissa-sharing.
+        if p in ("mxint8_wonly", "mxint8_wa") and os.environ.get("MS_FUSED_B16") == "1" and B >= _fminb:
+            return OPS.mxint8_gemm_fused_skinny(X, self.s, self.qwc, B, self.OUT, self.K, self.nb)
         if B >= 16:
             if p.startswith("mxint8"): return X @ OPS.mxint8_dequant_bf16(self.s, self.qwc, self.OUT, self.K, self.nb)
             if p.startswith("msaq"):   return X @ OPS.ms_dequant_bf16(self.s, self.upc, self.shc, self.OUT, self.K, self.nb, self.u, self.gs)

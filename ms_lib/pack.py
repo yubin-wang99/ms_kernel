@@ -137,6 +137,57 @@ def pack_weight(W, u, gs):
     return d
 
 
+def pack_weight_ra(W, u, gs):
+    """REGISTER-ALIGNED pack: SAME codes as pack_weight (signed q_upper/r_shared),
+    but the upper plane is padded so each (8-u)-bit code lies WHOLLY inside one 32-bit
+    word (CPW = floor(32/(8-u)) codes/word, NW words) -> the kernel extracts each code
+    with ONE bfe.s32 (HW sign-extend), no straddle / rolling-buffer / mask / sign-extend.
+    shared stays dense (n_group*u <= 8 -> already 1 straddle-free byte). +~20% upper
+    bytes (u3 20->24, u2 24->28) buys ~4->1 ALU ops/elem. Decode == pack_weight."""
+    OUT, K = W.shape
+    assert K % BLOCK == 0
+    nb = K // BLOCK; wbits = 8 - u; n_group = BLOCK // gs
+    CPW = 32 // wbits; NW = (BLOCK + CPW - 1) // CPW
+    blocks = W.reshape(OUT, nb, BLOCK).reshape(OUT * nb, BLOCK)
+    scale, q_upper, r_shared = decompose(blocks, u, gs)
+    exp = np.rint(np.log2(scale.reshape(-1))).astype(np.int64).reshape(OUT, nb)
+    qu = q_upper.reshape(OUT, nb, BLOCK); rs = r_shared.reshape(OUT, nb, n_group)
+    # register-aligned upper: words[..,wi] |= (code & mask) << ((k%CPW)*wbits)
+    mask = (1 << wbits) - 1
+    words = np.zeros((OUT, nb, NW), dtype=np.uint32)
+    for k in range(BLOCK):
+        wi = k // CPW; bp = (k % CPW) * wbits
+        words[..., wi] |= ((qu[..., k].astype(np.uint64) & mask).astype(np.uint32) << bp)
+    upper_ra = words.view(np.uint8).reshape(OUT, nb, NW * 4)        # little-endian bytes
+    sh = _pack_codes_lsb(rs, u)                                     # [OUT,nb,SB] dense (1 byte)
+    SB = sh.shape[-1]
+    return dict(
+        scale_exp=np.ascontiguousarray(exp.T.astype(np.int8)),     # [nb, OUT]
+        upper_ra_cm=np.ascontiguousarray(upper_ra.transpose(1, 0, 2)),  # [nb, OUT, NW*4]
+        shared_cm=np.ascontiguousarray(sh.transpose(1, 0, 2)),     # [nb, OUT, SB]
+        OUT=OUT, K=K, nb=nb, u=u, gs=gs, wbits=wbits, CPW=CPW, NW=NW, SB=SB, n_group=n_group,
+    )
+
+
+def dequant_weight_ra(p):
+    """register-aligned packed -> dense float [OUT,K] (oracle)."""
+    OUT, nb, u, gs, wbits, CPW, NW, n_group = (p["OUT"], p["nb"], p["u"], p["gs"],
+                                               p["wbits"], p["CPW"], p["NW"], p["n_group"])
+    exp = p["scale_exp"].T.astype(np.int64)                        # [OUT,nb]
+    words = np.ascontiguousarray(p["upper_ra_cm"].transpose(1, 0, 2)).reshape(OUT, nb, NW, 4).view(np.uint32).reshape(OUT, nb, NW)
+    mask = (1 << wbits) - 1; half = 1 << (wbits - 1)
+    q_upper = np.empty((OUT, nb, BLOCK), np.int64)
+    for k in range(BLOCK):
+        wi = k // CPW; bp = (k % CPW) * wbits
+        v = ((words[..., wi] >> bp) & mask).astype(np.int64)
+        q_upper[..., k] = np.where(v >= half, v - (1 << wbits), v)   # sign-extend
+    sh = np.ascontiguousarray(p["shared_cm"].transpose(1, 0, 2))    # [OUT,nb,SB]
+    r_shared = _unpack_codes_lsb(sh, n_group, u)                    # signed
+    r_exp = np.repeat(r_shared, gs, axis=2)
+    qfull = q_upper * (1 << u) + r_exp
+    return (qfull.astype(np.float64) * (2.0 ** exp)[:, :, None]).reshape(OUT, p["K"])
+
+
 def decompose_naive(x_blocked, u, gs):
     """NAIVE mantissa-sharing: quantize to MXINT8 int8 q8, then split q8 into a
     per-element high part + group-shared low u bits (the low bits are AVERAGED).

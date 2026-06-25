@@ -226,6 +226,75 @@ __device__ __forceinline__ void stream_block_uspec_unsigned(
     }
 }
 
+// --- DENSE + SELECTIVE-bfe unpack: reads the EXISTING dense upper_cm plane (pack_weight,
+//   0.66x bytes, NO repack) but extracts each code with a SINGLE bfe.s32 when it does not
+//   cross a 32-bit register boundary (compile-time known), and funnelshift+bfe only for the
+//   few straddlers. Keeps dense bytes AND ~1 op/code. Bit-exact to stream_block_uspec.
+template<int U_, int GS_, typename F>
+__device__ __forceinline__ void stream_block_dense_bfe(
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        long base, F per_elem) {
+    constexpr int MXB = 32;
+    constexpr int WBITS = 8 - U_;
+    constexpr int UBc = MXB * WBITS / 8;
+    constexpr int NW  = UBc / 4;
+    constexpr int SBc = ((MXB / GS_) * U_ + 7) / 8;
+    constexpr int gs_shift = (GS_>=2?1:0)+(GS_>=4?1:0)+(GS_>=8?1:0)+(GS_>=16?1:0)+(GS_>=32?1:0);
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UBc);
+    uint32_t ureg[NW];
+    #pragma unroll
+    for (int i = 0; i < NW; ++i) ureg[i] = src[i];
+    uint32_t sreg = 0u;
+    #pragma unroll
+    for (int i = 0; i < SBc; ++i) sreg |= (uint32_t)shared_cm[base * SBc + i] << (8 * i);
+    #pragma unroll
+    for (int k = 0; k < MXB; ++k) {
+        const int gb = k * WBITS, wi = gb >> 5, bo = gb & 31;
+        int up;
+        if (bo + WBITS <= 32) {                                  // no straddle -> 1 bfe
+            up = bfe_s32((int)ureg[wi], bo, WBITS);
+        } else {                                                 // straddle -> funnel window + bfe
+            const uint32_t hi = (wi + 1 < NW) ? ureg[wi + 1] : 0u;
+            up = bfe_s32((int)__funnelshift_r(ureg[wi], hi, bo), 0, WBITS);
+        }
+        const int g  = k >> gs_shift;
+        const int sh = bfe_s32((int)sreg, g * U_, U_);
+        per_elem(k, up * (1 << U_) + sh);
+    }
+}
+
+// --- REGISTER-ALIGNED unpack (ms_lib.pack.pack_weight_ra). Upper codes padded so each
+//   (8-U_)-bit code lies wholly inside one 32-bit word (CPW codes/word, NW words) ->
+//   ONE bfe.s32 per code (HW sign-extend), no straddle/rolling-buffer/mask/sign-extend.
+//   shared dense in 1 word (n_group*U_<=8), also bfe. Reconstructs the SAME signed int8
+//   word as stream_block_uspec. base = blk*OUT+o (column-major); a column's NW words are
+//   contiguous at upper_ra_cm + base*NW*4.
+template<int U_, int GS_, typename F>
+__device__ __forceinline__ void stream_block_ra(
+        const uint8_t* __restrict__ upper_ra_cm, const uint8_t* __restrict__ shared_cm,
+        long base, F per_elem) {
+    constexpr int MXB = 32;
+    constexpr int WBITS = 8 - U_;
+    constexpr int CPW = 32 / WBITS;
+    constexpr int NW  = (MXB + CPW - 1) / CPW;
+    constexpr int SBc = ((MXB / GS_) * U_ + 7) / 8;
+    constexpr int gs_shift = (GS_>=2?1:0)+(GS_>=4?1:0)+(GS_>=8?1:0)+(GS_>=16?1:0)+(GS_>=32?1:0);
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_ra_cm + base * (NW * 4));
+    uint32_t ureg[NW];
+    #pragma unroll
+    for (int i = 0; i < NW; ++i) ureg[i] = src[i];
+    uint32_t sreg = 0u;
+    #pragma unroll
+    for (int i = 0; i < SBc; ++i) sreg |= (uint32_t)shared_cm[base * SBc + i] << (8 * i);
+    #pragma unroll
+    for (int k = 0; k < MXB; ++k) {
+        const int up = bfe_s32((int)ureg[k / CPW], (k % CPW) * WBITS, WBITS);   // 1 op, signed
+        const int g  = k >> gs_shift;
+        const int sh = bfe_s32((int)sreg, g * U_, U_);                          // 1 op, signed
+        per_elem(k, up * (1 << U_) + sh);
+    }
+}
+
 // --- NIBBLE-ALIGNED re-layout streaming unpack (ms_lib.pack.pack_weight_relayout).
 //   The (8-u)-bit per-element upper code is split into a high nibble (signed 4-bit,
 //   16B plane, bfe-extractable with HW sign-extend, no straddle) + a small dense

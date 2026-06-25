@@ -572,6 +572,156 @@ __global__ void wonly_gemv_batched_unsigned(
     }
 }
 
+// REGISTER-ALIGNED batched W-only GEMV: same shared-activation structure, weight from
+// the register-aligned plane via stream_block_ra (1 bfe/code). Tests whether cutting the
+// unpack ALU raises MLP/BW and beats MXINT8.
+template<int U_, int GS_, int MR>
+__global__ void wonly_gemv_batched_ra(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_ra_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    __shared__ float As[MR][BLOCK];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    const bool active = (o < OUT);
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? __bfloat162float(x[(long)(row0 + m) * K + blk * BLOCK + k]) : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            ms::stream_block_ra<U_, GS_>(upper_ra_cm, shared_cm, base, [&](int k, int word) {
+                const float wf = (float)word * scale;
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
+            });
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
+}
+
+// DENSE + SELECTIVE-bfe batched GEMV: same production dense planes (upper_cm/shared_cm),
+// unpack via stream_block_dense_bfe (1 bfe/code for non-straddlers). No repack, dense bytes.
+template<int U_, int GS_, int MR>
+__global__ void wonly_gemv_batched_densebfe(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    __shared__ float As[MR][BLOCK];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    const bool active = (o < OUT);
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? __bfloat162float(x[(long)(row0 + m) * K + blk * BLOCK + k]) : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            ms::stream_block_dense_bfe<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+                const float wf = (float)word * scale;
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
+            });
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
+}
+
+// REGISTER-ALIGNED + SEPARATED-SCALE batched GEMV: removes the per-element combine
+// (up<<u + sh) by folding scale*2^u into the upper FFMA (acc += scale16*up*As) and
+// handling the shared code per-group via activation group-sums qg (acc += scale*sh*qg).
+// Per element: bfe(1) + FFMA only — no shift/add combine. Same acc[MR] (no extra accum).
+template<int U_, int GS_, int MR>
+__global__ void wonly_gemv_batched_ra_sepsc(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_ra_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    constexpr int WBITS = 8 - U_, CPW = 32 / WBITS, NW = (BLOCK + CPW - 1) / CPW;
+    constexpr int NG = BLOCK / GS_;
+    constexpr int SBc = ((BLOCK / GS_) * U_ + 7) / 8;
+    constexpr int gs_shift = (GS_>=2?1:0)+(GS_>=4?1:0)+(GS_>=8?1:0)+(GS_>=16?1:0)+(GS_>=32?1:0);
+    __shared__ float As[MR][BLOCK];
+    __shared__ float qg[MR][NG];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    const bool active = (o < OUT);
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? __bfloat162float(x[(long)(row0 + m) * K + blk * BLOCK + k]) : 0.0f;
+        }
+        __syncthreads();
+        for (int idx = tid; idx < MR * NG; idx += blockDim.x) {   // qg[j][g] = sum As over group (once/block)
+            const int j = idx / NG, g = idx % NG; float s = 0.0f;
+            #pragma unroll
+            for (int t = 0; t < GS_; ++t) s += As[j][g * GS_ + t];
+            qg[j][g] = s;
+        }
+        __syncthreads();
+        if (active) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const float scale16 = scale * (float)(1 << U_);
+            const long base = (long)blk * OUT + o;
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_ra_cm + base * (NW * 4));
+            uint32_t ureg[NW];
+            #pragma unroll
+            for (int i = 0; i < NW; ++i) ureg[i] = src[i];
+            uint32_t sreg = 0u;
+            #pragma unroll
+            for (int i = 0; i < SBc; ++i) sreg |= (uint32_t)shared_cm[base * SBc + i] << (8 * i);
+            #pragma unroll
+            for (int k = 0; k < BLOCK; ++k) {                     // upper term: NO combine
+                const float wf = scale16 * (float)ms::bfe_s32((int)ureg[k / CPW], (k % CPW) * WBITS, WBITS);
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
+            }
+            #pragma unroll
+            for (int g = 0; g < NG; ++g) {                        // shared term: per group
+                const float shc = scale * (float)ms::bfe_s32((int)sreg, g * U_, U_);
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) acc[j] += shc * qg[j][g];
+            }
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
+}
+
 // NIBBLE-RELAYOUT batched W-only GEMV. Same shared-activation structure as
 // wonly_gemv_batched_uspec, but the weight comes from the 3 re-layout planes
 // (hi4/lowun/shared) and is unpacked via stream_block_relayout (high nibble = bfe,
@@ -1392,6 +1542,108 @@ torch::Tensor wonly_gemv_batched_unsigned_cuda(
     else if ((int)u==2 && (int)gs==8)  { UNMR(2,8); }
     else TORCH_CHECK(false, "unsigned proto: only u3/gs16 and u2/gs8");
 #undef UNMR
+    gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return y;
+}
+
+// REGISTER-ALIGNED batched GEMV host: planes from pack_weight_ra (upper_ra_cm).
+torch::Tensor wonly_gemv_batched_ra_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_ra_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto L = [&](auto Ut, auto Gt, auto MRt) {
+        wonly_gemv_batched_ra<decltype(Ut)::value, decltype(Gt)::value, decltype(MRt)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), upper_ra_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK); };
+#define RAMR(UU,GG) switch (MR) { \
+        case 1:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{});  break; \
+        case 2:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{});  break; \
+        case 4:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{});  break; \
+        case 8:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,8>{});  break; \
+        case 16: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,16>{}); break; \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,32>{}); break; }
+    if      ((int)u==3 && (int)gs==16) { RAMR(3,16); }
+    else if ((int)u==2 && (int)gs==8)  { RAMR(2,8); }
+    else TORCH_CHECK(false, "ra proto: only u3/gs16 and u2/gs8");
+#undef RAMR
+    gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return y;
+}
+
+torch::Tensor wonly_gemv_batched_ra_sepsc_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_ra_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto L = [&](auto Ut, auto Gt, auto MRt) {
+        wonly_gemv_batched_ra_sepsc<decltype(Ut)::value, decltype(Gt)::value, decltype(MRt)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), upper_ra_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK); };
+#define RSMR(UU,GG) switch (MR) { \
+        case 1:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{});  break; \
+        case 2:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{});  break; \
+        case 4:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{});  break; \
+        case 8:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,8>{});  break; \
+        case 16: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,16>{}); break; \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,32>{}); break; }
+    if      ((int)u==3 && (int)gs==16) { RSMR(3,16); }
+    else if ((int)u==2 && (int)gs==8)  { RSMR(2,8); }
+    else TORCH_CHECK(false, "ra_sepsc proto: only u3/gs16 and u2/gs8");
+#undef RSMR
+    gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return y;
+}
+torch::Tensor wonly_gemv_batched_densebfe_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto L = [&](auto Ut, auto Gt, auto MRt) {
+        wonly_gemv_batched_densebfe<decltype(Ut)::value, decltype(Gt)::value, decltype(MRt)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK); };
+#define DBMR(UU,GG) switch (MR) { \
+        case 1:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{});  break; \
+        case 2:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{});  break; \
+        case 4:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{});  break; \
+        case 8:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,8>{});  break; \
+        case 16: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,16>{}); break; \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,32>{}); break; }
+    if      ((int)u==3 && (int)gs==16) { DBMR(3,16); }
+    else if ((int)u==2 && (int)gs==8)  { DBMR(2,8); }
+    else TORCH_CHECK(false, "densebfe proto: only u3/gs16 and u2/gs8");
+#undef DBMR
     gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
         (int)M, (int)OUT, splitK);
