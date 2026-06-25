@@ -29,7 +29,7 @@ cutlass_dir = os.environ.get("CUTLASS_DIR")
 if cutlass_dir:
     include_dirs.append(os.path.join(cutlass_dir, "include"))
 
-nvcc_flags = ["-O3", "-gencode", "arch=compute_86,code=sm_86", "--use_fast_math",
+nvcc_flags = ["-O3", "-gencode", "arch=compute_120,code=sm_120", "--use_fast_math",
               "--expt-extended-lambda"]   # device lambdas for the (u,gs)-specialized unpack helper
 cxx_flags = ["-O3"]
 if os.environ.get("ENABLE_PROFILING") == "1":

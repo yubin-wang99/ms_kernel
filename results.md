@@ -67,3 +67,20 @@ RTX 3090, CUDA-graph decode (prefill=800 / decode=3880). Timing harness: random 
 | Mistral-7B | S2 W+A | u4 gs32 | 0.790 | 0.895 |
 | Mistral-7B | S3 KV-only | u4 gs32 | 0.627 | 1.008 |
 | Mistral-7B | S4 W+KV | u4 gs32 | 0.416 | 0.667 |
+
+---
+
+## Blackwell (RTX PRO 4000) — kernel_ver3, absolute ms (2026-06-24)
+
+New server: **NVIDIA RTX PRO 4000 Blackwell (sm_120)**, CUDA 13.2, torch 2.12.0+cu132, Python 3.12 (`.venv`). `ms_cuda` rebuilt for sm_120. kernel_ver3 = all ver3 optimizations ON (no `MS_*` toggles). Source: `tests/e2e_1024_128.py`, Llama-3.1-8B 32L, **B=1, L_in=1024, L_out=128**, per-scope robust (u,gs). Absolute milliseconds (not normalized); `prefill`=TTFT(1024 tok), `decode`=integrated over 128 steps, `total`=prefill+decode. Ratios <1 = MSAQ faster.
+
+| scope | cfg | prefill bf/mx/**mq** (ms) | decode bf/mx/**mq** (ms) | total bf/mx/**mq** (ms) | mq/bf | mq/mx |
+|---|---|---|---|---|---|---|
+| S1 W-only | u3g16 | 256.3 / 287.1 / **283.5** | 3609.9 / 2250.4 / **1847.6** | 3866.2 / 2537.5 / **2131.1** | 0.55 | 0.84 |
+| S2 W+A | u2g8 | 258.5 / 288.8 / **287.0** | 3626.9 / 2284.1 / **2005.3** | 3885.4 / 2572.9 / **2292.3** | 0.59 | 0.89 |
+| S3 KV-only | u4g2 | 258.7 / 261.1 / **257.9** | 3630.5 / 3571.8 / **3459.2** | 3889.2 / 3832.9 / **3717.1** | 0.96 | 0.97 |
+| S4 W-only+KV | u2g8 | 259.8 / 292.4 / **289.3** | 3609.0 / 2188.9 / **1871.1** | 3868.8 / 2481.3 / **2160.4** | 0.56 | 0.87 |
+| S5 W+A+KV | u2g8 | 259.0 / 291.9 / **289.3** | 3620.3 / 2208.8 / **1879.9** | 3879.3 / 2500.6 / **2169.2** | 0.56 | 0.87 |
+| S6 W+A+KV+AA | u2g8 | 259.0 / 291.4 / **289.6** | 3619.1 / 2198.5 / **1880.2** | 3878.2 / 2489.9 / **2169.8** | 0.56 | 0.87 |
+
+Notes: at B=1 the run is decode-dominated (decode ≫ prefill), so the total ratio tracks decode. MSAQ reaches **0.55–0.59× of BF16** on weight-touching scopes (S1/S2/S4/S5/S6). S3 (KV-only) shows little gain (0.96×) — KV quant alone has small weight-DRAM savings, as expected. Batch-size sweep below.
