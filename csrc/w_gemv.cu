@@ -348,6 +348,64 @@ __global__ void wonly_gemv_wide_uspec(
     partial[(long)sp * OUT + o] = acc;
 }
 
+// MS-UNSIGNED wide B=1 GEMV (naive-ms): identical to wonly_gemv_wide_uspec but shared
+// is UNSIGNED (no sign-extend) and the non-sepsc word is (up<<U_)|sh.
+template<int U_, int GS_>
+__global__ void wonly_gemv_wide_unsigned(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial,
+        int OUT, int NB, int splitK, int sepsc) {
+    constexpr int WBITS = 8 - U_;
+    constexpr int UBc = BLOCK * WBITS / 8;
+    constexpr int SBc = ((BLOCK / GS_) * U_ + 7) / 8;
+    constexpr int NW  = UBc / 4;
+    constexpr int NSW = (SBc + 3) / 4 > 0 ? (SBc + 3) / 4 : 1;
+    constexpr uint32_t umask = (1u << WBITS) - 1u, usign = 1u << (WBITS - 1);
+    constexpr uint32_t smask = (1u << U_) - 1u;
+    constexpr int gsmask = GS_ - 1;
+    const int o  = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK;
+    const int b0 = sp * per, b1 = min(b0 + per, NB);
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const long sbase = ((long)blk * OUT + o) * SBc;
+        uint32_t sreg[NSW] = {0u};
+        #pragma unroll
+        for (int i = 0; i < SBc; ++i) sreg[i >> 2] |= (uint32_t)shared_cm[sbase + i] << (8 * (i & 3));
+        const uint32_t* srcp = reinterpret_cast<const uint32_t*>(upper_cm + ((long)blk * OUT + o) * UBc);
+        uint32_t ureg[NW];
+        #pragma unroll
+        for (int i = 0; i < NW; ++i) ureg[i] = srcp[i];
+        uint64_t ubuf = 0; int unb = 0, uwi = 0;
+        uint64_t sbuf = 0; int snb = 0, swi = 0;
+        int sh_code = 0;
+        float bup = 0.0f, bsh = 0.0f, xsum = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < BLOCK; ++k) {
+            if (unb < WBITS) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+            const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+            ubuf >>= WBITS; unb -= WBITS;
+            const float xk = __bfloat162float(x[blk * BLOCK + k]);
+            if ((k & gsmask) == 0) {
+                if (sepsc && k > 0) bsh += sh_code * xsum;
+                if (snb < U_) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+                sh_code = (int)((uint32_t)sbuf & smask);   // UNSIGNED
+                sbuf >>= U_; snb -= U_; xsum = 0.0f;
+            }
+            if (sepsc) { bup += up_code * xk; xsum += xk; }
+            else acc += (static_cast<float>((up_code << U_) | sh_code) * scale) * xk;
+        }
+        if (sepsc) { bsh += sh_code * xsum; acc += scale * ((float)(1 << U_) * bup + bsh); }
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
 // ---- BATCHED-DECODE W-only GEMV (M=B small): amortize the weight read over B rows --
 //   The B=1 wide GEMV is memory-bound on the weight (the column read dominates; the
 //   activation is tiny). At decode batch M=B the SAME weight column serves all B rows,
@@ -460,6 +518,89 @@ __global__ void wonly_gemv_batched_uspec(
             const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
             const long base = (long)blk * OUT + o;
             ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+                const float wf = (float)word * scale;
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
+            });
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
+}
+
+// MS-UNSIGNED batched W-only GEMV: identical to wonly_gemv_batched_uspec but the
+// weight word comes from the unsigned (OR-concat) unpack. Same upper_cm/shared_cm
+// planes (from pack_weight_unsigned). Tests whether unsigned-shared cuts kernel time.
+template<int U_, int GS_, int MR>
+__global__ void wonly_gemv_batched_unsigned(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    __shared__ float As[MR][BLOCK];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    const bool active = (o < OUT);
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? __bfloat162float(x[(long)(row0 + m) * K + blk * BLOCK + k]) : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            ms::stream_block_uspec_unsigned<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+                const float wf = (float)word * scale;
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
+            });
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
+}
+
+// NIBBLE-RELAYOUT batched W-only GEMV. Same shared-activation structure as
+// wonly_gemv_batched_uspec, but the weight comes from the 3 re-layout planes
+// (hi4/lowun/shared) and is unpacked via stream_block_relayout (high nibble = bfe,
+// HW sign-extend, no straddle). Prototype to test the user's nibble-align idea.
+template<int U_, int GS_, int MR>
+__global__ void wonly_gemv_batched_relayout(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ hi4_cm,
+        const uint8_t* __restrict__ lowun_cm, const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    __shared__ float As[MR][BLOCK];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    const bool active = (o < OUT);
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? __bfloat162float(x[(long)(row0 + m) * K + blk * BLOCK + k]) : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            ms::stream_block_relayout<U_, GS_>(hi4_cm, lowun_cm, shared_cm, base, [&](int k, int word) {
                 const float wf = (float)word * scale;
                 #pragma unroll
                 for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
@@ -747,6 +888,79 @@ __global__ void wa_gemv_batched_uspec(
     }
 }
 
+// MS-UNSIGNED W+A wide B=1 (naive-ms): wa_gemv_wide_uspec with unsigned weight unpack.
+template<int U_, int GS_>
+__global__ void wa_gemv_wide_unsigned(
+        const int8_t*  __restrict__ qx, const int8_t* __restrict__ sa_exp,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int OUT, int NB, int splitK) {
+    const int o   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp  = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK;
+    const int b0  = sp * per, b1 = min(b0 + per, NB);
+    extern __shared__ int8_t qx_sh[];
+    const int slice = (b1 - b0) * BLOCK;
+    for (int i = threadIdx.x; i < slice; i += blockDim.x) qx_sh[i] = qx[b0 * BLOCK + i];
+    __syncthreads();
+    if (o >= OUT) return;
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        const float sa = ms::e8m0_to_scale(sa_exp[blk]);
+        const long base = (long)blk * OUT + o;
+        const int8_t* qxb = qx_sh + (blk - b0) * BLOCK;
+        int idot = 0;
+        ms::stream_block_uspec_unsigned<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+            idot += word * (int)qxb[k];
+        });
+        acc += (float)idot * sw * sa;
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
+// MS-UNSIGNED W+A batched (naive-ms): wa_gemv_batched_uspec with unsigned weight unpack.
+template<int U_, int GS_, int MR>
+__global__ void wa_gemv_batched_unsigned(
+        const int8_t* __restrict__ qx, const int8_t* __restrict__ sa_exp,
+        const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    __shared__ float As[MR][BLOCK];
+    __shared__ float Sas[MR];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    const bool active = (o < OUT);
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        if (tid < MR) Sas[tid] = (row0 + tid < M) ? ms::e8m0_to_scale(sa_exp[(row0 + tid) * NB + blk]) : 0.0f;
+        __syncthreads();
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? (float)qx[(long)(row0 + m) * K + blk * BLOCK + k] * Sas[m] : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
+            const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            ms::stream_block_uspec_unsigned<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+                const float wf = (float)word * sw;
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
+            });
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
+}
+
 // FULLY-FUSED decode W+A: fake-quant the activation INSIDE the staging (no separate
 // quant_act kernel, no int8 qx global round-trip). One thread per row 2-passes its 32-elem
 // block (amax -> E8M0 scale; round+clamp to int8 -> As = q*sa, float), then the W-only
@@ -851,6 +1065,42 @@ __global__ void ms_dequant_bf16_kernel(
     }
 }
 
+// MS-UNSIGNED dequant: shared UNSIGNED (no sign-extend), word = (up<<u)|sh. For naive-ms.
+__global__ void ms_dequant_bf16_unsigned_kernel(
+        const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm, __nv_bfloat16* __restrict__ Wbf,
+        int OUT, int K, int NB, int u, int gs, int UB, int SB) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int blk = blockIdx.y;
+    if (o >= OUT) return;
+    const int wbits = 8 - u, gsmask = gs - 1;
+    const uint32_t umask = (1u << wbits) - 1u, usign = 1u << (wbits - 1);
+    const uint32_t smask = (1u << u) - 1u;
+    const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+    const long base = (long)blk * OUT + o;
+    uint32_t ureg[6];
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UB);
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+    uint32_t sreg[3] = {0u, 0u, 0u};
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) if (i < SB) sreg[i >> 2] |= (uint32_t)shared_cm[base * SB + i] << (8 * (i & 3));
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) {
+        if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+        ubuf >>= wbits; unb -= wbits;
+        if ((k & gsmask) == 0) {
+            if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)((uint32_t)sbuf & smask);     // UNSIGNED
+            sbuf >>= u; snb -= u;
+        }
+        Wbf[((long)(blk * BLOCK + k)) * OUT + o] = __float2bfloat16((float)((up_code << u) | sh_code) * scale);
+    }
+}
+
 } // namespace
 
 // Dequant the MSAQ weight to a bf16 [OUT,K] buffer (for prefill: dequant-once + cuBLAS).
@@ -861,6 +1111,19 @@ torch::Tensor ms_dequant_bf16_cuda(
     auto W = torch::empty({K, OUT}, torch::dtype(torch::kBFloat16).device(scale_exp.device()));  // [K,OUT]
     const int threads = 256, blocks = (int)((OUT + threads - 1) / threads);
     ms_dequant_bf16_kernel<<<dim3(blocks, (int)NB), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(W.data_ptr<at::BFloat16>()),
+        (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
+    return W;
+}
+
+torch::Tensor ms_dequant_bf16_unsigned_cuda(
+        torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
+    const int UB = 32 * (8 - (int)u) / 8, SB = ((32 / (int)gs) * (int)u + 7) / 8;
+    auto W = torch::empty({K, OUT}, torch::dtype(torch::kBFloat16).device(scale_exp.device()));
+    const int threads = 256, blocks = (int)((OUT + threads - 1) / threads);
+    ms_dequant_bf16_unsigned_kernel<<<dim3(blocks, (int)NB), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(W.data_ptr<at::BFloat16>()),
         (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
@@ -1030,6 +1293,159 @@ torch::Tensor wonly_gemv_batched_cuda(
     return y;
 }
 
+// VECTORIZED nibble-relayout GEMV (u3/gs16 only): high nibble -> float via
+// __byte_perm magic (8 at a time), low_un(1b) folded as a float select. Tests
+// whether Marlin-style byte_perm beats the funnel unpack on Blackwell.
+template<int MR>
+__global__ void wonly_gemv_batched_relayout_vec_u3(
+        const __nv_bfloat16* __restrict__ x,
+        const int8_t*  __restrict__ scale_exp, const uint8_t* __restrict__ hi4_cm,
+        const uint8_t* __restrict__ lowun_cm, const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    __shared__ float As[MR][BLOCK];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    const bool active = (o < OUT);
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, kk = idx % BLOCK;
+            As[m][kk] = (row0 + m < M) ? __bfloat162float(x[(long)(row0 + m) * K + blk * BLOCK + kk]) : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            const uint32_t* hp = reinterpret_cast<const uint32_t*>(hi4_cm + base * 16);
+            uint32_t hw0 = hp[0], hw1 = hp[1], hw2 = hp[2], hw3 = hp[3];
+            const uint32_t lwd = *reinterpret_cast<const uint32_t*>(lowun_cm + base * 4);  // 1 bit/elem
+            const uint32_t sreg = shared_cm[base * 1];
+            const int sh0 = (int)((sreg & 7u) ^ 4u) - 4;          // signed 3-bit, group 0 (k<16)
+            const int sh1 = (int)(((sreg >> 3) & 7u) ^ 4u) - 4;   // group 1 (k>=16)
+            const float s16 = 16.0f * scale, s8 = 8.0f * scale;
+            const float base0 = scale * (float)sh0 - 128.0f * scale;
+            const float base1 = scale * (float)sh1 - 128.0f * scale;
+            const float MAGIC = 8388608.0f;
+            // process 8 elements per hi-word; even nibbles -> k0,k0+2,..; odd -> k0+1,..
+            #pragma unroll
+            for (int wi = 0; wi < 4; ++wi) {
+                const uint32_t hw = (wi==0)?hw0:(wi==1)?hw1:(wi==2)?hw2:hw3;
+                const uint32_t ev = hw & 0x0F0F0F0Fu;             // hi_u for even elems
+                const uint32_t od = (hw >> 4) & 0x0F0F0F0Fu;      // hi_u for odd elems
+                const int k0 = wi * 8;
+                const float bb = (k0 < 16) ? base0 : base1;
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int ke = k0 + 2*q, ko = k0 + 2*q + 1;
+                    const uint32_t sele = 0x7440u | (uint32_t)q;  // byte q -> pos0, 0x4B -> pos3, 0 elsewhere
+                    const uint32_t selo = 0x7440u | (uint32_t)q;
+                    const float hfe = __uint_as_float(__byte_perm(ev, 0x4B000000u, sele)) - MAGIC;
+                    const float hfo = __uint_as_float(__byte_perm(od, 0x4B000000u, selo)) - MAGIC;
+                    float wfe = hfe * s16 + bb;
+                    float wfo = hfo * s16 + bb;
+                    if ((lwd >> ke) & 1u) wfe += s8;
+                    if ((lwd >> ko) & 1u) wfo += s8;
+                    #pragma unroll
+                    for (int j = 0; j < MR; ++j) { acc[j] += wfe * As[j][ke]; acc[j] += wfo * As[j][ko]; }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
+}
+
+// MS-UNSIGNED batched GEMV host: planes from pack_weight_unsigned (u3/gs16, u2/gs8).
+torch::Tensor wonly_gemv_batched_unsigned_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto L = [&](auto Ut, auto Gt, auto MRt) {
+        wonly_gemv_batched_unsigned<decltype(Ut)::value, decltype(Gt)::value, decltype(MRt)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+    };
+#define UNMR(UU,GG) switch (MR) { \
+        case 1:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{});  break; \
+        case 2:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{});  break; \
+        case 4:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{});  break; \
+        case 8:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,8>{});  break; \
+        case 16: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,16>{}); break; \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,32>{}); break; }
+    if      ((int)u==3 && (int)gs==16) { UNMR(3,16); }
+    else if ((int)u==2 && (int)gs==8)  { UNMR(2,8); }
+    else TORCH_CHECK(false, "unsigned proto: only u3/gs16 and u2/gs8");
+#undef UNMR
+    gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return y;
+}
+
+// NIBBLE-RELAYOUT batched GEMV host (prototype): planes from pack_weight_relayout.
+torch::Tensor wonly_gemv_batched_relayout_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor hi4_cm,
+        torch::Tensor lowun_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    const bool vec = getenv("MS_RELAYOUT_VEC") && atoi(getenv("MS_RELAYOUT_VEC")) != 0;
+    auto L = [&](auto Ut, auto Gt, auto MRt) {
+        if (vec && decltype(Ut)::value == 3 && decltype(Gt)::value == 16) {
+            wonly_gemv_batched_relayout_vec_u3<decltype(MRt)::value>
+                <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                scale_exp.data_ptr<int8_t>(), hi4_cm.data_ptr<uint8_t>(),
+                lowun_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+                partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+            return;
+        }
+        wonly_gemv_batched_relayout<decltype(Ut)::value, decltype(Gt)::value, decltype(MRt)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            scale_exp.data_ptr<int8_t>(), hi4_cm.data_ptr<uint8_t>(),
+            lowun_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+    };
+#define RLMR(UU,GG) switch (MR) { \
+        case 1:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{});  break; \
+        case 2:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{});  break; \
+        case 4:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{});  break; \
+        case 8:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,8>{});  break; \
+        case 16: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,16>{}); break; \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,32>{}); break; }
+    if      ((int)u==3 && (int)gs==16) { RLMR(3,16); }
+    else if ((int)u==2 && (int)gs==8)  { RLMR(2,8); }
+    else TORCH_CHECK(false, "relayout proto: only u3/gs16 and u2/gs8");
+#undef RLMR
+    gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return y;
+}
+
 // W+A GEMV: MSAQ-s activation pre-pass (Stage 0) + wide-load int-dot GEMV. x is
 // the bf16 decode vector [K]; weights are the column-major planes (same as wide).
 torch::Tensor wa_gemv_cuda(
@@ -1084,6 +1500,54 @@ torch::Tensor wa_gemv_cuda(
     gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+
+// ===== MS-UNSIGNED (naive-ms) hosts: u3/gs16 + u2/gs8 only =====
+torch::Tensor wonly_gemv_wide_unsigned_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    auto y = torch::empty({OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
+    int sepsc = ((int)u != 4) ? 1 : 0;
+    if (const char* e = getenv("MS_GEMV_SEPSC")) sepsc = atoi(e) != 0 ? 1 : 0;
+    auto L = [&](auto Ut, auto Gt) {
+        wonly_gemv_wide_unsigned<decltype(Ut)::value, decltype(Gt)::value><<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(), partial.data_ptr<float>(),
+            (int)OUT, (int)NB, splitK, sepsc); };
+    if ((int)u==3 && (int)gs==16) L(std::integral_constant<int,3>{}, std::integral_constant<int,16>{});
+    else if ((int)u==2 && (int)gs==8) L(std::integral_constant<int,2>{}, std::integral_constant<int,8>{});
+    else TORCH_CHECK(false, "unsigned: u3/gs16,u2/gs8");
+    gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+torch::Tensor wa_gemv_unsigned_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    const int K = (int)NB * BLOCK;
+    auto qx = torch::empty({K}, x.options().dtype(torch::kInt8));
+    auto sa_exp = torch::empty({NB}, x.options().dtype(torch::kInt8));
+    ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                             qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), 1, K, (int)NB, (int)u, (int)gs);
+    auto y = torch::empty({OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
+    const int per = ((int)NB + splitK - 1) / splitK; const size_t smem = (size_t)per * BLOCK;
+    auto L = [&](auto Ut, auto Gt) {
+        wa_gemv_wide_unsigned<decltype(Ut)::value, decltype(Gt)::value><<<dim3(blocks, splitK), threads, smem, at::cuda::getCurrentCUDAStream()>>>(
+            qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(), partial.data_ptr<float>(),
+            (int)OUT, (int)NB, splitK); };
+    if ((int)u==3 && (int)gs==16) L(std::integral_constant<int,3>{}, std::integral_constant<int,16>{});
+    else if ((int)u==2 && (int)gs==8) L(std::integral_constant<int,2>{}, std::integral_constant<int,8>{});
+    else TORCH_CHECK(false, "unsigned: u3/gs16,u2/gs8");
+    gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
     return y;
 }
 
@@ -1181,6 +1645,44 @@ torch::Tensor wa_gemv_batched_cuda(
 #undef MRDISP
 #undef MRDISP_SPEC
     }
+    gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return y;
+}
+
+torch::Tensor wa_gemv_batched_unsigned_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    const int K = (int)NB * BLOCK;
+    auto qx = torch::empty({M, K}, x.options().dtype(torch::kInt8));
+    auto sa_exp = torch::empty({M, NB}, x.options().dtype(torch::kInt8));
+    ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                             qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), (int)M, K, (int)NB, (int)u, (int)gs);
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto L = [&](auto Ut, auto Gt, auto MRt) {
+        wa_gemv_batched_unsigned<decltype(Ut)::value, decltype(Gt)::value, decltype(MRt)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK); };
+#define WAUMR(UU,GG) switch (MR) { \
+        case 1:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{});  break; \
+        case 2:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{});  break; \
+        case 4:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{});  break; \
+        case 8:  L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,8>{});  break; \
+        case 16: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,16>{}); break; \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,32>{}); break; }
+    if      ((int)u==3 && (int)gs==16) { WAUMR(3,16); }
+    else if ((int)u==2 && (int)gs==8)  { WAUMR(2,8); }
+    else TORCH_CHECK(false, "unsigned: u3/gs16,u2/gs8");
+#undef WAUMR
     gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
         (int)M, (int)OUT, splitK);

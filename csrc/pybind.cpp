@@ -21,6 +21,30 @@ torch::Tensor wa_gemv_cuda(
 torch::Tensor wonly_gemv_batched_cuda(
     torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
     int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor wonly_gemv_batched_relayout_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor hi4_cm, torch::Tensor lowun_cm,
+    torch::Tensor shared_cm, int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor wonly_gemv_batched_unsigned_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor ms_dequant_bf16_unsigned_cuda(
+    torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor wonly_gemv_wide_unsigned_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t OUT, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor wa_gemv_unsigned_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t OUT, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor wa_gemv_batched_unsigned_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor kv_kdot_unsigned_cuda(
+    torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
+    int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor kv_kdot_mxint8_cuda(
+    torch::Tensor q, torch::Tensor ks, torch::Tensor kq,
+    int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB);
 torch::Tensor wonly_gemv_tc_cuda(
     torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
     int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs);
@@ -29,6 +53,8 @@ torch::Tensor wa_gemv_batched_cuda(
     int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs);
 
 // defined in wa_gemm.cu
+std::vector<torch::Tensor> quant_act_unsigned_cuda(torch::Tensor X, int64_t M, int64_t K,
+                                                   int64_t NB, int64_t u, int64_t gs);
 std::vector<torch::Tensor> quant_act_cuda(torch::Tensor X, int64_t M, int64_t K,
                                           int64_t NB, int64_t u, int64_t gs);
 torch::Tensor wonly_gemm_cuda(
@@ -61,6 +87,12 @@ torch::Tensor kv_decode_attention_batched_cuda(
     torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
     int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs,
     int64_t Lcap);
+torch::Tensor kv_kdot_uspec_cuda(
+    torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
+    int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor kv_kdot_relayout_cuda(
+    torch::Tensor q, torch::Tensor ks, torch::Tensor hi4, torch::Tensor lowun, torch::Tensor shared,
+    int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs);
 torch::Tensor pv_wmma_cuda(
     torch::Tensor P, torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
     int64_t Hkv, int64_t M, int64_t D, int64_t Lk, int64_t NBd, int64_t u, int64_t gs);
@@ -142,11 +174,28 @@ TORCH_LIBRARY(msaq, m) {
           "int OUT, int NB, int u, int gs) -> Tensor", &wa_gemv_cuda);
     m.def("wonly_gemv_batched(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
           "int M, int OUT, int NB, int u, int gs) -> Tensor", &wonly_gemv_batched_cuda);
+    m.def("wonly_gemv_batched_relayout(Tensor x, Tensor scale_exp, Tensor hi4_cm, Tensor lowun_cm, "
+          "Tensor shared_cm, int M, int OUT, int NB, int u, int gs) -> Tensor", &wonly_gemv_batched_relayout_cuda);
+    m.def("wonly_gemv_batched_unsigned(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int M, int OUT, int NB, int u, int gs) -> Tensor", &wonly_gemv_batched_unsigned_cuda);
+    m.def("ms_dequant_bf16_unsigned(Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int OUT, int K, int NB, int u, int gs) -> Tensor", &ms_dequant_bf16_unsigned_cuda);
+    m.def("wonly_gemv_wide_unsigned(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int OUT, int NB, int u, int gs) -> Tensor", &wonly_gemv_wide_unsigned_cuda);
+    m.def("wa_gemv_unsigned(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int OUT, int NB, int u, int gs) -> Tensor", &wa_gemv_unsigned_cuda);
+    m.def("wa_gemv_batched_unsigned(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int M, int OUT, int NB, int u, int gs) -> Tensor", &wa_gemv_batched_unsigned_cuda);
+    m.def("kv_kdot_unsigned(Tensor q, Tensor ks, Tensor ku, Tensor kh, int B, int H, int Hkv, "
+          "int Lk, int D, int NB, int u, int gs) -> Tensor", &kv_kdot_unsigned_cuda);
+    m.def("kv_kdot_mxint8(Tensor q, Tensor ks, Tensor kq, int B, int H, int Hkv, "
+          "int Lk, int D, int NB) -> Tensor", &kv_kdot_mxint8_cuda);
     m.def("wonly_gemv_tc(Tensor x, Tensor scale_exp, Tensor upper, Tensor shared, "
           "int M, int OUT, int NB, int u, int gs) -> Tensor", &wonly_gemv_tc_cuda);
     m.def("wa_gemv_batched(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
           "int M, int OUT, int NB, int u, int gs) -> Tensor", &wa_gemv_batched_cuda);
     m.def("quant_act(Tensor X, int M, int K, int NB, int u, int gs) -> Tensor[]", &quant_act_cuda);
+    m.def("quant_act_unsigned(Tensor X, int M, int K, int NB, int u, int gs) -> Tensor[]", &quant_act_unsigned_cuda);
     m.def("kv_write(Tensor X, int H, int L, int D, int NB, int u, int gs) -> Tensor[]", &kv_write_cuda);
     m.def("kv_append(Tensor X, Tensor(a!) scale_exp, Tensor(b!) upper, Tensor(c!) shared, "
           "int H, int D, int NB, int pos, int Lcap, int u, int gs) -> ()", &kv_append_cuda);
@@ -172,6 +221,10 @@ TORCH_LIBRARY(msaq, m) {
           "Tensor vs, Tensor vu, Tensor vh, "
           "int B, int H, int Hkv, int Lk, int D, int NB, int u, int gs, int Lcap=-1) -> Tensor",
           &kv_decode_attention_batched_cuda);
+    m.def("kv_kdot_uspec(Tensor q, Tensor ks, Tensor ku, Tensor kh, int B, int H, int Hkv, "
+          "int Lk, int D, int NB, int u, int gs) -> Tensor", &kv_kdot_uspec_cuda);
+    m.def("kv_kdot_relayout(Tensor q, Tensor ks, Tensor hi4, Tensor lowun, Tensor shared, "
+          "int B, int H, int Hkv, int Lk, int D, int NB, int u, int gs) -> Tensor", &kv_kdot_relayout_cuda);
     m.def("pv_wmma(Tensor P, Tensor vs, Tensor vu, Tensor vh, "
           "int Hkv, int M, int D, int Lk, int NBd, int u, int gs) -> Tensor", &pv_wmma_cuda);
     m.def("pv_wmma_mx(Tensor P, Tensor vs, Tensor vq, "

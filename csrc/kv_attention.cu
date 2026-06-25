@@ -332,6 +332,120 @@ __global__ void kv_decode_cpasync_kernel(
 //   Templated on U4 with `if constexpr` so each instantiation drops the other
 //   path's registers (a merged runtime branch bloated u4 regs -> killed its
 //   occupancy). -----------------------------------------------------------------
+// ===== MICRO-BENCH: pass-1 K-dot only (thread-per-key), to isolate the u2/u3 unpack
+// cost vs the nibble re-layout, with the real KV launch geometry (integer-bound). =====
+template<int U_, int GS_>
+__global__ void kv_kdot_uspec_kernel(
+        const __nv_bfloat16* __restrict__ q, const int8_t* __restrict__ ks,
+        const uint8_t* __restrict__ ku, const uint8_t* __restrict__ kh,
+        float* __restrict__ out, int H, int Hkv, int Lk, int Lcap, int D, int NB, int key_tile) {
+    const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
+    const long b = blockIdx.z; const int hk = h / (H / Hkv);
+    q += b * (long)H * D; ks += b * (long)Hkv * NB * Lcap;
+    ku += b * (long)Hkv * NB * Lcap * (BLOCK * (8 - U_) / 8);
+    kh += b * (long)Hkv * NB * Lcap * (((BLOCK / GS_) * U_ + 7) / 8);
+    out += b * (long)H * Lk;
+    extern __shared__ float qsh[];
+    if (tid < D) qsh[tid] = __bfloat162float(q[h * D + tid]);
+    __syncthreads();
+    const int j0 = s * key_tile, j1 = min(j0 + key_tile, Lk);
+    for (int key = j0 + tid; key < j1; key += NT) {
+        float dot = 0.0f;
+        for (int blk = 0; blk < NB; ++blk) {
+            const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lcap + key]);
+            const long kbase = (long)(hk * NB + blk) * Lcap + key;
+            ms::stream_block_uspec<U_, GS_>(ku, kh, kbase, [&](int kd, int w) {
+                dot += qsh[blk * BLOCK + kd] * (w * ksc); });
+        }
+        out[h * Lk + key] = dot;
+    }
+}
+template<int U_, int GS_>
+__global__ void kv_kdot_relayout_kernel(
+        const __nv_bfloat16* __restrict__ q, const int8_t* __restrict__ ks,
+        const uint8_t* __restrict__ hi4, const uint8_t* __restrict__ lowun,
+        const uint8_t* __restrict__ shared,
+        float* __restrict__ out, int H, int Hkv, int Lk, int Lcap, int D, int NB, int key_tile) {
+    const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
+    const long b = blockIdx.z; const int hk = h / (H / Hkv);
+    constexpr int LUB = ((4 - U_) * BLOCK + 7) / 8, SBc = ((BLOCK / GS_) * U_ + 7) / 8;
+    q += b * (long)H * D; ks += b * (long)Hkv * NB * Lcap;
+    hi4 += b * (long)Hkv * NB * Lcap * 16;
+    lowun += b * (long)Hkv * NB * Lcap * LUB; shared += b * (long)Hkv * NB * Lcap * SBc;
+    out += b * (long)H * Lk;
+    extern __shared__ float qsh[];
+    if (tid < D) qsh[tid] = __bfloat162float(q[h * D + tid]);
+    __syncthreads();
+    const int j0 = s * key_tile, j1 = min(j0 + key_tile, Lk);
+    for (int key = j0 + tid; key < j1; key += NT) {
+        float dot = 0.0f;
+        for (int blk = 0; blk < NB; ++blk) {
+            const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lcap + key]);
+            const long kbase = (long)(hk * NB + blk) * Lcap + key;
+            ms::stream_block_relayout<U_, GS_>(hi4, lowun, shared, kbase, [&](int kd, int w) {
+                dot += qsh[blk * BLOCK + kd] * (w * ksc); });
+        }
+        out[h * Lk + key] = dot;
+    }
+}
+// MS-UNSIGNED (naive-ms) K-dot: unsigned concat unpack.
+template<int U_, int GS_>
+__global__ void kv_kdot_unsigned_kernel(
+        const __nv_bfloat16* __restrict__ q, const int8_t* __restrict__ ks,
+        const uint8_t* __restrict__ ku, const uint8_t* __restrict__ kh,
+        float* __restrict__ out, int H, int Hkv, int Lk, int Lcap, int D, int NB, int key_tile) {
+    const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
+    const long b = blockIdx.z; const int hk = h / (H / Hkv);
+    q += b * (long)H * D; ks += b * (long)Hkv * NB * Lcap;
+    ku += b * (long)Hkv * NB * Lcap * (BLOCK * (8 - U_) / 8);
+    kh += b * (long)Hkv * NB * Lcap * (((BLOCK / GS_) * U_ + 7) / 8);
+    out += b * (long)H * Lk;
+    extern __shared__ float qsh[];
+    if (tid < D) qsh[tid] = __bfloat162float(q[h * D + tid]);
+    __syncthreads();
+    const int j0 = s * key_tile, j1 = min(j0 + key_tile, Lk);
+    for (int key = j0 + tid; key < j1; key += NT) {
+        float dot = 0.0f;
+        for (int blk = 0; blk < NB; ++blk) {
+            const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lcap + key]);
+            const long kbase = (long)(hk * NB + blk) * Lcap + key;
+            ms::stream_block_uspec_unsigned<U_, GS_>(ku, kh, kbase, [&](int kd, int w) {
+                dot += qsh[blk * BLOCK + kd] * (w * ksc); });
+        }
+        out[h * Lk + key] = dot;
+    }
+}
+// MXINT8 K-dot baseline: int8 read directly (token-major qweight [Hkv,NB,Lcap,32]).
+__global__ void kv_kdot_mxint8_kernel(
+        const __nv_bfloat16* __restrict__ q, const int8_t* __restrict__ ks,
+        const int8_t* __restrict__ kq,
+        float* __restrict__ out, int H, int Hkv, int Lk, int Lcap, int D, int NB, int key_tile) {
+    const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
+    const long b = blockIdx.z; const int hk = h / (H / Hkv);
+    q += b * (long)H * D; ks += b * (long)Hkv * NB * Lcap; kq += b * (long)Hkv * NB * Lcap * 32;
+    out += b * (long)H * Lk;
+    extern __shared__ float qsh[];
+    if (tid < D) qsh[tid] = __bfloat162float(q[h * D + tid]);
+    __syncthreads();
+    const int j0 = s * key_tile, j1 = min(j0 + key_tile, Lk);
+    for (int key = j0 + tid; key < j1; key += NT) {
+        float dot = 0.0f;
+        for (int blk = 0; blk < NB; ++blk) {
+            const float ksc = ms::e8m0_to_scale(ks[(hk * NB + blk) * Lcap + key]);
+            const int8_t* kqb = kq + ((long)(hk * NB + blk) * Lcap + key) * 32;
+            const int4 w0 = *reinterpret_cast<const int4*>(kqb);          // 16 int8 (wide load)
+            const int4 w1 = *reinterpret_cast<const int4*>(kqb + 16);     // 16 int8
+            const int8_t* b0 = reinterpret_cast<const int8_t*>(&w0);
+            const int8_t* b1 = reinterpret_cast<const int8_t*>(&w1);
+            #pragma unroll
+            for (int kd = 0; kd < 16; ++kd) dot += qsh[blk * BLOCK + kd] * ((float)b0[kd] * ksc);
+            #pragma unroll
+            for (int kd = 0; kd < 16; ++kd) dot += qsh[blk * BLOCK + 16 + kd] * ((float)b1[kd] * ksc);
+        }
+        out[h * Lk + key] = dot;
+    }
+}
+
 template<bool U4, bool VPACK, int U_, int GS_>
 __global__ void kv_decode_wide_kernel(
         const __nv_bfloat16* __restrict__ q,
@@ -1948,6 +2062,77 @@ torch::Tensor kv_decode_attention_batched_cuda(
     kv_decode_combine_kernel<<<dim3((int)H, (int)B), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), (int)H, (int)D, S);
+    return out;
+}
+
+// ---- MICRO-BENCH host: pass-1 K-dot only (current streaming vs nibble relayout) ----
+torch::Tensor kv_kdot_uspec_cuda(
+        torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
+        int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs) {
+    const int threads = next_pow2((int)D);
+    const int S = ms::kv_split_count((long)Lk, (int)(H * B));
+    const int key_tile = (int)((Lk + S - 1) / S);
+    auto out = torch::empty({B, H, Lk}, q.options().dtype(torch::kFloat32));
+    dim3 grid((int)H, S, (int)B);
+    const int shmem = (int)D * sizeof(float);
+    auto launch = [&](auto Ut, auto Gt) {
+        kv_kdot_uspec_kernel<decltype(Ut)::value, decltype(Gt)::value><<<grid, threads, shmem, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()), ks.data_ptr<int8_t>(),
+            ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(), out.data_ptr<float>(),
+            (int)H, (int)Hkv, (int)Lk, (int)Lk, (int)D, (int)NB, key_tile); };
+    if ((int)u==3 && (int)gs==16) launch(std::integral_constant<int,3>{}, std::integral_constant<int,16>{});
+    else if ((int)u==2 && (int)gs==8) launch(std::integral_constant<int,2>{}, std::integral_constant<int,8>{});
+    else TORCH_CHECK(false, "kdot proto: u3/gs16, u2/gs8");
+    return out;
+}
+torch::Tensor kv_kdot_relayout_cuda(
+        torch::Tensor q, torch::Tensor ks, torch::Tensor hi4, torch::Tensor lowun, torch::Tensor shared,
+        int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs) {
+    const int threads = next_pow2((int)D);
+    const int S = ms::kv_split_count((long)Lk, (int)(H * B));
+    const int key_tile = (int)((Lk + S - 1) / S);
+    auto out = torch::empty({B, H, Lk}, q.options().dtype(torch::kFloat32));
+    dim3 grid((int)H, S, (int)B);
+    const int shmem = (int)D * sizeof(float);
+    auto launch = [&](auto Ut, auto Gt) {
+        kv_kdot_relayout_kernel<decltype(Ut)::value, decltype(Gt)::value><<<grid, threads, shmem, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()), ks.data_ptr<int8_t>(),
+            hi4.data_ptr<uint8_t>(), lowun.data_ptr<uint8_t>(), shared.data_ptr<uint8_t>(), out.data_ptr<float>(),
+            (int)H, (int)Hkv, (int)Lk, (int)Lk, (int)D, (int)NB, key_tile); };
+    if ((int)u==3 && (int)gs==16) launch(std::integral_constant<int,3>{}, std::integral_constant<int,16>{});
+    else if ((int)u==2 && (int)gs==8) launch(std::integral_constant<int,2>{}, std::integral_constant<int,8>{});
+    else TORCH_CHECK(false, "kdot proto: u3/gs16, u2/gs8");
+    return out;
+}
+torch::Tensor kv_kdot_unsigned_cuda(
+        torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
+        int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs) {
+    const int threads = next_pow2((int)D);
+    const int S = ms::kv_split_count((long)Lk, (int)(H * B));
+    const int key_tile = (int)((Lk + S - 1) / S);
+    auto out = torch::empty({B, H, Lk}, q.options().dtype(torch::kFloat32));
+    dim3 grid((int)H, S, (int)B); const int shmem = (int)D * sizeof(float);
+    auto launch = [&](auto Ut, auto Gt) {
+        kv_kdot_unsigned_kernel<decltype(Ut)::value, decltype(Gt)::value><<<grid, threads, shmem, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()), ks.data_ptr<int8_t>(),
+            ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(), out.data_ptr<float>(),
+            (int)H, (int)Hkv, (int)Lk, (int)Lk, (int)D, (int)NB, key_tile); };
+    if ((int)u==3 && (int)gs==16) launch(std::integral_constant<int,3>{}, std::integral_constant<int,16>{});
+    else if ((int)u==2 && (int)gs==8) launch(std::integral_constant<int,2>{}, std::integral_constant<int,8>{});
+    else TORCH_CHECK(false, "kdot proto: u3/gs16, u2/gs8");
+    return out;
+}
+torch::Tensor kv_kdot_mxint8_cuda(
+        torch::Tensor q, torch::Tensor ks, torch::Tensor kq,
+        int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB) {
+    const int threads = next_pow2((int)D);
+    const int S = ms::kv_split_count((long)Lk, (int)(H * B));
+    const int key_tile = (int)((Lk + S - 1) / S);
+    auto out = torch::empty({B, H, Lk}, q.options().dtype(torch::kFloat32));
+    dim3 grid((int)H, S, (int)B); const int shmem = (int)D * sizeof(float);
+    kv_kdot_mxint8_kernel<<<grid, threads, shmem, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()), ks.data_ptr<int8_t>(),
+        kq.data_ptr<int8_t>(), out.data_ptr<float>(), (int)H, (int)Hkv, (int)Lk, (int)Lk, (int)D, (int)NB, key_tile);
     return out;
 }
 

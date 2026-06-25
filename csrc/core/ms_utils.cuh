@@ -185,6 +185,86 @@ __device__ __forceinline__ void stream_block_uspec(
     }
 }
 
+// --- MS-UNSIGNED streaming unpack (ms_lib.pack.pack_weight_unsigned). Same dense
+//   plane layout as stream_block_uspec, but the shared code is UNSIGNED (floor-upper
+//   design) so it needs NO sign-extend and the int8 word is a pure bit-concat
+//   (up_code<<U_)|sh: the shared bits slot into the upper word's zeroed low U_ bits.
+//   Saves the shared xor/sub sign-extend; reconstruction is OR not signed-add.
+template<int U_, int GS_, typename F>
+__device__ __forceinline__ void stream_block_uspec_unsigned(
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        long base, F per_elem) {
+    constexpr int MXB = 32;
+    constexpr int WBITS = 8 - U_;
+    constexpr int UBc = MXB * WBITS / 8;
+    constexpr int SBc = ((MXB / GS_) * U_ + 7) / 8;
+    constexpr int NW  = UBc / 4;
+    constexpr int NSW = (SBc + 3) / 4 > 0 ? (SBc + 3) / 4 : 1;
+    constexpr uint32_t umask = (1u << WBITS) - 1u, usign = 1u << (WBITS - 1);
+    constexpr uint32_t smask = (1u << U_) - 1u;
+    constexpr int gsmask = GS_ - 1;
+    uint32_t sreg[NSW] = {0u};
+    #pragma unroll
+    for (int i = 0; i < SBc; ++i) sreg[i >> 2] |= (uint32_t)shared_cm[base * SBc + i] << (8 * (i & 3));
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UBc);
+    uint32_t ureg[NW];
+    #pragma unroll
+    for (int i = 0; i < NW; ++i) ureg[i] = src[i];
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < MXB; ++k) {
+        if (unb < WBITS) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+        ubuf >>= WBITS; unb -= WBITS;
+        if ((k & gsmask) == 0) {
+            if (snb < U_) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)((uint32_t)sbuf & smask);     // UNSIGNED: no sign-extend
+            sbuf >>= U_; snb -= U_;
+        }
+        per_elem(k, (up_code << U_) | sh_code);           // OR-concat (low U_ bits of up_code<<U_ are 0)
+    }
+}
+
+// --- NIBBLE-ALIGNED re-layout streaming unpack (ms_lib.pack.pack_weight_relayout).
+//   The (8-u)-bit per-element upper code is split into a high nibble (signed 4-bit,
+//   16B plane, bfe-extractable with HW sign-extend, no straddle) + a small dense
+//   low_un ((4-u)-bit) plane. Reconstructs the SAME int8 word as stream_block_uspec:
+//     w = hi4*16 + low_un*2^u + shared.   hi4_cm: 16B/block; lowun_cm: ceil((4-u)*32/8)
+//   B/block (u3:4, u2:8); shared_cm: SBc B/block. Bit-exact to pack_weight_relayout.
+template<int U_, int GS_, typename F>
+__device__ __forceinline__ void stream_block_relayout(
+        const uint8_t* __restrict__ hi4_cm, const uint8_t* __restrict__ lowun_cm,
+        const uint8_t* __restrict__ shared_cm, long base, F per_elem) {
+    constexpr int MXB = 32;
+    constexpr int LU = 4 - U_;                          // low_un bits/elem (u3:1 u2:2)
+    constexpr int LUB = (LU * MXB + 7) / 8;             // u3:4 u2:8 bytes
+    constexpr int NLU = (LUB + 3) / 4;
+    constexpr int SBc = ((MXB / GS_) * U_ + 7) / 8;
+    constexpr int gs_shift = (GS_>=2?1:0)+(GS_>=4?1:0)+(GS_>=8?1:0)+(GS_>=16?1:0)+(GS_>=32?1:0);
+    constexpr uint32_t lumask = (1u << LU) - 1u;
+    constexpr uint32_t smask = (1u << U_) - 1u, ssign = 1u << (U_ - 1);
+    const uint32_t* hp = reinterpret_cast<const uint32_t*>(hi4_cm + base * 16);
+    uint32_t hw[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) hw[i] = hp[i];          // 16B = 32 signed nibbles
+    uint32_t lw[NLU] = {0u};
+    #pragma unroll
+    for (int i = 0; i < LUB; ++i) lw[i >> 2] |= (uint32_t)lowun_cm[base * LUB + i] << (8 * (i & 3));
+    uint32_t sreg = 0u;
+    #pragma unroll
+    for (int i = 0; i < SBc; ++i) sreg |= (uint32_t)shared_cm[base * SBc + i] << (8 * (i & 3));
+    #pragma unroll
+    for (int k = 0; k < MXB; ++k) {
+        const int hi = (int)((hw[k >> 3] >> ((k & 7) * 4)) & 0xF) - 8;    // biased nibble -> signed
+        const int bit = k * LU;                                          // (4-u)-bit field, no straddle
+        const int lu = (int)((lw[bit >> 5] >> (bit & 31)) & lumask);     // unsigned
+        const int g = k >> gs_shift;
+        const int sh = (int)(((sreg >> (g * U_)) & smask) ^ ssign) - (int)ssign;
+        per_elem(k, hi * 16 + (lu << U_) + sh);
+    }
+}
+
 // --- KV variant: TOKEN-MAJOR planes [H, nb, L, BYTES] (BYTES innermost; Stage
 //     4a). base_u/base_h fold in the per-head + per-block offset (= same value as
 //     the old [.,BYTES,L] base since UB*L == L*UB); a block's BYTES bytes for a

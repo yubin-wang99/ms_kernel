@@ -106,6 +106,36 @@ __global__ void quant_act_msaq_kernel(
     if (lane == 0) sa_exp[(long)m * NB + blk] = (int8_t)ea;      // 8. scale = base sa
 }
 
+// ---- STAGE 0 (MS-UNSIGNED): floor-upper -> unsigned shared (concat). Mirrors
+//   quant_act_msaq_kernel but q_upper=floor (residual>=0) and r_shared unsigned
+//   [0,2^u-1]; qX = (q_upper<<u)|r_shared. Tests if the simpler encode is faster.
+__global__ void quant_act_unsigned_kernel(
+        const __nv_bfloat16* __restrict__ X, int8_t* __restrict__ qX,
+        int8_t* __restrict__ sa_exp, int M, int K, int NB, int u, int gs) {
+    const int wpb = blockDim.x >> 5;
+    const int gw  = blockIdx.x * wpb + (threadIdx.x >> 5);
+    if (gw >= M * NB) return;
+    const int m = gw / NB, blk = gw % NB, lane = threadIdx.x & 31;
+    const long base = (long)m * K + (long)blk * BLOCK;
+    const float x = __bfloat162float(X[base + lane]);
+    float a = fabsf(x);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    int ea = (int)floorf(log2f(fmaxf(a, 1e-30f))) - (int)ms::E_MAX;
+    ea = max(-127, min(127, ea));
+    const float sa = exp2f((float)ea);
+    const float s_unshared = sa * exp2f((float)u);
+    const int q_lo = -(1 << (7 - u)), q_hi = (1 << (7 - u)) - 1;
+    const int q_upper = max(q_lo, min(q_hi, (int)floorf(x / s_unshared)));   // FLOOR -> residual>=0
+    const float r = x - (float)q_upper * s_unshared;
+    float rs = r;
+    for (int o = 1; o < gs; o <<= 1) rs += __shfl_xor_sync(0xffffffffu, rs, o);
+    const float res_avg = rs / (float)gs;
+    const int r_shared = max(0, min((1 << u) - 1, (int)rintf(res_avg / sa)));  // UNSIGNED
+    qX[base + lane] = (int8_t)((q_upper << u) | r_shared);                     // concat
+    if (lane == 0) sa_exp[(long)m * NB + blk] = (int8_t)ea;
+}
+
 // Templated shared-memory tiled W-only GEMM. <TBM,TBN> output tile, <RTM,RTN>
 // per-thread register tile; blockDim = (TBM/RTM)*(TBN/RTN). Weight unpacked ONCE
 // per tile (Bs stage) and reused by all TBM rows. Tile config swept via
@@ -806,6 +836,20 @@ std::vector<torch::Tensor> quant_act_cuda(torch::Tensor X, int64_t M, int64_t K,
     ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
                              qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(),
                              (int)M, (int)K, (int)NB, (int)u, (int)gs);
+    return {qX, sa};
+}
+
+// torch op: MS-UNSIGNED activation quant (floor-upper, unsigned shared concat).
+std::vector<torch::Tensor> quant_act_unsigned_cuda(torch::Tensor X, int64_t M, int64_t K,
+                                                   int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
+    auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
+    const int tpb = 256, wpb = tpb >> 5;
+    const int blocks = ((long)M * NB + wpb - 1) / wpb;
+    quant_act_unsigned_kernel<<<blocks, tpb, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        qX.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB, (int)u, (int)gs);
     return {qX, sa};
 }
 

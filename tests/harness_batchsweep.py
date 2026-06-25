@@ -22,7 +22,7 @@ import argparse, sys, os, json, gc, subprocess
 import numpy as np, torch, torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ms_lib import ops  # noqa: F401
-from ms_lib.pack import pack_weight, pack_weight_mxint8
+from ms_lib.pack import pack_weight, pack_weight_mxint8, pack_weight_naive
 OPS = torch.ops.msaq
 
 
@@ -44,6 +44,9 @@ class QLinear:
         elif path.startswith("mxint8"):
             p = pack_weight_mxint8(W); self.s, self.qw = cuda(p["scale_exp"]), cuda(p["qweight"])
             self.qwc = cuda(p["qweight_cm"])   # column-major twin for the wide-load kernels
+        elif path.startswith("naive"):                # naive-ms: unsigned-format planes (same layout as msaq)
+            p = pack_weight_naive(W, u, gs); self.s = cuda(p["scale_exp"])
+            self.upc, self.shc = cuda(p["upper_cm"]), cuda(p["shared_cm"])
         else:
             p = pack_weight(W, u, gs); self.s = cuda(p["scale_exp"])
             self.up, self.sh = cuda(p["upper"]), cuda(p["shared"])
@@ -58,6 +61,8 @@ class QLinear:
             return X @ OPS.mxint8_dequant_bf16(self.s, self.qwc, self.OUT, self.K, self.nb)
         if p == "msaq_wonly" or p == "msaq_wa":
             return X @ OPS.ms_dequant_bf16(self.s, self.upc, self.shc, self.OUT, self.K, self.nb, self.u, self.gs)
+        if p == "naive_wonly" or p == "naive_wa":
+            return X @ OPS.ms_dequant_bf16_unsigned(self.s, self.upc, self.shc, self.OUT, self.K, self.nb, self.u, self.gs)
 
     def gemv(self, x):                                   # x [K] bf16 -> [OUT]
         p = self.path
@@ -66,6 +71,8 @@ class QLinear:
         if p == "mxint8_wa":     return OPS.mxint8_wa_gemv_wide(x, self.s, self.qwc, self.OUT, self.nb)
         if p == "msaq_wonly":    return OPS.wonly_gemv_wide(x, self.s, self.upc, self.shc, self.OUT, self.nb, self.u, self.gs)
         if p == "msaq_wa":       return OPS.wa_gemv(x, self.s, self.upc, self.shc, self.OUT, self.nb, self.u, self.gs)
+        if p == "naive_wonly":   return OPS.wonly_gemv_wide_unsigned(x, self.s, self.upc, self.shc, self.OUT, self.nb, self.u, self.gs)
+        if p == "naive_wa":      return OPS.wa_gemv_unsigned(x, self.s, self.upc, self.shc, self.OUT, self.nb, self.u, self.gs)
 
     def fwd(self, X):                                    # decode: [B,K]->[B,OUT]
         B, p = X.shape[0], self.path
@@ -80,11 +87,14 @@ class QLinear:
         if B >= 16:
             if p.startswith("mxint8"): return X @ OPS.mxint8_dequant_bf16(self.s, self.qwc, self.OUT, self.K, self.nb)
             if p.startswith("msaq"):   return X @ OPS.ms_dequant_bf16(self.s, self.upc, self.shc, self.OUT, self.K, self.nb, self.u, self.gs)
+            if p.startswith("naive"):  return X @ OPS.ms_dequant_bf16_unsigned(self.s, self.upc, self.shc, self.OUT, self.K, self.nb, self.u, self.gs)
         # small batch (2..15): weight read still ~free per row, scalar batched is fine
         if p == "msaq_wonly":   return OPS.wonly_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
         if p == "mxint8_wonly": return OPS.mxint8_gemv_batched_wide(X, self.s, self.qwc, B, self.OUT, self.nb)
         if p == "msaq_wa":      return OPS.wa_gemv_batched(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
         if p == "mxint8_wa":    return OPS.mxint8_wa_gemv_batched_wide(X, self.s, self.qwc, B, self.OUT, self.nb)
+        if p == "naive_wonly":  return OPS.wonly_gemv_batched_unsigned(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
+        if p == "naive_wa":     return OPS.wa_gemv_batched_unsigned(X, self.s, self.upc, self.shc, B, self.OUT, self.nb, self.u, self.gs)
         return self.gemm(X)                              # bf16 (cuBLAS)
 
 
