@@ -27,8 +27,9 @@
 | | B=2..15 | `wa_gemv_batched` | `wa_gemv_batched_cuda` | **`wa_gemv_batched_uspec`** ⭐ (+ `quant_act`) | [w_gemv.cu:703](csrc/w_gemv.cu#L703) / host [:1032](csrc/w_gemv.cu#L1032) |
 | | B≥16 | `ms_dequant_bf16` + cuBLAS | (= prefill 경로) | 위와 동일 | |
 | **활성화 양자화** | W+A 전용 | `quant_act` | `ms_launch_quant_act_msaq` | `quant_act_msaq_kernel` | [wa_gemm.cu:81](csrc/wa_gemm.cu#L81) / host [:792](csrc/wa_gemm.cu#L792) |
-| **어텐션 (KV decode)** | 모든 B | `kv_decode_attention_batched` | `kv_decode_attention_batched_cuda` | `kv_decode_wide_kernel` `<U4,VPACK,U_,GS_>` | [kv_attention.cu:336](csrc/kv_attention.cu#L336) / host [:1887](csrc/kv_attention.cu#L1887) |
-| **KV append** | 매 step | `kv_append` / `kv_append_rot` | — | `kv_append_kernel` / `kv_append_rot_kernel` | [kv_attention.cu:1636](csrc/kv_attention.cu#L1636) |
+| **KV write (prefill 일괄)** | prefill 1회 | `kv_write` | `kv_write_cuda` | `kv_write_kernel` (전체 [B,Hkv,Lp,hd] K/V를 MSAQ 평면으로 양자화 저장) | [kv_attention.cu:1599](csrc/kv_attention.cu#L1599) / host [:2061](csrc/kv_attention.cu#L2061) |
+| **KV append (decode 매 step)** | 매 step | `kv_append` / `kv_append_rot` | — | `kv_append_kernel` / `kv_append_rot_kernel` (새 K/V 1칸을 양자화해 캐시에 덧씀; `_rot`은 K 회전 융합) | [kv_attention.cu:1636](csrc/kv_attention.cu#L1636) / [:1668](csrc/kv_attention.cu#L1668) |
+| **KV read = 어텐션 연산** | 모든 B | `kv_decode_attention_batched` | `kv_decode_attention_batched_cuda` | `kv_decode_wide_kernel` `<U4,VPACK,U_,GS_>` (양자화 K/V 읽어 Q·Kᵀ, P·V; **Q는 bf16**) | [kv_attention.cu:336](csrc/kv_attention.cu#L336) / host [:1887](csrc/kv_attention.cu#L1887) |
 | **온라인 회전** | (옵션) | `hadamard_rotate` | — | `hadamard_rotate_kernel` | [rotate.cu:40](csrc/rotate.cu#L40) |
 
 ⭐ = **오늘(260625) 수정된 커널** (§4).
@@ -42,7 +43,8 @@
 | Decode W-only B=2..15 | **`mxint8_gemv_batched_wide_kernel`** ⭐ | [:216](csrc/mxint8.cu#L216) |
 | Decode W+A B=1 | `mxint8_wa_gemv_wide_kernel` | [:255](csrc/mxint8.cu#L255) |
 | Decode W+A B=2..15 | **`mxint8_wa_gemv_batched_wide_kernel`** ⭐ | [:277](csrc/mxint8.cu#L277) |
-| 어텐션 KV decode | `mxint8_kv_split_kernel` | [:750](csrc/mxint8.cu#L750) |
+| KV write(prefill) / append(decode) | `mxint8_kv_write_kernel` / `mxint8_kv_append_kernel` | [:865](csrc/mxint8.cu#L865) / [:891](csrc/mxint8.cu#L891) |
+| KV read = 어텐션 연산 | `mxint8_kv_split_kernel` | [:750](csrc/mxint8.cu#L750) |
 
 공유 헬퍼 ([`csrc/core/ms_utils.cuh`](csrc/core/ms_utils.cuh)): `e8m0_to_scale` [:87](csrc/core/ms_utils.cuh#L87),
 `stream_block_uspec<U_,GS_,F>` (레지스터 상주 스트리밍 언팩) [:153](csrc/core/ms_utils.cuh#L153),
@@ -90,8 +92,10 @@ cuda-core GEMV는 MAC 연산이 M과 함께 커져(M=32 점유율 23%, `acc[MR]`
 그래서 B≥16은 prefill과 같은 dequant+cuBLAS(≈101µs, bf16과 타이/약간 손해)를 쓴다.
 **교차점: shared-activation GEMV는 ~M=10까지 bf16 승, ~M=20까지 dequant+cuBLAS 승.**
 
-### 어텐션: `kv_decode_wide_kernel<U4,VPACK,U_,GS_>`
-KV 캐시(K,V)를 MSAQ 평면으로 저장하고 와이드 로드 + `(u,gs)` 특수화 언팩으로 Q·Kᵀ / P·V를 푼다.
+### 어텐션 3종: `kv_write` (prefill) / `kv_append` (decode) / `kv_decode_wide_kernel` (read)
+KV는 세 커널이 나눠 담당한다: **write**(`kv_write_kernel`, prefill에서 전체 K/V 일괄 양자화),
+**append**(`kv_append_kernel`, decode 매 step 새 K/V 1칸 양자화 저장; `_rot`은 K 회전 융합),
+**read**(`kv_decode_wide_kernel`, 아래). read 커널이 양자화 K/V를 와이드 로드 + `(u,gs)` 특수화 언팩으로 Q·Kᵀ / P·V를 푼다.
 Q는 bf16으로 읽는다 → **AA(어텐션 활성화 양자화)를 켜도 decode latency = KV-decode**(AA는 정확도
 비용이지 latency 비용이 아님; S6=S5). 배치가 커질수록 KV 바이트 절감이 커져 가장 잘 이기는 경로
 (B=32에서 0.65×). (KV 특수화: [kernel_ver3.md](kernel_ver3.md), 커밋 `57d6212`.)
@@ -121,8 +125,15 @@ B≥16은 weight scope 타이/손해 + KV scope 승.
   텐서코어 4% idle, fragment가 레지스터 잡아 점유율 32%). [wa_gemm.cu:580/498]. documented-negative.
 - `wa_imma` / `mxint8_wa_imma` (block-scaled INT8 IMMA prefill) — IMMA 5.6% (블록 스케일 flush),
   cuBLAS와 비호환. [wa_gemm.cu:651].
-- `qk_wmma` / `pv_wmma` (+`_mx`) — prefill 어텐션(M≥64) 프록시. decode는 위 KV 커널이 담당. AA prefill은
-  bf16 SDPA에 짐. [kv_attention.cu:1218/1096].
+- **AA low-bit×low-bit 어텐션 matmul** (= Q·Kᵀ, P·V를 *양자화끼리* 연산) — `qk_wmma_kernel`
+  [kv_attention.cu:1218](csrc/kv_attention.cu#L1218), `pv_wmma_kernel` [:1096](csrc/kv_attention.cu#L1096)
+  (+ `_mx`/`qk_scalar` 변형). **production 경로엔 없음.** 호출처는 `tests/aa_kernel_bench.py`,
+  `tests/shared_prefix_attn_bench.py`뿐. 이유: ① **decode** — production `kv_decode_wide_kernel`은 Q를
+  bf16으로 읽는다(decode는 KV 바이트에 memory-bound, Q는 [B,Hq,hd]로 극소). Q를 양자화(low×low)해도
+  latency 이득 0 → **S6(AA)가 S5와 같은 커널**을 쓴다(AA = 정확도 비용, latency 비용 아님). ② **prefill** —
+  qk_wmma/pv_wmma(low×low)는 bf16 SDPA에 2–2.7× 짐 → prefill 어텐션도 bf16 SDPA. 즉 low×low 어텐션은
+  **만들어 측정했으나 documented-negative**라 E2E에서 빠졌다. (측정: [precision/aa_attn_results.md](precision/aa_attn_results.md),
+  [change.md](change.md) Phase 49.)
 - 초기 버전들: `wonly_gemv_splitk_kernel`(ver.1), `wonly_gemv_cpasync_kernel`, `*_tiled`,
   `*_wmma`(비-pipe), `kv_decode_cpasync/warpT/gqa` — ver.2/3 와이드로드·특수화로 대체됨.
 - generic fallback(`*_kernel` 비-uspec): 특수화 안 된 `(u,gs)`용. E2E(u2/u3, gs8/16)는 전부 uspec 사용.
