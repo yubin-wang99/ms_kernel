@@ -278,8 +278,11 @@ __global__ void mxint8_wa_gemv_batched_wide_kernel(
         const int8_t* __restrict__ qx, const int8_t* __restrict__ sa_exp,
         const int8_t* __restrict__ scale_exp, const int8_t* __restrict__ qweight_cm,
         float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
-    // SHARED-ACTIVATION: stage int8 [MR][BLOCK] activation in shared once per K-block.
-    __shared__ int8_t As[MR][BLOCK];
+    // DEQUANT-IN-STAGING (see msaq wa_gemv_batched_uspec): at decode the int8 dot has no
+    // advantage; fold sa into the staged activation (As = qx*sa float) and run a float MAC
+    // (one FFMA/elem, single acc[MR]) at W-only speed. Numerically identical W+A.
+    __shared__ float As[MR][BLOCK];
+    __shared__ float Sas[MR];
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
     const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
@@ -289,24 +292,22 @@ __global__ void mxint8_wa_gemv_batched_wide_kernel(
     #pragma unroll
     for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
     for (int blk = b0; blk < b1; ++blk) {
+        if (tid < MR) Sas[tid] = (row0 + tid < M) ? ms::e8m0_to_scale(sa_exp[(row0 + tid) * NB + blk]) : 0.0f;
+        __syncthreads();
         for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
             const int m = idx / BLOCK, k = idx % BLOCK;
-            As[m][k] = (row0 + m < M) ? qx[(long)(row0 + m) * K + blk * BLOCK + k] : (int8_t)0;
+            As[m][k] = (row0 + m < M) ? (float)qx[(long)(row0 + m) * K + blk * BLOCK + k] * Sas[m] : 0.0f;
         }
         __syncthreads();
         if (active) {
             const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
             int8_t wbuf[32]; mx_load_col32(qweight_cm, (long)blk * OUT + o, wbuf);
-            int idot[MR];
-            #pragma unroll
-            for (int j = 0; j < MR; ++j) idot[j] = 0;
             #pragma unroll
             for (int k = 0; k < BLOCK; ++k) {
+                const float wf = (float)wbuf[k] * sw;
                 #pragma unroll
-                for (int j = 0; j < MR; ++j) idot[j] += (int)wbuf[k] * (int)As[j][k];
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
             }
-            #pragma unroll
-            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += (float)idot[j] * sw * ms::e8m0_to_scale(sa_exp[m * NB + blk]); }
         }
         __syncthreads();
     }

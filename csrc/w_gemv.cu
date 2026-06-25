@@ -705,10 +705,15 @@ __global__ void wa_gemv_batched_uspec(
         const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
         const uint8_t* __restrict__ shared_cm,
         float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
-    // SHARED-ACTIVATION (see wonly_gemv_batched_uspec): stage the int8 [MR][BLOCK]
-    // activation tile in shared once per K-block so the 128 output-column threads
-    // broadcast-read it instead of each reloading qx[m,kk] from global (L1-bound).
-    __shared__ int8_t As[MR][BLOCK];
+    // DEQUANT-IN-STAGING decode W+A. At decode (memory-bound) the int8 dot has no
+    // compute advantage -- (qa.qw).sa.sw == (qa.sa).(qw.sw) -- and the int path was 70us
+    // (vs W-only's float 40us): IMAD < FFMA on Ampere, int8 shared reads, and idot[MR]+
+    // acc[MR] = 2x accumulators capping occupancy. So fold sa into the staged activation
+    // (As = qx * sa, in float) and run the W-only float MAC: one FFMA per element, single
+    // acc[MR]. Numerically identical W+A, at W-only speed. Sas staged first (one sync),
+    // then As, then the MAC -> three light syncs per block.
+    __shared__ float As[MR][BLOCK];
+    __shared__ float Sas[MR];
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
     const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
@@ -718,23 +723,21 @@ __global__ void wa_gemv_batched_uspec(
     #pragma unroll
     for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
     for (int blk = b0; blk < b1; ++blk) {
+        if (tid < MR) Sas[tid] = (row0 + tid < M) ? ms::e8m0_to_scale(sa_exp[(row0 + tid) * NB + blk]) : 0.0f;
+        __syncthreads();
         for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
             const int m = idx / BLOCK, k = idx % BLOCK;
-            As[m][k] = (row0 + m < M) ? qx[(long)(row0 + m) * K + blk * BLOCK + k] : (int8_t)0;
+            As[m][k] = (row0 + m < M) ? (float)qx[(long)(row0 + m) * K + blk * BLOCK + k] * Sas[m] : 0.0f;
         }
         __syncthreads();
         if (active) {
             const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
             const long base = (long)blk * OUT + o;
-            int idot[MR];
-            #pragma unroll
-            for (int j = 0; j < MR; ++j) idot[j] = 0;
             ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+                const float wf = (float)word * sw;
                 #pragma unroll
-                for (int j = 0; j < MR; ++j) idot[j] += word * (int)As[j][k];
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
             });
-            #pragma unroll
-            for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) acc[j] += (float)idot[j] * sw * ms::e8m0_to_scale(sa_exp[m * NB + blk]); }
         }
         __syncthreads();
     }

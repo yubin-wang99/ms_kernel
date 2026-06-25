@@ -20,8 +20,9 @@ def emit(s): print(s, flush=True); lines.append(s)
 emit(f"# Per-scope E2E latency v2 (S1-S6, incl. AA) — {torch.cuda.get_device_name(0)}")
 emit(f"\nLlama-3.1-8B {H.Cfg.layers}L, L_in={LIN}, L_out={LOUT}, per-scope robust (u=4 where robust).")
 emit("Current kernels: prefill = dequant-weight + cuBLAS (ties bf16); batched decode B in 2..15 = "
-     "shared-activation wide GEMV (40us@M8, beats bf16 46us); B>=16 = dequant+cuBLAS; KV decode = "
-     "(u,gs)-specialized wide-load. ms in µs; ratio <1 = MSAQ faster.")
+     "shared-activation wide GEMV (W-only 40us@M8; W+A dequant-in-staging float MAC 44us@M8 incl "
+     "quant_act; both beat bf16 46us); B>=16 = dequant+cuBLAS; KV decode = (u,gs)-specialized "
+     "wide-load. ms in µs; ratio <1 = MSAQ faster.")
 emit("\n**S6 W+A+KV+AA** = full quant incl. attention activation×activation (Q,K,P,V). The decode "
      "attention kernel reads Q in bf16, so **AA decode latency == KV-decode (== S5)**; AA adds accuracy "
      "cost (~+0.9–1.0pp PPL, `precision/aa_attn_results.md`), not decode latency. Prefill attention is "
