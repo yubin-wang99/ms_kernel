@@ -221,8 +221,9 @@ regime is decode (memory-bound), not prefill.
 
 | topic | file |
 |---|---|
+| **which kernel is current** (production path → file:line per stage, ver.260625) | [`kernel_ver260625.md`](kernel_ver260625.md) |
 | **E2E batched latency** (uniform u4/gs2, prefill/decode/total × ratios) | [`tests/harness_batchsweep_results.md`](tests/harness_batchsweep_results.md), harness `tests/harness_batchsweep.py` |
-| **E2E at accuracy-robust (u,gs) per scope** (`--perscope`) | [`tests/harness_perscope_results.md`](tests/harness_perscope_results.md) |
+| **E2E at accuracy-robust (u,gs) per scope, incl. S6 AA** (`tests/e2e_perscope2.py`) | [`tests/harness_perscope_results2.md`](tests/harness_perscope_results2.md) (older: [`_results.md`](tests/harness_perscope_results.md)) |
 | packing/unpacking format (planes, u4-nibble vs u<4-straddle, unpack ops) | [`packing_explained.md`](packing_explained.md) |
 | E2E batch-1 (TTFT/TPOT, 4 scenarios × 3 models) | [`harness_results.md`](harness_results.md), `tests/harness.py` |
 | weight-matmul kernel wins (GEMV/GEMM/W+A) | [`weight_scope_results.md`](weight_scope_results.md) |
