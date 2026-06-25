@@ -1,0 +1,63 @@
+[caveat_e2e] NVIDIA GeForce RTX 3090 | L_in=1024 L_out=128 | per-scope robust u/gs | ratios <1=faster (mq=msaq, mx=mxint8, bf=bf16)
+
+--- S1 W-only (MSAQ u3/gs16) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    0.99   1.09   1.10 |    0.83   0.54   0.65 |    0.85   0.59   0.68
+     8 |    0.99   1.00   1.01 |    1.00   0.84   0.83 |    1.00   0.88   0.88
+    32 |    1.00   1.00   1.00 |    0.99   1.24   1.25 |    0.99   1.15   1.16
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+--- S2 W+A (MSAQ u2/gs8) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    0.99   1.09   1.09 |    0.92   0.61   0.66 |    0.93   0.64   0.69
+     8 |    0.99   1.00   1.01 |    1.02   1.19   1.17 |    1.01   1.14   1.13
+    32 |    1.00   1.00   1.00 |    1.00   1.25   1.25 |    1.00   1.15   1.15
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+--- S3 KV-only (MSAQ u4/gs2) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    1.01   1.02   1.01 |    1.01   0.95   0.94 |    1.01   0.96   0.95
+     8 |    1.00   1.01   1.01 |    0.98   0.68   0.69 |    0.99   0.77   0.77
+    32 |    1.00   1.01   1.01 |    1.01   0.42   0.42 |    1.01   0.65   0.64
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+--- S4 W-only+KV (MSAQ u2/gs8) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    1.00   1.10   1.10 |    0.92   0.54   0.59 |    0.93   0.59   0.63
+     8 |    1.00   1.01   1.01 |    1.11   0.56   0.51 |    1.06   0.68   0.64
+    32 |    0.99   1.00   1.01 |    1.10   0.73   0.66 |    1.05   0.83   0.79
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+--- S5 W+A+KV (MSAQ u2/gs8) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    1.00   1.09   1.10 |    0.94   0.57   0.60 |    0.95   0.61   0.64
+     8 |    1.00   1.01   1.01 |    1.08   0.91   0.84 |    1.06   0.94   0.89
+    32 |    0.99   1.00   1.01 |    1.10   0.73   0.66 |    1.05   0.84   0.80
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+--- S6 W+A+KV+AA (MSAQ u2/gs8) ---
+     B |        PREFILL        |        DECODE         |         TOTAL        
+       |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf |   mq/mx  mq/bf  mx/bf
+     1 |    1.00   1.10   1.11 |    0.94   0.57   0.60 |    0.95   0.61   0.64
+     8 |    1.00   1.01   1.01 |    1.08   0.91   0.85 |    1.05   0.94   0.89
+    32 |    0.99   1.00   1.01 |    1.10   0.73   0.66 |    1.05   0.84   0.79
+    64 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   128 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+   256 |     OOM    OOM    OOM |     OOM    OOM    OOM |     OOM    OOM    OOM
+
+[caveat_e2e] done
