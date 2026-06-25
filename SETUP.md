@@ -1,5 +1,9 @@
 # Porting the project to another server
 
+> Starting from a **bare server** (no git, no driver, no CUDA toolkit, no Python env) and also want to
+> install Claude Code? See [`FRESH_SERVER_SETUP.md`](FRESH_SERVER_SETUP.md). This doc assumes the
+> toolchain (conda/`nvcc`/driver) already exists and you just need to port + build.
+
 The CUDA extension (`ms_cuda`) is **compiled on the machine it runs on** — the `.so` is
 tied to the exact GPU arch + CUDA toolkit + torch ABI, so you **never copy the build
 artifacts**; you copy the source and rebuild.
