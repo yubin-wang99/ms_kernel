@@ -1,0 +1,9 @@
+ncu main-kernel metrics (RTX 3090, sudo). DRAM read / %peak BW / time / L2 sector hit / long_scoreboard stall / math_pipe(unpack) stall
+case        kernel                  DRAMrd(MB)  BW%peak  time     L2hit%  longSB%  mathpipe%
+w_dec_ms    wonly_gemv_wide_uspec   11.55       68.26    21.63us  8.05    31.45    12.53
+w_dec_mx    mxint8_gemv_splitk      17.32       38.27    55.49us  2.86    75.86    0.20
+wa_dec_ms   wa_gemv                 13.64       71.16    24.06us  6.23    59.83    5.20
+kv_ms       kv_decode_wide          26.32        7.93   391.30us 83.88    11.33    3.63
+kv_mx       mxint8_kv_split         34.62        8.85   453.25us 69.81    45.59    0.19
+w_pre_ms    wonly_gemm_wmma_pipe    27.85        2.46     1.48ms  94.05    17.11    9.76
+w_pre_mx    mxint8_gemm_tiled       49.54        1.77     3.36ms  79.21    30.48    0.49
