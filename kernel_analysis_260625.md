@@ -221,3 +221,193 @@ MLP(메모리대기/iss): MXINT8 18.0  | MSAQ 5.6  → DRAM 82% vs 74%
 straddle 세금       : u2(1436M ALU/502µs) vs u4(853M/266µs) = 1.7× ALU / 1.9× 시간
 weight 바이트       : bf16 34MB | MSAQ 11MB | MXINT8 17MB  (B≥16 fused가 11MB 직접 read = 승)
 ```
+
+---
+
+# 4. Insight (요약 문장)
+
+## 4-A. Workload 특성 (prefill vs decode)
+
+- Prefill stage는 입력 시퀀스 전체(L_in개 토큰)의 activation matrix와 weight 간 GEMM을 수행하므로
+  arithmetic intensity가 ridge point를 크게 상회하는 **compute-bound** 연산이며, weight load는 전체
+  실행시간의 7% 수준에 불과해 양자화의 memory traffic 절감이 시간으로 전환되지 않습니다.
+- 반면 decode step은 토큰 1개의 activation vector와 전체 weight의 GEMV를 수행하므로, 매 token 생성
+  시 모델 전체 weight와 누적된 KV cache 전체를 메모리에서 load하는 **memory-bound** 연산이고, 따라서
+  byte를 줄이는 양자화가 latency로 직결됩니다.
+- 같은 memory-bound라도 batch=1 decode는 in-flight load가 적어 **latency-bound**(유휴 issue slot이
+  많음)인 반면, batch가 커지면 weight load가 amortize되며 점차 **bandwidth-bound**로 이동하므로,
+  동일한 양자화 기법이라도 batch 구간에 따라 효과가 달라집니다.
+- KV write(prefill 일괄)와 KV append(decode 매 step)는 각각 streaming store와 launch-bound 연산이라
+  양자화 포맷 차이가 memory latency 뒤에 은닉되어 latency에 거의 영향을 주지 않으며, KV 양자화의
+  실질 이득은 오직 KV read(attention) 단계의 traffic 감소에서 나옵니다.
+
+## 4-B. Batch size·sequence length 증가에 따른 영향
+
+- Decode에서 weight load는 batch 전체가 공유(amortize)하지만 KV cache는 sequence·batch에 비례해
+  누적되므로, sequence length와 batch size가 커지면 KV cache 용량이 weight 용량을 초과하게 되어
+  **KV cache quantization의 이점이 weight-only quantization의 이점을 능가**합니다.
+- Weight-only 양자화의 byte 이득은 batch가 커져도 일정(weight 크기 고정)하지만 GEMV의 arithmetic
+  intensity는 batch에 비례해 증가하므로, 일정 batch를 넘으면 weight scope가 compute-bound 쪽으로
+  이동해 cuda-core GEMV가 폭발하고, 이를 피하려면 **양자화 weight를 직접 읽어 tensor-core에 공급하는
+  fused GEMM**으로 전환해야 합니다.
+- 반대로 KV scope는 batch·문맥이 커질수록 점점 더 깊은 bandwidth-bound가 되어 byte 절감이 그대로
+  시간이 되므로, **batch가 커질수록 KV 양자화가 가장 잘 이기는 구간**이 됩니다.
+
+## 4-C. MS 자체의 이점과 한계
+
+- MS의 유일한 무기는 mantissa-sharing을 통한 **byte 절감(MXINT8 대비 약 0.66×, BF16 대비 0.32×)**
+  이며, 이 무기는 대상 연산이 bandwidth-bound일 때만 시간으로 전환됩니다.
+- MS는 그 byte 이득에 대해 항상 **sub-byte unpack ALU 세금**(MXINT8 대비 정수 명령 약 3.7×)을 함께
+  지불하는데, 이 unpack 연산이 단순히 명령 수를 늘리는 것을 넘어 **warp가 메모리를 기다리는 대신
+  연산하게 만들어 in-flight load 수(MLP)를 떨어뜨리고, 그 결과 DRAM bandwidth를 포화시키지 못해 byte
+  절감 이득이 미실현**되는 것이 한계의 본질입니다.
+- 따라서 MS는 unpack 세금이 유휴 사이클에 숨는 **latency-bound 구간(batch=1)** 과 byte가 unpack을
+  압도하는 **깊은 bandwidth-bound 구간(대배치·긴 문맥)** 에서는 이기지만, 그 사이의 **중간 batch
+  구간에서는 unpack이 MLP를 빼앗아 MXINT8의 0-unpack memory-bound 우위를 넘지 못하는 "골짜기"** 를
+  보입니다.
+- 이 골짜기는 명령 스케줄링(funnel-shift 재배치)이나 bit re-layout(nibble 재배치, register-aligned)로는
+  해소되지 않는 **구조적 한계**이며, 유일한 예외는 코드 폭이 nibble(4-bit)로 정렬되어 단일 hardware
+  bfe로 unpack이 끝나는 경우(unpack이 애초에 싸짐)뿐입니다.
+
+## 4-D. Quantization scope별 특징과 batch에 따른 변화
+
+- **Weight-only / KV cache quantization은 memory traffic 감소를 통해 decode latency 절감에 직접 기여**
+  하며, MS는 latency-bound인 batch=1과 bandwidth-bound인 대배치에서 BF16·MXINT8를 모두 이기지만,
+  중간 batch 구간(W-only)·중배치 straddle 포맷(KV)에서는 MXINT8와 타이거나 패배합니다.
+- 반면 **weight and activation quantization은 low-bitwidth GEMM을 통해 compute throughput을 높이지만,
+  decode는 memory-bound 특성을 띠므로 그 throughput 이득은 prefill stage에 국한**되며, decode에서는
+  `(qa·sa)·(qw·sw)` 항등식으로 int8 dot 대신 float MAC을 돌려 weight-only와 동일한 memory-bound
+  특성을 따릅니다.
+- 게다가 **activation quantization은 runtime quantization overhead(decode 매 step의 quant_act)를
+  수반하므로 그 자체로 decode latency를 증가**시키며, 이 overhead는 memory-bound라 양자화 포맷을
+  바꿔도 줄지 않습니다.
+- MS 고유의 활성화 양자화(per-block E8M0 scale + sub-byte)는 prefill에서 INT8 tensor-core의 2×
+  throughput을 살리려 할 때 **per-block scale이 scale-free main-loop를 막아 per-block store·scale·RMW를
+  강제**하므로, MS는 compute-bound prefill에서 INT8 IMMA로 이기지 못하고 dequant→BF16→cuBLAS 경로로
+  후퇴해 **BF16과 타이**에 머뭅니다.
+- B≥16 weight scope에서 기존 dequant+cuBLAS 경로는 BF16 weight를 쓰고 다시 읽는 round-trip 때문에
+  오히려 BF16보다 많이 읽어 패배했으나, **양자화 weight를 직접 읽어 tensor-core fragment로 dequant하는
+  fused skinny-GEMM**은 weight read가 memory-bound인 이 구간에서 byte 우위(11MB vs BF16 34MB·MXINT8
+  17MB)를 그대로 실현해 BF16·MXINT8를 모두 압승하며, 이 한 번의 전환으로 weight 계열 모든 scope가
+  전 batch에서 두 baseline을 이기게 됩니다.
+- KV scope에서 attention의 Q는 항상 BF16으로 읽고 decode latency는 KV byte에 의해 결정되므로,
+  **attention activation까지 양자화(AA)해도 latency는 변하지 않고 정확도 비용만 추가**되어, W+A+KV
+  scope의 decode 특성은 W+KV scope와 동일합니다.
+
+## 4-E. Nibble(u4) vs non-nibble(u2/u3) — 코드 정렬에 따른 이득 변화
+
+**무엇이 nibble 정렬을 가르나**
+
+- MSAQ는 원소당 **upper code (8−u) bit** + 그룹당 **shared (u) bit**를 저장하므로, 원소마다 추출하는
+  코드 폭은 **(8−u) 비트**입니다.
+- **u=4 → upper 4비트 = nibble**: 32비트 워드에 정확히 8개가 떨어져 어떤 코드도 워드 경계를 넘지
+  않습니다(straddle 없음). shared도 4비트라 **딱 2개의 깨끗한 nibble 필드**가 됩니다.
+- **u=2 → upper 6비트 / u=3 → upper 5비트**: 4의 배수가 아니라 byte/word 경계를 **가로지릅니다
+  (straddle)** → 두 위치의 비트를 결합(rolling buffer/funnel) + 가변 shift 필요.
+
+**unpack 비용 차이 (메커니즘 + 측정)**
+
+- **u=4(nibble)**: 추출이 **단일 `bfe.s32`**(HW bit-field-extract + sign-extend, 1 op)로 끝남.
+- **u=2/3(straddle)**: 원소당 rolling-buffer refill(조건부 OR) + mask(LOP) + sign-extend(XOR+IADD) +
+  가변 shift + combine = **정수 ALU 약 5~7개**(nibble은 ~3개).
+- 측정 (KV decode B=8, Lk=2048, isolated): **u4 = 853M 정수 ALU / 266µs**, **u2 = 1436M / 502µs** →
+  straddle만으로 **정수 ALU 1.7×, 시간 1.9×**. DRAM%도 u4 15.4 vs u2 8.5로 하락(unpack이 MLP를 더
+  빼앗아 BW 미포화).
+
+**승패 구조 변화 (가장 중요)**
+
+- **u=4(nibble)는 "골짜기"가 사라짐**: unpack이 애초에 싸 MLP를 거의 안 빼앗으므로 byte 절감이 거의
+  그대로 시간 전환. KV u4/gs2 실측: B8 **0.80**, B32 **0.55** → **전 배치에서 BF16·MXINT8 모두 승**.
+- **u=2/3(straddle)는 "골짜기"가 그대로**: unpack 세금이 무거워 중간 배치에서 MXINT8의 0-unpack 우위를
+  못 넘음. KV u2/gs8 실측: B8 **1.33(mx 패)**, B32 **0.92(대배치만 승)**. W-only가 u3(5비트 straddle)라
+  batched B=2~15가 골짜기에 빠지는 것도 동일 원인.
+- 즉 **nibble 여부가 "이기는 배치 구간의 폭"을 결정**: u4는 batch=1~대배치까지 연속 승, u2/u3는
+  batch=1(latency-bound)과 대배치(깊은 BW-bound) 양 끝에서만 승, 가운데가 패배 골짜기.
+
+**nibble 재배치로 u2/u3를 구제 못하는 이유**
+
+- u=4가 빠른 근본 이유는 **정확히 2개의 깨끗한 nibble 필드**를 갖기 때문. u=2/3는 8−u=6/5비트라 nibble로
+  나누면 **3번째 필드(low_un)가 불가피**.
+- nibble 재배치는 3개 평면(hi4 + low_un + shared)이 되어 stride 로드 증가 + recombine
+  (`hi*16 + low_un*2^u + shared` ≈ 5~6 op) 추가 → 기존 streaming straddle보다 **30~37% 더 느림**
+  (bit-exact). → **u2/u3엔 streaming straddle unpack이 이미 최적, 어떤 re-layout도 못 넘음.**
+
+**byte·정확도 trade-off (왜 그냥 u4를 안 쓰나)**
+
+- u가 클수록 per-element upper code가 작아져(u4=4비트) **바이트도 적고 unpack도 싸지만** 원소당 정밀도가
+  낮음. u가 작을수록(u2=6비트) 정밀도는 높지만 바이트 증가(W에서 u3 0.64× → u2 0.76×) + straddle 비용.
+- 따라서 **u 선택은 속도가 아니라 정확도 요구가 결정**하며, 정확도가 u2/u3를 요구하는 scope(weight,
+  attention activation frontier가 u2 고정)에서는 cheap-to-unpack한 u4를 못 쓰고 **강제로 straddle
+  regime(골짜기)** 에 진입. 이것이 "nibble이면 쉽게 이기는데 정작 정확도가 필요한 곳에선 nibble을 못
+  쓴다"는 MS의 구조적 긴장.
+
+## 4-F. 260626 fused 측정 기반 batch별 현상 정밀 해설 (메커니즘 보강)
+
+`blackwell_results_260625_2.md`(B≥16 fused 적용 + MXINT8 공정 twin)를 근거로, 4-A~E의 명제를 **유휴 slot·
+unpack 구성·fused 오버헤드·traffic 지표·DRAM 포화 여부**까지 내려 정밀화한다.
+
+### (1) Weight-only(S1): B=1 또렷 → B=8 동률 → B=16/32 소폭
+
+- **"유휴 issue slot"이란**: SM 스케줄러는 매 사이클 eligible warp 하나의 명령을 발행하는데, **모든 warp가
+  stall(메모리 대기 등)이면 그 사이클은 발행할 게 없어 빈다 — 이것이 유휴 issue slot**. B=1 decode는 weight
+  재사용이 없어 memory-latency-bound라 warp가 load 반환을 기다리며 자주 stall → 유휴 slot 多 → MSAQ의
+  unpack ALU가 *그 빈 사이클에 공짜로* 실행되어 숨는다 → byte 절감만 latency가 되어 BF16 0.55·MXINT8 0.84.
+- **유휴 slot이 batch와 함께 주는 이유**: batch가 커지면 같은 weight 한 줄이 **B개 토큰의 MAC에 재사용**되어
+  arithmetic intensity가 오르고(load 1회당 연산 B배), warp가 순수 대기하는 사이클이 줄어 유휴 slot이 감소
+  → unpack 명령이 숨을 빈자리를 잃고 유용한 발행과 경쟁하며 MLP를 빼앗는다 → B=8 골짜기 진입(mq/mx 1.00).
+- **sub-byte unpack ALU의 구성**(u2/u3 straddle, 원소당): ① rolling-buffer 보충(부족 시 다음 32-bit 워드를
+  조건부 OR) → ② mask(`&(2^wbits−1)`, LOP) → ③ sign-extend(XOR+IADD) → ④ 가변 shift로 버퍼 전진(SHF)
+  → ⑤ 그룹 경계마다 shared code 보충+mask+sign-extend → ⑥ combine(`up×2^u+sh`, SHL+IADD) = **정수 ~5~7 op**
+  (MXINT8은 0; u4 nibble은 단일 `bfe.s32` 1 op).
+- **B=16/32에서 "dequant+WMMA+barrier 오버헤드"란**(fused 커널): DRAM에서 양자화 weight를 읽고 K-블록마다
+  **① dequant**(shared의 각 코드를 bfe 추출 → E8M0 scale 곱 → bf16 변환 → Bs shared write), **② WMMA**(Bs·As
+  16×16 fragment를 shared에서 load → `mma.sync`), **③ barrier**(dequant→Bs write 완료 보장 위해 `__syncthreads`
+  + mma 후 1회 = K-블록당 2회)를 반복. 시간 = "11/17MB DRAM 읽기" + dequant ALU + shared write/read + barrier.
+- **load-latency-bound / barrier-bound의 의미**: 전자는 warp가 global load의 *반환 지연*(수백 cycle)을 기다리며
+  stall — DRAM 버스 대역폭이 아니라 *latency*를 못 가려 SM이 노는 상태(ncu long_scoreboard 59%). 후자는 warp가
+  `__syncthreads`에서 *블록 내 가장 느린 warp* 도착을 기다리며 노는 상태(ncu barrier 21%). 즉 한계가 DRAM
+  처리량이 아니라 *기다림*이라 byte 절감이 일부만 시간이 됨 → MXINT8(17MB+dequant)은 BF16(34MB·순수
+  텐서코어)과 동률(mx/bf ~1.00), MSAQ(11MB)만 11/17=0.65의 일부만큼 소폭(0.93~0.95) 앞섬.
+
+### (2) Weight+KV(S4): KV 효과의 batch 의존 — traffic 지표 + DRAM 포화 검증
+
+- **weight vs KV traffic 지표**(Llama-3.1-8B 32L, Hkv=8, hd=128, transformer GEMM weight=6.98B): decode는 매 step
+  weight 전체(batch 공유, **bf16 13.96 GB 고정**) + KV 캐시 전체(sequence당 1회, `B·Lk·32·2·8·128`)를 읽는다.
+
+  | B | KV @Lk=1024(prefill 끝) | KV @Lk=1152(decode 끝) | KV 비중(weight+KV) |
+  |--:|--:|--:|--:|
+  | 1 | 0.13 GB | 0.15 GB | **1.0 → 1.1 %** |
+  | 8 | 1.07 GB | 1.21 GB | 7.1 → 8.0 % |
+  | 16 | 2.15 GB | 2.42 GB | 13.3 → 14.8 % |
+  | 32 | 4.29 GB | 4.83 GB | **23.5 → 25.7 %** |
+
+  → **B=1엔 KV가 traffic의 ~1%뿐**이라 KV 양자화가 안 보이고(S4 0.56 ≈ S1 0.55), B=32엔 ~26%로 커져 좌우.
+- **MSAQ가 MXINT 대비 소폭만 이기는 비용 관점**: S4/S5/S6 KV는 정확도 요구상 **u2/gs8 straddle**(코드 폭 6비트가
+  4의 배수가 아니라 byte/word 경계를 가로지름). MXINT8은 int8을 그대로 읽어 `load→I2F→×scale(FFMA)`로 unpack
+  이 0인데, **MSAQ-u2는 KV 원소마다 위 ①~⑥의 5~7 정수 op를 추가 지불**(측정 KV B=8 Lk2048: u4 853M ALU/266µs
+  vs u2 1436M/502µs = 1.7× ALU·1.9× 시간). 이 세금이 byte 우위(0.81 vs 1.03 = 0.79×)를 갉고, 근본적으로 MSAQ의
+  무기가 MXINT8 대비 byte 절감(~0.66×)뿐이라 **우위 천장 자체가 byte-ratio 수준** → mq/mx 0.92~0.94.
+- **B=16까진 잠잠 → B=32 두드러짐, 그리고 DRAM은 포화되지 않는다**: W+KV total은 *깊어지는 KV 우위* + *줄어드는
+  fused weight 우위(0.88→0.93→0.95)*의 합이라 B=8→16 평평(0.68→0.69), B=32에서 KV(traffic 26%)가 압도해
+  두드러짐(0.62). **그러나 "깊은 bandwidth-bound"를 DRAM 포화로 읽으면 틀림**: 측정 peak DRAM BW = **~553(copy)/
+  616(read) GB/s**인데 B=32 MSAQ 풀양자화 decode(S5)는 step당 47ms·traffic 7.63 GB → **유효 162 GB/s = peak의
+  ~27%**로 **DRAM 미포화**. 즉 B=32 이득은 raw DRAM 포화가 아니라 **KV-read 커널이 shared/L2 처리량(ncu L1 81%·
+  DRAM 20%)에 묶여 있고 그 한계가 옮긴 byte에 비례**하기 때문(traffic-proportional)이며, batch가 크면 블록이
+  많아져 SM 점유율이 차는 것도 더해진다. **→ 4-B/4-C의 "bandwidth-bound"는 'DRAM 포화'가 아니라 'byte-비례'로
+  읽어야 정확하다**(측정 정정).
+
+### (3) AA·A가 prefill·decode 어느 쪽도 못 빠르게 하는 이유
+
+- **prefill에서 MS×MS GEMM인데도 안 빨라짐**: prefill GEMM은 intensity≈M(1024)≫ridge(76)라 compute-bound →
+  빨라지려면 INT8 텐서코어 2× throughput이 필요. 그러나 **MS 코드는 GEMM 전 반드시 INT8 워드로 복원(unpack)**
+  되어야 하고(추가 ALU), 결정적으로 **per-32-block E8M0 scale이 scale-free INT8 main-loop를 막아** 블록마다
+  `IMMA→int32 store→타일 scale→float RMW`를 강제해 IMMA 이득을 상쇄(실측 bf16-fused 대비 2.05× regression).
+  → **활성화·가중치를 둘 다 양자화해도 GEMM 처리시간 이득 0**, MS는 `dequant→bf16→cuBLAS`로 후퇴해 BF16 타이;
+  A 양자화는 **MXINT8보다 복잡한(sub-byte+per-block-share) quantize 오버헤드만 추가**.
+- **decode 어텐션을 AA로 저비트끼리 돌려도 안 빨라짐**: decode 어텐션은 토큰 1개의 Q(극소)와 *누적 KV 캐시 전체*
+  를 곱하므로 KV byte에 memory-bound. ① Q·K/P·V FLOP 자체가 (쿼리 1토큰이라) 미미해 연산 가속이 latency를 못
+  줄이고, ② 병목인 KV read+unpack을 AA가 안 바꾸며, ③ production 커널은 **Q를 어차피 bf16으로 읽어**(traffic
+  기여 무시) 양자화해도 byte가 안 줄음 → **AA = 정확도 비용(~+0.9~1.0pp PPL)일 뿐 latency 0 → S6=S5**.
+- **W+KV→W+A+KV+AA가 동률~미세 악화인 이유**: AA는 latency 0, +A만 매 step `quant_act`(~13µs/step·memory-bound,
+  BF16 baseline엔 없는 단계, 포맷 무관)를 더해 S6가 W+KV 대비 동률이거나 그 분(B=8 decode +54µs)만큼 BF16 비율이
+  미세하게 올라(악화) 보임.
