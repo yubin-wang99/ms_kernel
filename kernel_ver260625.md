@@ -137,6 +137,11 @@ B≥16은 weight scope 타이/손해 + KV scope 승.
 - 초기 버전들: `wonly_gemv_splitk_kernel`(ver.1), `wonly_gemv_cpasync_kernel`, `*_tiled`,
   `*_wmma`(비-pipe), `kv_decode_cpasync/warpT/gqa` — ver.2/3 와이드로드·특수화로 대체됨.
 - generic fallback(`*_kernel` 비-uspec): 특수화 안 된 `(u,gs)`용. E2E(u2/u3, gs8/16)는 전부 uspec 사용.
+- **`wa_gemv_batched_fused_uspec`** (`MS_WA_FUSED=1`, [w_gemv.cu](csrc/w_gemv.cu)) — quant_act를 GEMV
+  staging에 완전 융합(활성화를 in-kernel fake-quant). **documented-negative, 기본 OFF**: split 대비 4–9%
+  *느림*(M=8 46 vs 44µs). quant_act는 [M,K]당 1회 연산인데, output-column 블록(≈OUT/128≈32개)마다
+  fake-quant를 재실행해 그 중복 연산이 제거한 13µs보다 크다. → split(quant_act 1회 + dequant-in-staging
+  float MAC = `wa_gemv_batched_uspec`)이 기본·최적.
 
 전체 연혁: [change.md](change.md). 설계 원리: [packing_explained.md](packing_explained.md),
 [compile_time_optimization.md](compile_time_optimization.md).

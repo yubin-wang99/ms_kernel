@@ -747,6 +747,66 @@ __global__ void wa_gemv_batched_uspec(
     }
 }
 
+// FULLY-FUSED decode W+A: fake-quant the activation INSIDE the staging (no separate
+// quant_act kernel, no int8 qx global round-trip). One thread per row 2-passes its 32-elem
+// block (amax -> E8M0 scale; round+clamp to int8 -> As = q*sa, float), then the W-only
+// float MAC runs. The activation is 8-bit (not sub-byte) and consumed immediately (no
+// storage), so plain int8 fake-quant is the right model (>= MSAQ-shared accuracy). 2-pass
+// avoids a 32-elem register array (occupancy). Cost: the fake-quant is redone per
+// output-column block (~OUT/128 x), but it hides under the l1tex-bound MAC (measured).
+template<int U_, int GS_, int MR>
+__global__ void wa_gemv_batched_fused_uspec(
+        const __nv_bfloat16* __restrict__ x,         // bf16 [M,K] RAW activation (not pre-quantized)
+        const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    __shared__ float As[MR][BLOCK];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    const bool active = (o < OUT);
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        if (tid < MR) {
+            const int m = row0 + tid;
+            if (m < M) {
+                const long xb = (long)m * K + blk * BLOCK;
+                float amax = 1e-30f;
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) amax = fmaxf(amax, fabsf(__bfloat162float(x[xb + k])));
+                const int ea = ms::e8m0_exp_from_amax(amax);
+                const float sa = ms::e8m0_to_scale((int8_t)ea), inv = exp2f(-(float)ea);
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) {
+                    const int q = max(-128, min(127, (int)rintf(__bfloat162float(x[xb + k]) * inv)));
+                    As[tid][k] = (float)q * sa;
+                }
+            } else {
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) As[tid][k] = 0.0f;
+            }
+        }
+        __syncthreads();
+        if (active) {
+            const float sw = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            const long base = (long)blk * OUT + o;
+            ms::stream_block_uspec<U_, GS_>(upper_cm, shared_cm, base, [&](int k, int word) {
+                const float wf = (float)word * sw;
+                #pragma unroll
+                for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
+            });
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
+}
+
 // ---- DEQUANT the whole weight to a bf16 [OUT,K] buffer (column-major wide-load) -----
 //   For PREFILL the fused per-tile dequant runs the tensor cores at ~11% (it starves the
 //   MMA and re-dequants the weight M/TBM times). Instead dequant ONCE here (memory-bound,
@@ -1037,8 +1097,6 @@ torch::Tensor wa_gemv_batched_cuda(
     const int K = (int)NB * BLOCK;
     auto qx = torch::empty({M, K}, x.options().dtype(torch::kInt8));
     auto sa_exp = torch::empty({M, NB}, x.options().dtype(torch::kInt8));
-    ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-                             qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), (int)M, K, (int)NB, (int)u, (int)gs);
     auto y = torch::empty({M, OUT}, x.options());
     const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
     const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
@@ -1049,20 +1107,54 @@ torch::Tensor wa_gemv_batched_cuda(
     const int nTiles = (int)((M + MR - 1) / MR);
     auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
     dim3 grid(blocks, splitK, nTiles);
-    auto launch = [&](auto U4tag, auto MRtag) {
-        wa_gemv_batched_kernel<decltype(U4tag)::value, decltype(MRtag)::value>
-            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-            qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
-            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
-            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
-    };
-    auto launch_spec = [&](auto Ut, auto Gt, auto MRtag) {
-        wa_gemv_batched_uspec<decltype(Ut)::value, decltype(Gt)::value, decltype(MRtag)::value>
-            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-            qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
-            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
-            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
-    };
+    const bool nospec = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+    bool launched = false;
+    // MS_WA_FUSED=1: fake-quant the activation INSIDE the GEMV staging (no quant_act pre-pass,
+    // no int8 qx round-trip). DOCUMENTED-NEGATIVE, default OFF: it's 4-9% SLOWER than the split
+    // path. quant_act is a once-per-[M,K] op; fusing it into the per-output-column-block GEMV
+    // redoes the fake-quant ~OUT/128 (~32x) times, and that redundant compute costs more than
+    // the single 13us quant_act it removes. The split path (quant_act once + dequant-in-staging
+    // float MAC, = wa_gemv_batched_uspec) stays the default at 44us@M8.
+    const bool fused = getenv("MS_WA_FUSED") && atoi(getenv("MS_WA_FUSED")) != 0;
+    if (fused && !nospec && (int)u != 4) {
+        auto lf = [&](auto Ut, auto Gt, auto MRtag) {
+            wa_gemv_batched_fused_uspec<decltype(Ut)::value, decltype(Gt)::value, decltype(MRtag)::value>
+                <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+                partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+        };
+#define MRDISP_FUSED(UU,GG) switch (MR) { \
+        case 1:  lf(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,1>{});  break; \
+        case 2:  lf(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,2>{});  break; \
+        case 4:  lf(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,4>{});  break; \
+        case 8:  lf(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,8>{});  break; \
+        case 16: lf(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,16>{}); break; \
+        default: lf(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,32>{}); break; }
+        if      ((int)u==2 && (int)gs==8)  { MRDISP_FUSED(2,8);  launched = true; }
+        else if ((int)u==3 && (int)gs==8)  { MRDISP_FUSED(3,8);  launched = true; }
+        else if ((int)u==2 && (int)gs==16) { MRDISP_FUSED(2,16); launched = true; }
+        else if ((int)u==3 && (int)gs==16) { MRDISP_FUSED(3,16); launched = true; }
+#undef MRDISP_FUSED
+    }
+    // OLD path (u=4, non-specialized, or MS_WA_FUSED=0): quant_act pre-pass + int dot.
+    if (!launched) {
+        ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                                 qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), (int)M, K, (int)NB, (int)u, (int)gs);
+        auto launch = [&](auto U4tag, auto MRtag) {
+            wa_gemv_batched_kernel<decltype(U4tag)::value, decltype(MRtag)::value>
+                <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+                upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+                partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, (int)u, (int)gs, UB, SB, splitK);
+        };
+        auto launch_spec = [&](auto Ut, auto Gt, auto MRtag) {
+            wa_gemv_batched_uspec<decltype(Ut)::value, decltype(Gt)::value, decltype(MRtag)::value>
+                <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                qx.data_ptr<int8_t>(), sa_exp.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+                upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+                partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK);
+        };
 #define MRDISP(U4) switch (MR) { \
         case 1:  launch(U4, std::integral_constant<int,1>{});  break; \
         case 2:  launch(U4, std::integral_constant<int,2>{});  break; \
@@ -1077,18 +1169,18 @@ torch::Tensor wa_gemv_batched_cuda(
         case 8:  launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,8>{});  break; \
         case 16: launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,16>{}); break; \
         default: launch_spec(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}, std::integral_constant<int,32>{}); break; }
-    const bool nospec = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
-    bool launched = false;
-    if ((int)u == 4) { MRDISP(std::true_type{}); launched = true; }
-    else if (!nospec) {
-        if      ((int)u==2 && (int)gs==8)  { MRDISP_SPEC(2,8);  launched = true; }
-        else if ((int)u==3 && (int)gs==8)  { MRDISP_SPEC(3,8);  launched = true; }
-        else if ((int)u==2 && (int)gs==16) { MRDISP_SPEC(2,16); launched = true; }
-        else if ((int)u==3 && (int)gs==16) { MRDISP_SPEC(3,16); launched = true; }
-    }
-    if (!launched) { MRDISP(std::false_type{}); }
+        if ((int)u == 4) { MRDISP(std::true_type{}); }
+        else if (!nospec) {
+            if      ((int)u==2 && (int)gs==8)  { MRDISP_SPEC(2,8);  }
+            else if ((int)u==3 && (int)gs==8)  { MRDISP_SPEC(3,8);  }
+            else if ((int)u==2 && (int)gs==16) { MRDISP_SPEC(2,16); }
+            else if ((int)u==3 && (int)gs==16) { MRDISP_SPEC(3,16); }
+            else { MRDISP(std::false_type{}); }
+        }
+        else { MRDISP(std::false_type{}); }
 #undef MRDISP
 #undef MRDISP_SPEC
+    }
     gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
         (int)M, (int)OUT, splitK);
