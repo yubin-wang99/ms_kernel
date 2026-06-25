@@ -1,0 +1,28 @@
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 73.13it/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2-raw test: 288,937 tokens; window=2048 stride=1024 max_win=40
+target linears: 224 (CPU master cached)
+
+BF16 PPL = 6.5756
+
+  method  u  mg |      PPL | % over BF16 | within 3%?
+   naive  4   8 |   8.6205 |     +31.10% | FAIL
+   light  4   8 |   7.2615 |     +10.43% | FAIL
+    msaq  4   8 |   7.2547 |     +10.33% | FAIL
+
+   naive  4   4 |   7.8690 |     +19.67% | FAIL
+   light  4   4 |   7.1977 |      +9.46% | FAIL
+    msaq  4   4 |   7.1851 |      +9.27% | FAIL
+
+   naive  4   2 |   7.1784 |      +9.17% | FAIL
+   light  4   2 |   6.9923 |      +6.34% | FAIL
+    msaq  4   2 |   6.9876 |      +6.27% | FAIL
+
+   naive  3   4 |   6.7963 |      +3.36% | FAIL
+   light  3   4 |   6.7588 |      +2.79% | OK
+    msaq  3   4 |   6.7602 |      +2.81% | OK
+
+   naive  2   2 |   6.6049 |      +0.45% | OK
+   light  2   2 |   6.6086 |      +0.50% | OK
+    msaq  2   2 |   6.5974 |      +0.33% | OK
+
