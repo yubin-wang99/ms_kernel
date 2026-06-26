@@ -455,7 +455,7 @@ __global__ void kv_decode_wide_kernel(
         const uint8_t* __restrict__ vh,
         float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
         int H, int Hkv, int Lk, int Lcap, int D, int NB, int u, int gs, int UB, int SB,
-        int key_tile, int S, int chunk, float sm_scale, int v8, int sepsc, int vt, int qrot) {
+        int key_tile, int S, int chunk, float sm_scale, int v8, int sepsc, int vt, int qrot, int aa) {
     const int h = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, NT = blockDim.x;
     const int hk = h / (H / Hkv);                  // GQA: q head -> kv head
     const int gs_shift = __ffs(gs) - 1;            // gs is pow2: k/gs == k>>shift
@@ -494,6 +494,33 @@ __global__ void kv_decode_wide_kernel(
             __syncthreads();
         }
         if (active) q_sh[tid] *= rsqrtf((float)D);
+        __syncthreads();
+    }
+    // ---- AA: fake-quantize Q to the MS (u,gs) format (attention-activation quant) ----
+    //   AA quantizes the attention ACTIVATIONS (Q,P) the same way K,V are quantized, so
+    //   QK^T and P·V run low-bit×low-bit. Decode is memory-bound on the KV cache and Q is a
+    //   single-token vector, so this adds the Q/P quant ERROR (accuracy cost) but ~no latency
+    //   (S6==S5 latency, now MEASURED not assumed). Q[D] is split into NB 32-blocks; thread
+    //   b<NB decomposes its block to (u,gs) codes and reconstructs (quantize->dequantize).
+    if (aa) {
+        // warp-parallel Q fake-quant: warp w owns Q-block w (32 of the D dims), lane = one dim.
+        const int wq = tid >> 5, lq = tid & 31;
+        if (wq < NB && (wq * 32 + lq) < D) {
+            const int dq = wq * 32 + lq;
+            float x = q_sh[dq], amax = fabsf(x);
+            #pragma unroll
+            for (int o = 16; o >= 1; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            int ea = (int)((__float_as_int(fmaxf(amax, 1e-30f)) >> 23) & 0xFF) - 127 - ms::E_MAX;
+            ea = max(-127, min(127, ea));
+            const float sa = ldexpf(1.0f, ea), su = sa * (float)(1 << u);
+            const int qmax = (1 << (7 - u)) - 1, smin = -(1 << (u - 1)), smax = (1 << (u - 1)) - 1;
+            const int up = max(-qmax, min(qmax, (int)rintf(x / su)));
+            float gsum = x - (float)up * su;
+            #pragma unroll
+            for (int o = 1; o < 32; o <<= 1) if (o < gs) gsum += __shfl_xor_sync(0xffffffffu, gsum, o);
+            const int sh = max(smin, min(smax, (int)rintf(gsum / (float)gs / sa)));
+            q_sh[dq] = (float)up * su + (float)sh * sa;
+        }
         __syncthreads();
     }
     // separated-scale: per (blk,g) query group-sum qg = Σ_{d∈group} q[d] (key-independent,
@@ -693,6 +720,32 @@ __global__ void kv_decode_wide_kernel(
         __syncthreads();
         for (int kk = tid; kk < nC; kk += NT) sc[kk] = __expf(sc[kk] - m_new);
         __syncthreads();
+        // ---- AA: fake-quantize P (softmax probs) to MS (u,gs) before P·V ----
+        //   The other half of attention-activation quant: P·V runs low-bit×low-bit. This
+        //   chunk's nC probabilities are split into 32-key blocks; thread b decomposes block b.
+        if (aa) {
+            // warp-parallel P fake-quant: warp w owns key-block w (32 keys), lane = one prob.
+            // amax + per-gs-group residual sum via __shfl (no serial 32-loop, full-thread util).
+            const int npb = (nC + 31) >> 5, w = tid >> 5, lane = tid & 31;
+            if (w < npb) {
+                const int gk = w * 32 + lane;
+                float x = (gk < nC) ? sc[gk] : 0.0f;
+                float amax = fabsf(x);
+                #pragma unroll
+                for (int o = 16; o >= 1; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                int ea = (int)((__float_as_int(fmaxf(amax, 1e-30f)) >> 23) & 0xFF) - 127 - ms::E_MAX;
+                ea = max(-127, min(127, ea));
+                const float sa = ldexpf(1.0f, ea), su = sa * (float)(1 << u);
+                const int qmax = (1 << (7 - u)) - 1, smin = -(1 << (u - 1)), smax = (1 << (u - 1)) - 1;
+                const int up = max(-qmax, min(qmax, (int)rintf(x / su)));
+                float gsum = x - (float)up * su;                       // residual; sum within gs-group
+                #pragma unroll
+                for (int o = 1; o < 32; o <<= 1) if (o < gs) gsum += __shfl_xor_sync(0xffffffffu, gsum, o);
+                const int sh = max(smin, min(smax, (int)rintf(gsum / (float)gs / sa)));
+                if (gk < nC) sc[gk] = (float)up * su + (float)sh * sa;
+            }
+            __syncthreads();
+        }
 
         // ---- Pass 2: out[d] += Σ_kk p_kk·V[d,kk]  (thread d, V from staged shared) ----
         const int blk = tid / BLOCK, kd = tid % BLOCK;
@@ -1943,6 +1996,7 @@ torch::Tensor kv_decode_attention_cuda(
         // (u,gs)-specialized u<4 K-stream unpack (compile-time); u4 uses bfe (no
         // streaming) so passes <-1,-1>. MS_GEMV_NOSPEC=1 forces the runtime path.
         const bool kv_nospec = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+        const int aa = getenv("MS_KV_AA") ? (atoi(getenv("MS_KV_AA")) != 0) : 0;
         auto launch = [&](auto U4tag, auto Utag, auto Gtag) {
           auto run = [&](auto VPtag) {
             auto k = kv_decode_wide_kernel<decltype(U4tag)::value, decltype(VPtag)::value,
@@ -1954,7 +2008,7 @@ torch::Tensor kv_decode_attention_cuda(
                 ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
                 vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
                 part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt, 0);
+                (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt, 0, aa);
           };
           if (vpack) run(std::true_type{}); else run(std::false_type{});
         };
@@ -2027,6 +2081,8 @@ torch::Tensor kv_decode_attention_batched_cuda(
     if (const char* e = getenv("MS_KV_VT")) vt = (v8 && atoi(e) != 0) ? 1 : 0;
     int qrot = 0;                                  // fused online Q-rotation (H_D)
     if (const char* e = getenv("MS_KV_QROT")) qrot = atoi(e) != 0 ? 1 : 0;
+    int aa = 0;                                    // AA: fake-quant Q,P to (u,gs) -> low-bit attention
+    if (const char* e = getenv("MS_KV_AA")) aa = atoi(e) != 0 ? 1 : 0;
     int CHPv = (chunk + 1) >> 1; CHPv = (CHPv + 3) & ~3; if (((CHPv >> 2) & 1) == 0) CHPv += 4;
     const int ngv = BLOCK / (int)gs;
     const size_t stageB = vpack ? (size_t)NB * CHPv * (BLOCK + ngv)
@@ -2046,7 +2102,7 @@ torch::Tensor kv_decode_attention_batched_cuda(
             ks.data_ptr<int8_t>(), ku.data_ptr<uint8_t>(), kh.data_ptr<uint8_t>(),
             vs.data_ptr<int8_t>(), vu.data_ptr<uint8_t>(), vh.data_ptr<uint8_t>(),
             part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt, qrot);
+            (int)H, (int)Hkv, (int)Lk, (int)Lcap, (int)D, (int)NB, (int)u, (int)gs, UB, SB, key_tile, S, chunk, sm_scale, v8, sepsc, vt, qrot, aa);
       };
       if (vpack) run(std::true_type{}); else run(std::false_type{});
     };
