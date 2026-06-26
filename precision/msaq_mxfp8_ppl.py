@@ -36,9 +36,14 @@ def _fp_round(y, e, step, maxval):
     return q.clamp(-maxval, maxval)
 
 
-def msaq_mxfp8(x, u, mg, eb, mb):
+def msaq_mxfp8(x, u, mg, eb, mb, wshare=True):
     """MSAQ-MXFP8: FP8(E{eb}M{mb}) elements with low-u mantissa bits shared over mg.
-    u=0 -> plain MXFP8; u<mb keeps (mb-u) per-element mantissa + u shared."""
+    u=0 -> plain MXFP8; u<mb keeps (mb-u) per-element mantissa + u shared.
+    wshare=True: the shared u-bit fraction is the step_up^2-weighted mean of the group's
+    residual fractions (L2-optimal for FP, since each element's reconstruction error is
+    (frac_i-shared)*step_up_i and step_up_i differs per element). wshare=False = plain mean
+    (the INT8-inherited form). The weighted mean never hurts L2 and helps when a group spans
+    multiple exponents (the large-exponent element dominates the error -> shared should fit it)."""
     assert 0 <= u <= mb, f"u={u} must be in [0,{mb}]"
     emin, maxexp, maxval = _fmt_params(eb, mb)
     xf = x.reshape(-1, BLOCK).to(torch.float32)
@@ -55,7 +60,13 @@ def msaq_mxfp8(x, u, mg, eb, mb):
         return (upper * s_base).reshape(x.shape)
     res = y - upper
     frac = res / step_up                                   # normalized residual in [-0.5, 0.5)
-    frac_avg = frac.reshape(frac.shape[0], -1, mg).mean(-1, keepdim=True).expand(-1, -1, mg).reshape(frac.shape)
+    fg = frac.reshape(frac.shape[0], -1, mg)
+    if wshare:
+        w = step_up.reshape(fg.shape).pow(2)               # weight = step_up_i^2 (∝ 4^e_i): L2-optimal
+        frac_avg = ((fg * w).sum(-1, keepdim=True) / w.sum(-1, keepdim=True).clamp(min=1e-30))
+    else:
+        frac_avg = fg.mean(-1, keepdim=True)
+    frac_avg = frac_avg.expand(-1, -1, mg).reshape(frac.shape)
     half = 1 << (u - 1)
     shared = (torch.round(frac_avg * float(1 << u)).clamp(-half, half - 1)) / float(1 << u)   # u-bit signed fraction
     rec = upper + shared * step_up

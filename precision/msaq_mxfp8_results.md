@@ -26,8 +26,32 @@ block=32 + per-block E8M0 scale(=MX)는 그대로 두고, 각 원소를 FP8(sign
 
 (전체 표: `msaq_mxfp8_selftest.txt`.)
 
+## 최적화 — FP-특화 가중 shared (2026-06-27, 정확도 향상)
+
+초기 구현은 shared 보정을 `mean(frac)`(plain 평균)으로 구했는데, 이는 **모든 원소가 같은 선형 scale을 쓰는
+INT8에서 물려받은 형태**다. FP8은 원소마다 지수가 달라 per-element quantum `step_up_i = 2^(e_i−(mb−u))`가
+제각각이므로, 한 원소의 실제 복원오차는 `(frac_i − shared)·step_up_i`다. 따라서 그룹 L2 오차
+`Σ (frac_i − shared)²·step_up_i²`를 최소화하는 **최적 shared는 plain 평균이 아니라 `step_up_i²`(∝ 4^e_i)
+가중평균**이다(큰 지수 원소가 오차를 지배 → shared가 그 원소에 맞춰져야 함). `msaq_mxfp8(..., wshare=True)`(기본값).
+
+- L2-최적이라 **절대 손해 없음**; cross-check(u=0, mg=1)도 보존(단일 원소면 가중=plain).
+- QSNR 개선 (가중−plain): Gaussian W **+0.2~1.9 dB**, high-intra-block-range Ws **+0.6~4.5 dB**
+  (블록 내 지수가 다양할수록 큼 = FP-특화 이득).
+- **개선 후 high-range(Ws) regime에서 INT8을 따라잡거나 넘어선다** (활성화·KV처럼 outlier 많은 분포):
+
+  | bits | E3M4-MSAQ(가중) Ws | MXINT8-MSAQ Ws |
+  |--:|--:|--:|
+  | 6.75 | 30.87 | 31.16 |
+  | 6.00 | **25.92** | 25.89 |
+  | 5.62 | 23.62 | 25.24 |
+
+  (Gaussian W에선 INT8이 여전히 +3 dB 우세 — uniform grid가 smooth 분포에 이상적. 그러나 dynamic range가
+  큰 데이터에선 가중 FP8-MSAQ가 INT8과 대등.) 전체 표: `msaq_mxfp8_selftest.txt`.
+
 ## 결론
 
+0. **(최적화)** FP-특화 가중 shared로 MXFP8-MSAQ 정확도를 올렸고, **outlier/high-range 데이터(활성화·KV)에선
+   INT8과 대등~우세**로 끌어올렸다. smooth weight에선 여전히 INT8 우세(아래).
 1. **MSAQ는 MXFP8에 깨끗하게 적용된다** — 구현·검증 완료(u0=MXFP8, mg1=full FP8 cross-check 정확). 만티사 하위
    비트를 mg개 원소가 공유하고, 원소별 지수 단위로 정규화해 적용하므로 서로 다른 지수에도 올바르게 동작.
 2. **그러나 동일 bits에서 MXFP8-MSAQ는 MXINT8-MSAQ를 못 이긴다** — 전 포맷·전 bit·전 분포에서 INT8이 **~4–6 dB 우위**.
