@@ -1,0 +1,49 @@
+=== MSAQ-MXFP8 selftest (device=cuda) ===
+cross-checks (should hold exactly):
+  e4m3: u0==MXFP8 (Δ=0.0e+00) | mg1 QSNR≈full (Δmax=7.8e-03)
+  e5m2: u0==MXFP8 (Δ=0.0e+00) | mg1 QSNR≈full (Δmax=1.6e-02)
+  e3m4: u0==MXFP8 (Δ=0.0e+00) | mg1 QSNR≈full (Δmax=3.9e-03)
+
+QSNR (dB) vs effective bits/elem  [W=Gaussian | Wt=heavy-tail | Ws=hi intra-block range]:
+   fmt        cfg  bits |  QSNR_W QSNR_Wt QSNR_Ws
+  e4m3      MXFP8  8.25 |   31.45   31.44   31.39
+  e4m3     u1/mg2  7.75 |   26.14   26.13   26.78
+  e4m3     u1/mg4  7.50 |   25.67   25.67   26.32
+  e4m3     u1/mg8  7.38 |   25.57   25.57   26.21
+  e4m3     u2/mg2  7.25 |   22.07   22.08   22.90
+  e4m3     u2/mg4  6.75 |   20.59   20.61   21.47
+  e4m3     u2/mg8  6.50 |   20.02   20.04   20.94
+  e4m3     u3/mg2  6.75 |   16.89   16.89   17.62
+  e4m3     u3/mg4  6.00 |   15.38   15.39   16.11
+  e4m3     u3/mg8  5.62 |   14.83   14.85   15.57
+
+  e5m2      MXFP8  8.25 |   25.38   25.35   24.67
+  e5m2     u1/mg2  7.75 |   20.27   20.28   20.81
+  e5m2     u1/mg4  7.50 |   19.82   19.83   20.35
+  e5m2     u1/mg8  7.38 |   19.73   19.74   20.25
+  e5m2     u2/mg2  7.25 |   16.50   16.49   17.33
+  e5m2     u2/mg4  6.75 |   15.20   15.20   16.08
+  e5m2     u2/mg8  6.50 |   14.75   14.75   15.67
+
+  e3m4      MXFP8  8.25 |   37.50   37.49   37.80
+  e3m4     u1/mg2  7.75 |   32.11   32.12   32.79
+  e3m4     u1/mg4  7.50 |   31.64   31.65   32.32
+  e3m4     u1/mg8  7.38 |   31.54   31.55   32.22
+  e3m4     u2/mg2  7.25 |   27.99   27.98   28.72
+  e3m4     u2/mg4  6.75 |   26.46   26.47   27.25
+  e3m4     u2/mg8  6.50 |   25.86   25.87   26.68
+  e3m4     u3/mg2  6.75 |   22.50   22.51   23.10
+  e3m4     u3/mg4  6.00 |   20.84   20.86   21.56
+  e3m4     u3/mg8  5.62 |   20.21   20.23   20.99
+  e3m4     u4/mg2  6.25 |   16.93   16.93   17.45
+  e3m4     u4/mg4  5.25 |   15.35   15.37   15.84
+  e3m4     u4/mg8  4.75 |   14.78   14.80   15.25
+
+reference — MXINT8-MSAQ (deployed, INT8 element) at matched bits:
+   fmt        cfg  bits |  QSNR_W QSNR_Wt QSNR_Ws
+  int8     MXINT8  8.25 |   42.37   41.98   41.15
+  int8     u2/mg8  6.50 |   30.67   30.29   30.57
+  int8     u2/mg4  6.75 |   31.28   30.90   31.16
+  int8     u3/mg8  5.62 |   24.85   24.47   25.24
+  int8     u3/mg4  6.00 |   25.51   25.13   25.89
+
