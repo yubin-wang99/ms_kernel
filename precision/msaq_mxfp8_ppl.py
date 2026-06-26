@@ -142,17 +142,20 @@ def selftest():
 # wikitext-2 PPL across scopes (needs transformers + datasets + the model).
 # ---------------------------------------------------------------------------
 def run_ppl():
+    import os
     import torch.nn.functional as F
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from datasets import load_dataset
-    MODEL = "meta-llama/Llama-3.1-8B-Instruct"; DEV = "cuda"
+    MODEL = os.environ.get("MSAQ_MODEL", "meta-llama/Llama-3.1-8B-Instruct"); DEV = "cuda"
     MAXLEN, STRIDE, MAX_WINDOWS = 2048, 1024, 30
     LINEAR_KEYS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
     # per-format (u,mg) configs (u<=mb)
     CFG = {"e4m3": [(1, 8), (1, 4), (2, 4)], "e5m2": [(1, 8), (1, 4), (2, 4)],
            "e3m4": [(1, 8), (2, 4), (3, 4)]}
-    _S = {"eb": 4, "mb": 3}
-    def Q(x, u, mg): return msaq_mxfp8(x, u, mg, _S["eb"], _S["mb"]).to(x.dtype)
+    _S = {"eb": 4, "mb": 3, "base": "fp8"}
+    def Q(x, u, mg):
+        if _S["base"] == "int8": return msaq_mxint8(x, u, mg).to(x.dtype)
+        return msaq_mxfp8(x, u, mg, _S["eb"], _S["mb"]).to(x.dtype)
 
     def is_target(n, m): return isinstance(m, torch.nn.Linear) and any(p in n for p in LINEAR_KEYS)
     def patch_act(targets, u, mg):
@@ -188,8 +191,11 @@ def run_ppl():
     tok = AutoTokenizer.from_pretrained(MODEL)
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16,
                                                  attn_implementation="sdpa").to(DEV).eval()
-    ids = tok("\n\n".join(t for t in load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"]
-                          if t.strip()), return_tensors="pt").input_ids
+    try:
+        _wt = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    except Exception:                                      # newer hub/datasets: use the parquet mirror
+        _wt = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    ids = tok("\n\n".join(t for t in _wt["text"] if t.strip()), return_tensors="pt").input_ids
     targets = [(n, m) for n, m in model.named_modules() if is_target(n, m)]
     master = {m: m.weight.detach().to("cpu", copy=True) for _, m in targets}
     def restore():
@@ -210,17 +216,21 @@ def run_ppl():
         return (p / bf - 1) * 100
 
     LABEL = {"weight": "weight", "wa": "weight+act", "kv": "KV", "wkv": "weight+KV"}
-    for f, (eb, mb) in FMT.items():
-        _S["eb"], _S["mb"] = eb, mb
-        cfgs = CFG[f]
-        print(f"================  MSAQ-MXFP8 element = {f.upper()}  (block={BLOCK})  ================", flush=True)
-        print(f"{'scope':>11} | " + " ".join(f"u{u}/mg{mg}({bits_mxfp8(eb,mb,u,mg):.2f}b)" for u, mg in cfgs) + " | within 3%?", flush=True)
+    def sweep(name, cfgs, bitfn):
+        print(f"================  {name}  (block={BLOCK})  ================", flush=True)
+        print(f"{'scope':>11} | " + " ".join(f"u{u}/mg{mg}({bitfn(u,mg):.2f}b)" for u, mg in cfgs) + " | within 3%?", flush=True)
         for scope in SCOPES:
             cells, oks = [], []
             for u, mg in cfgs:
                 pct = run(scope, u, mg); cells.append(f"{pct:>+6.2f}%"); oks.append("OK" if pct <= 3 else "FAIL")
             print(f"{LABEL[scope]:>11} | " + "  ".join(cells) + " | " + " ".join(oks), flush=True)
         print(flush=True)
+    for f, (eb, mb) in FMT.items():
+        _S["base"], _S["eb"], _S["mb"] = "fp8", eb, mb
+        sweep(f"MSAQ-MXFP8 element = {f.upper()}", CFG[f], lambda u, mg, eb=eb, mb=mb: bits_mxfp8(eb, mb, u, mg))
+    # MXINT8-MSAQ at bit-matched configs (u1/mg8=7.38b, u2/mg4=6.75b, u3/mg4=6.00b == E3M4's configs)
+    _S["base"] = "int8"
+    sweep("MSAQ-MXINT8 (reference, INT8 element)", [(1, 8), (2, 4), (3, 4)], bits_mxint8)
 
 
 if __name__ == "__main__":

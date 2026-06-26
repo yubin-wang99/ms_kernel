@@ -45,6 +45,35 @@ block=32 + per-block E8M0 scale(=MX)는 그대로 두고, 각 원소를 FP8(sign
 효율적)이 MSAQ에도 그대로 적용된다 — MSAQ는 두 base 포맷 위에서 **동일하게** 작동하지만, base의 우열(INT8>FP8)을
 뒤집지 못한다.
 
+## PPL 측정 (wikitext-2, proxy 모델 SmolLM2-1.7B, BF16 PPL=6.9955)
+
+⚠️ **proxy**: 이 머신엔 gated Llama-3.1-8B(+HF토큰)가 없어 ungated Llama-arch **SmolLM2-1.7B**로 측정. 절대값은
+8B와 다르나 **포맷 간 상대 순위·scope 거동**은 유효(8B 정식 수치는 precision 환경에서 동일 스크립트로 실행).
+표는 BF16 대비 PPL 증가율(%), within 3% 기준. (`msaq_mxfp8_ppl_smollm2.txt`)
+
+**bit-matched 직접 비교 — E3M4(최선 FP8) vs MXINT8:**
+
+| bits | scope | E3M4-MSAQ | MXINT8-MSAQ |
+|--:|---|--:|--:|
+| 7.38 | weight | +0.48 | **+0.30** |
+| 7.38 | weight+act | +1.38 | **+0.90** |
+| 7.38 | KV | +0.64 | **+0.14** |
+| 7.38 | weight+KV | +1.23 | **+0.46** |
+| 6.75 | weight | +2.55 | **+1.18** |
+| 6.75 | weight+act | +5.35 ❌ | **+2.76 ✓** |
+| 6.75 | KV | +2.31 | **+0.57** |
+| 6.75 | weight+KV | +5.13 ❌ | **+1.71 ✓** |
+| 6.00 | KV | +10.52 | **+1.82 ✓** |
+| 6.00 | weight+act | +46.06 | **+10.68** |
+
+- **MXINT8-MSAQ가 전 bit·전 scope(weight/act/KV)에서 E3M4-MSAQ를 이긴다** — QSNR 결론과 완전 일치. 격차는 저비트
+  일수록 벌어짐(6.0b KV: E3M4 +10.5% vs INT8 +1.8%).
+- **KV가 양쪽 모두 가장 robust한 scope**이고, INT8 KV는 특히 강함(+1.82%@6.0b도 OK). FP8의 per-element 지수가 KV
+  outlier에 유리할 것이란 가설은 이 모델에선 **반증**(INT8이 더 좋음). 단 8B의 더 극단적 outlier에선 다를 여지는 남음.
+- **activation(weight+act)이 가장 어려운 scope**(양쪽 다 %가 가장 큼).
+- **E5M2(만티사 2비트)는 +17~770%로 사용 불가**; **E4M3 < E3M4**; 포맷 순위 **INT8 > E3M4 > E4M3 ≫ E5M2** (PPL=QSNR 일치).
+- 그래도 **E3M4-MSAQ @7.38b는 전 scope within 3%**(weight 0.48/act 1.38/KV 0.64/wkv 1.23) → MXFP8-MSAQ도 ~7.4비트면 동작은 함.
+
 ## 한계 / 다음
 
 - 위는 **합성 분포 + power-weighted QSNR**이다. 최종 판정은 **wikitext-2 PPL**(모델 출력 가중 오차)이며, 작은
