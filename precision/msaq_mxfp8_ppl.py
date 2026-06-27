@@ -11,8 +11,9 @@ PPL across the 4 scopes (weight / weight+act / KV / weight+KV), mirroring scale_
 
 Run (numeric validation, no model, this repo's .venv):
     CUDA_VISIBLE_DEVICES=0 python precision/msaq_mxfp8_ppl.py --selftest
-Run (PPL, needs transformers + Llama-3.1-8B in your precision env):
-    CUDA_VISIBLE_DEVICES=0 python precision/msaq_mxfp8_ppl.py > precision/msaq_mxfp8_ppl.txt 2>&1
+Run (PPL; set MSAQ_MODEL, e.g. the ungated Llama-3.1-8B mirror; MSAQ_EFB=0 disables error feedback):
+    MSAQ_MODEL=NousResearch/Meta-Llama-3.1-8B CUDA_VISIBLE_DEVICES=0 \
+        python precision/msaq_mxfp8_ppl.py > precision/msaq_mxfp8_ppl_llama31_8b.txt 2>&1
 """
 import sys, torch
 

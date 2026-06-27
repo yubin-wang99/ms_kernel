@@ -1,0 +1,30 @@
+wikitext-2: 288,937 tokens | BF16 PPL = 5.6877 | block=32 | criterion within 3%
+
+================  MSAQ-MXFP8 element = E4M3  (block=32)  ================
+      scope | u1/mg8(7.38b) u1/mg4(7.50b) u2/mg4(6.75b) | within 3%?
+     weight |  +1.27%   +1.24%   +2.74% | OK OK OK
+ weight+act |  +2.60%   +2.66%   +4.96% | OK OK FAIL
+         KV |  +0.97%   +0.79%   +1.15% | OK OK OK
+  weight+KV |  +2.25%   +2.00%   +3.88% | OK OK FAIL
+
+================  MSAQ-MXFP8 element = E5M2  (block=32)  ================
+      scope | u1/mg8(7.38b) u1/mg4(7.50b) u2/mg4(6.75b) | within 3%?
+     weight |  +6.10%   +5.53%  +10.63% | FAIL FAIL FAIL
+ weight+act | +13.14%  +13.06%  +19.95% | FAIL FAIL FAIL
+         KV |  +4.21%   +3.39%   +5.01% | FAIL FAIL FAIL
+  weight+KV | +10.92%  +10.03%  +17.46% | FAIL FAIL FAIL
+
+================  MSAQ-MXFP8 element = E3M4  (block=32)  ================
+      scope | u1/mg8(7.38b) u2/mg4(6.75b) u3/mg4(6.00b) | within 3%?
+     weight |  +0.43%   +0.65%   +2.20% | OK OK OK
+ weight+act |  +0.82%   +1.19%   +3.84% | OK OK FAIL
+         KV |  +0.26%   +0.35%   +0.75% | OK OK OK
+  weight+KV |  +0.67%   +0.92%   +2.92% | OK OK OK
+
+================  MSAQ-MXINT8 (reference, INT8 element)  (block=32)  ================
+      scope | u1/mg8(7.38b) u2/mg4(6.75b) u3/mg4(6.00b) | within 3%?
+     weight |  +0.19%   +0.75%   +2.98% | OK OK OK
+ weight+act |  +0.40%   +1.61%   +6.02% | OK OK FAIL
+         KV |  +0.12%   +0.23%   +0.99% | OK OK OK
+  weight+KV |  +0.28%   +1.00%   +4.29% | OK OK FAIL
+
