@@ -1,25 +1,28 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7020.62it/s]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
 wikitext-2: 288,937 tokens | BF16 PPL = 5.6877 | block=32 | criterion within 3%
 
 ================  MSAQ-MXFP8 element = E4M3  (block=32)  ================
       scope | u1/mg8(7.38b) u1/mg4(7.50b) u2/mg4(6.75b) | within 3%?
-     weight |  +1.27%   +1.24%   +2.74% | OK OK OK
- weight+act |  +2.60%   +2.66%   +4.96% | OK OK FAIL
-         KV |  +0.97%   +0.79%   +1.15% | OK OK OK
-  weight+KV |  +2.25%   +2.00%   +3.88% | OK OK FAIL
+     weight |  +1.26%   +1.20%   +3.07% | OK OK FAIL
+ weight+act |  +2.74%   +2.71%   +5.52% | OK OK FAIL
+         KV |  +0.92%   +0.76%   +1.27% | OK OK OK
+  weight+KV |  +2.18%   +2.09%   +4.33% | OK OK FAIL
 
 ================  MSAQ-MXFP8 element = E5M2  (block=32)  ================
       scope | u1/mg8(7.38b) u1/mg4(7.50b) u2/mg4(6.75b) | within 3%?
-     weight |  +6.10%   +5.53%  +10.63% | FAIL FAIL FAIL
- weight+act | +13.14%  +13.06%  +19.95% | FAIL FAIL FAIL
-         KV |  +4.21%   +3.39%   +5.01% | FAIL FAIL FAIL
-  weight+KV | +10.92%  +10.03%  +17.46% | FAIL FAIL FAIL
+     weight |  +5.88%   +5.33%  +14.11% | FAIL FAIL FAIL
+ weight+act | +12.52%  +11.76%  +28.80% | FAIL FAIL FAIL
+         KV |  +4.43%   +3.77%   +7.34% | FAIL FAIL FAIL
+  weight+KV | +10.39%   +9.54%  +25.21% | FAIL FAIL FAIL
 
 ================  MSAQ-MXFP8 element = E3M4  (block=32)  ================
       scope | u1/mg8(7.38b) u2/mg4(6.75b) u3/mg4(6.00b) | within 3%?
-     weight |  +0.43%   +0.65%   +2.20% | OK OK OK
- weight+act |  +0.82%   +1.19%   +3.84% | OK OK FAIL
-         KV |  +0.26%   +0.35%   +0.75% | OK OK OK
-  weight+KV |  +0.67%   +0.92%   +2.92% | OK OK OK
+     weight |  +0.43%   +0.73%   +2.57% | OK OK OK
+ weight+act |  +0.83%   +1.13%   +4.27% | OK OK FAIL
+         KV |  +0.23%   +0.32%   +0.96% | OK OK OK
+  weight+KV |  +0.66%   +1.03%   +3.48% | OK OK FAIL
 
 ================  MSAQ-MXINT8 (reference, INT8 element)  (block=32)  ================
       scope | u1/mg8(7.38b) u2/mg4(6.75b) u3/mg4(6.00b) | within 3%?
@@ -27,4 +30,4 @@ wikitext-2: 288,937 tokens | BF16 PPL = 5.6877 | block=32 | criterion within 3%
  weight+act |  +0.40%   +1.61%   +6.02% | OK OK FAIL
          KV |  +0.12%   +0.23%   +0.99% | OK OK OK
   weight+KV |  +0.28%   +1.00%   +4.29% | OK OK FAIL
-
+[recovered: INT8 weight+KV row from the deterministic prior 8B run — msaq_mxint8 unchanged by the storable edit]

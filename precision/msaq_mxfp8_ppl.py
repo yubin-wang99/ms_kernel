@@ -52,29 +52,51 @@ def msaq_mxfp8(x, u, mg, eb, mb, wshare=True, efb_iters=2):
     (frac_i - shared) sharing error. Strictly non-increasing L2; converges by ~2 iters (the
     extra gain over 1 iter is +0.4-0.5 dB at aggressive u3/u4). SAME stored format/decode
     (per-elem upper + group shared) regardless of efb_iters -> FREE at inference, encoder-only.
-    efb_iters=0 reduces to wshare-only. Cross-checks (u=0, mg=1) are preserved."""
+    efb_iters=0 reduces to wshare-only. Cross-checks (u=0, mg=1) are preserved.
+    BIT-STORABLE (u>0): the per-element upper holds only (mb-u) mantissa bits, so the block scale
+    is given ONE exponent of headroom and rounding PROMOTES the exponent at the top instead of
+    saturating -> every value is exactly representable by the packed [sign|exp|(mb-u)mant] field
+    and decodes bit-exactly via csrc msfp8_dequant_bf16 (see ms_lib.pack.pack_weight_msfp8)."""
     assert 0 <= u <= mb, f"u={u} must be in [0,{mb}]"
     emin, maxexp, maxval = _fmt_params(eb, mb)
     xf = x.reshape(-1, BLOCK).to(torch.float32)
     absmax = xf.abs().amax(-1, keepdim=True).clamp(min=1e-30)
-    # MX block scale: bring block absmax near the format max (power-of-2 E8M0).
-    s_base = torch.exp2(torch.floor(torch.log2(absmax)) - float(maxexp))
-    y = xf / s_base
-    # per-element exponent (clamped to the format's normal/subnormal range)
-    e = torch.floor(torch.log2(y.abs().clamp(min=1e-30))).clamp(min=float(emin), max=float(maxexp))
-    mb_up = mb - u
-    step_up = torch.exp2(e - float(mb_up))                 # upper-mantissa quantum (2^u coarser than full)
-    upper = _fp_round(y, e, step_up, maxval)               # per-element FP8 with (mb-u) mantissa bits
-    if u == 0:
+    if u == 0:                                             # plain MXFP8: full mb mantissa, no headroom
+        s_base = torch.exp2(torch.floor(torch.log2(absmax)) - float(maxexp))
+        y = xf / s_base
+        e = torch.floor(torch.log2(y.abs().clamp(min=1e-30))).clamp(min=float(emin), max=float(maxexp))
+        upper = _fp_round(y, e, torch.exp2(e - float(mb)), maxval)
         return (upper * s_base).reshape(x.shape)
+    # u>0: BIT-STORABLE encoder. The per-element upper holds only (mb-u) mantissa bits, so its
+    # top-exponent value would saturate below the full-mantissa maxval. We give the block scale
+    # ONE exponent of headroom (block-max at e=maxexp-1) so round-to-nearest at the top PROMOTES
+    # into maxexp instead of saturating -> the [sign|exp|(mb-u)mant] field represents every value
+    # exactly (recovers ~all of the QSNR a naive maxval-clamp would lose). _round_storable returns
+    # both the rounded value and its stored exponent ee; the shared quantum uses ee (not y's e) so
+    # reconstruction = 2^(ee-mb)*(m_up*2^u + sh) matches the decode kernel even when ee promotes.
+    mb_up = mb - u
+    lead, mmax = float(1 << mb_up), float((1 << (mb_up + 1)) - 1)
+    s_base = torch.exp2(torch.floor(torch.log2(absmax)) - float(maxexp - 1))   # headroom = 1
+    y = xf / s_base
+
+    def _round_storable(t):
+        et = torch.floor(torch.log2(t.abs().clamp(min=1e-30))).clamp(min=float(emin), max=float(maxexp))
+        m = torch.round(t.abs() / torch.exp2(et - float(mb_up)))
+        promote = (m >= 2.0 * lead) & (et < float(maxexp))
+        et = torch.where(promote, et + 1.0, et)
+        m = torch.where(promote, torch.full_like(m, lead), m).clamp(max=mmax)
+        return torch.sign(t) * m * torch.exp2(et - float(mb_up)), et
+
     half = 1 << (u - 1)
-    w = step_up.reshape(step_up.shape[0], -1, mg).pow(2) if wshare else None
+    upper, ee = _round_storable(y)
     shared = None
     for it in range(max(1, efb_iters + 1)):
+        step_up = torch.exp2(ee - float(mb_up))            # shared quantum at the STORED exponent
         # (1) optimal shared | fixed upper
-        frac = (y - upper) / step_up                       # normalized residual in [-0.5, 0.5)
+        frac = (y - upper) / step_up
         fg = frac.reshape(frac.shape[0], -1, mg)
-        if wshare:                                         # weight = step_up_i^2 (∝ 4^e_i): L2-optimal
+        if wshare:                                         # weight = step_up_i^2: L2-optimal
+            w = step_up.reshape(fg.shape).pow(2)
             frac_avg = (fg * w).sum(-1, keepdim=True) / w.sum(-1, keepdim=True).clamp(min=1e-30)
         else:
             frac_avg = fg.mean(-1, keepdim=True)
@@ -82,10 +104,10 @@ def msaq_mxfp8(x, u, mg, eb, mb, wshare=True, efb_iters=2):
         shared = (torch.round(frac_avg * float(1 << u)).clamp(-half, half - 1)) / float(1 << u)  # u-bit signed
         if it == efb_iters:
             break
-        # (2) optimal upper | fixed shared: re-round the per-element upper so it absorbs the
-        # group-sharing error (frac_i - shared) of each element.
-        upper = _fp_round(y - shared * step_up, e, step_up, maxval)
-    rec = upper + shared * step_up
+        # (2) optimal upper | fixed shared: re-round upper (and its exponent) to absorb the
+        # group-sharing error of each element.
+        upper, ee = _round_storable(y - shared * step_up)
+    rec = upper + shared * torch.exp2(ee - float(mb_up))
     return (rec * s_base).reshape(x.shape)
 
 

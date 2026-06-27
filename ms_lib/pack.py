@@ -137,6 +137,92 @@ def pack_weight(W, u, gs):
     return d
 
 
+# =============================================================================
+#  MXFP8-MSAQ (E3M4) — FP8 elements with shared low-u mantissa bits
+#  Mirrors precision/msaq_mxfp8_ppl.py msaq_mxfp8(e3m4, wshare=True, efb_iters=2).
+#  Same bit-stream layout as pack_weight (upper field width 8-u, shared u-bit signed),
+#  but the per-element upper field is an FP8 E3M4 element [sign:1|exp:eb|upmant:mb-u]
+#  (1+eb+mb == 8, so width 8-u matches the INT8 path exactly). Consumed by
+#  csrc msfp8_dequant_bf16 / msfp8_e3m4_dequant_bf16_kernel.
+# =============================================================================
+def decompose_msfp8(x_blocked, u, gs, eb=3, mb=4, efb_iters=2):
+    """float blocks (B,32) -> (s_exp (B,), field (B,32) uint FP8-code, sh (B,n_group) signed).
+    Bit-exact mirror of precision/msaq_mxfp8_ppl.py msaq_mxfp8 (u>0): per-block E8M0 scale with
+    ONE exponent of headroom, per-element FP8 with (mb-u) STORABLE upper mantissa bits (round-to-
+    nearest PROMOTES the exponent at the top instead of saturating), and a u-bit group-shared
+    low-mantissa fraction from wshare + efb coordinate descent. The shared quantum uses each
+    element's STORED exponent ee so reconstruction 2^(ee-mb)*(m_up*2^u + sh) matches the kernel."""
+    assert u > 0, "msfp8 packing is for u>0 (shared low-mantissa)"
+    xf = np.asarray(x_blocked, dtype=np.float64)
+    B = xf.shape[0]; n_group = BLOCK // gs; mb_up = mb - u
+    bias = (1 << (eb - 1)) - 1
+    emin, maxexp = 1 - bias, ((1 << eb) - 1) - bias
+    lead, mmax = float(1 << mb_up), float((1 << (mb_up + 1)) - 1)
+    absmax = np.maximum(np.abs(xf).max(axis=1, keepdims=True), 1e-30)
+    s_exp = np.clip(np.floor(np.log2(absmax)) - (maxexp - 1), -127, 127)  # (B,1) headroom=1
+    s_base = np.exp2(s_exp)
+    y = xf / s_base
+
+    def round_storable(t):
+        et = np.clip(np.floor(np.log2(np.maximum(np.abs(t), 1e-30))), emin, maxexp)
+        m = np.round(np.abs(t) / np.exp2(et - mb_up))
+        promote = (m >= 2.0 * lead) & (et < maxexp)
+        et = np.where(promote, et + 1.0, et)
+        m = np.minimum(np.where(promote, lead, m), mmax)
+        return np.sign(t) * m * np.exp2(et - mb_up), et, m
+
+    half = 1 << (u - 1)
+    upper, ee, m_up_abs = round_storable(y)
+    sh_group = None
+    for it in range(max(1, efb_iters + 1)):
+        step_up = np.exp2(ee - mb_up)                                     # quantum at STORED exponent
+        frac = (y - upper) / step_up
+        fg = frac.reshape(B, n_group, gs)
+        w = (step_up.reshape(B, n_group, gs)) ** 2                        # wshare weight ∝ 4^ee
+        frac_avg = (fg * w).sum(2) / np.maximum(w.sum(2), 1e-30)          # (B,n_group)
+        sh_group = np.clip(np.round(frac_avg * (1 << u)), -half, half - 1)
+        if it == efb_iters:
+            break
+        shared_elem = np.repeat(sh_group / (1 << u), gs, axis=1)
+        upper, ee, m_up_abs = round_storable(y - shared_elem * step_up)
+    # encode each upper element as an FP8 E3M4 field [sign|exp|upmant]
+    sgn = (np.signbit(upper) & (upper != 0)).astype(np.int64)
+    m_up_abs = m_up_abs.astype(np.int64)
+    normal = m_up_abs >= int(lead)
+    expf = np.where(normal, (ee + bias).astype(np.int64), 0)
+    upm = np.where(normal, m_up_abs - int(lead), m_up_abs)
+    wbits = 8 - u
+    field = ((sgn << (wbits - 1)) | (expf << mb_up) | upm).astype(np.int64)
+    return s_exp.reshape(-1), field, sh_group.astype(np.int64)
+
+
+def pack_weight_msfp8(W, u, gs):
+    """W float[OUT,K] -> packed planes for the MXFP8-MSAQ (E3M4) dequant kernel.
+    Same plane shapes/layout as pack_weight; only the per-element field semantics differ."""
+    OUT, K = W.shape
+    assert K % BLOCK == 0, "K must be a multiple of 32"
+    nb = K // BLOCK; wbits = 8 - u; n_group = BLOCK // gs
+    blocks = W.reshape(OUT, nb, BLOCK).reshape(OUT * nb, BLOCK)
+    s_exp, field, sh = decompose_msfp8(blocks, u, gs)
+    exp = s_exp.astype(np.int64).reshape(OUT, nb)
+    fu = field.reshape(OUT, nb, BLOCK)
+    rs = sh.reshape(OUT, nb, n_group)
+    UB = (BLOCK * wbits) // 8
+    SB = math.ceil(n_group * u / 8)
+    up = _pack_codes_lsb(fu, wbits)
+    shp = _pack_codes_lsb(rs, u)
+    d = dict(
+        scale_exp=np.ascontiguousarray(exp.T.astype(np.int8)),     # [nb, OUT]
+        upper=np.ascontiguousarray(up.transpose(1, 2, 0)),         # [nb, UB, OUT]
+        shared=np.ascontiguousarray(shp.transpose(1, 2, 0)),       # [nb, SB, OUT]
+        OUT=OUT, K=K, nb=nb, u=u, gs=gs, wbits=wbits,
+        UB=UB, SB=SB, n_group=n_group,
+    )
+    d["upper_cm"] = np.ascontiguousarray(d["upper"].transpose(0, 2, 1))   # [nb, OUT, UB]
+    d["shared_cm"] = np.ascontiguousarray(d["shared"].transpose(0, 2, 1)) # [nb, OUT, SB]
+    return d
+
+
 def pack_weight_ra(W, u, gs):
     """REGISTER-ALIGNED pack: SAME codes as pack_weight (signed q_upper/r_shared),
     but the upper plane is padded so each (8-u)-bit code lies WHOLLY inside one 32-bit

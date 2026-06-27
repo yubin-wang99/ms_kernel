@@ -1251,6 +1251,58 @@ __global__ void ms_dequant_bf16_unsigned_kernel(
     }
 }
 
+// MXFP8-MSAQ (E3M4) dequant: SAME bit-stream layout as ms_dequant_bf16 (upper field width
+// 8-u, shared u-bit signed), but each upper field is an FP8 E3M4 element [sign:1|exp:EB|upmant:MB-u]
+// instead of a signed int. Reconstruction: rec = sign * 2^(e-MB) * (m_up*2^u + sh_code) * scale,
+// matching precision/msaq_mxfp8_ppl.py's msaq_mxfp8 (e3m4). Only the per-element ALU differs from
+// the INT8 path (exp/mantissa split + ldexpf); memory traffic is identical -> isolates decode ALU.
+__global__ void msfp8_e3m4_dequant_bf16_kernel(
+        const int8_t* __restrict__ scale_exp, const uint8_t* __restrict__ upper_cm,
+        const uint8_t* __restrict__ shared_cm, __nv_bfloat16* __restrict__ Wbf,
+        int OUT, int K, int NB, int u, int gs, int UB, int SB) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int blk = blockIdx.y;
+    if (o >= OUT) return;
+    constexpr int EB = 3, MB = 4, BIAS = 3, EMIN = -2;   // E3M4
+    const int wbits = 8 - u, gsmask = gs - 1, mbup = MB - u;
+    const uint32_t umask = (1u << wbits) - 1u;
+    const uint32_t expmask = (1u << EB) - 1u, upmask = (1u << mbup) - 1u, mbup_lead = 1u << mbup;
+    const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+    const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+    const long base = (long)blk * OUT + o;
+    uint32_t ureg[6];
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UB);
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+    uint32_t sreg[3] = {0u, 0u, 0u};
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) if (i < SB) sreg[i >> 2] |= (uint32_t)shared_cm[base * SB + i] << (8 * (i & 3));
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) {
+        if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const uint32_t field = (uint32_t)ubuf & umask;       // unsigned FP8 field
+        ubuf >>= wbits; unb -= wbits;
+        const uint32_t sgn = field >> (wbits - 1);            // top bit
+        const uint32_t expf = (field >> mbup) & expmask;      // EB exponent bits
+        const uint32_t upm = field & upmask;                  // (MB-u) upper-mantissa bits
+        const int m_up = (int)((expf ? mbup_lead : 0u) | upm);  // implicit leading 1 for normals
+        const int ee = expf ? (int)expf - BIAS : EMIN;
+        if ((k & gsmask) == 0) {
+            if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+            sbuf >>= u; snb -= u;
+        }
+        // fully-signed reconstruction (matches msaq_mxfp8): sign the magnitude, THEN add the
+        // signed group-shared. mag carries the element sign; sh_code stays per-group signed.
+        int mag = m_up << u;
+        if (sgn) mag = -mag;
+        const float val = ldexpf((float)(mag + sh_code), ee - MB);
+        Wbf[((long)(blk * BLOCK + k)) * OUT + o] = __float2bfloat16(val * scale);
+    }
+}
+
 } // namespace
 
 // Dequant the MSAQ weight to a bf16 [OUT,K] buffer (for prefill: dequant-once + cuBLAS).
@@ -1274,6 +1326,21 @@ torch::Tensor ms_dequant_bf16_unsigned_cuda(
     auto W = torch::empty({K, OUT}, torch::dtype(torch::kBFloat16).device(scale_exp.device()));
     const int threads = 256, blocks = (int)((OUT + threads - 1) / threads);
     ms_dequant_bf16_unsigned_kernel<<<dim3(blocks, (int)NB), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(W.data_ptr<at::BFloat16>()),
+        (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
+    return W;
+}
+
+// MXFP8-MSAQ (E3M4) dequant launcher. Same plane layout as ms_dequant_bf16 (upper field 8-u bits,
+// shared u-bit signed), but fields decode as FP8 E3M4 elements. See msfp8_e3m4_dequant_bf16_kernel.
+torch::Tensor msfp8_dequant_bf16_cuda(
+        torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
+    const int UB = 32 * (8 - (int)u) / 8, SB = ((32 / (int)gs) * (int)u + 7) / 8;
+    auto W = torch::empty({K, OUT}, torch::dtype(torch::kBFloat16).device(scale_exp.device()));
+    const int threads = 256, blocks = (int)((OUT + threads - 1) / threads);
+    msfp8_e3m4_dequant_bf16_kernel<<<dim3(blocks, (int)NB), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(W.data_ptr<at::BFloat16>()),
         (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);

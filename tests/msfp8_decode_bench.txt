@@ -1,0 +1,7 @@
+[correctness] MXFP8-MSAQ E3M4 kernel vs msaq_mxfp8 reference: QSNR = 457.5 dB (max abs err 0.00e+00)
+[sanity]      MXINT8-MSAQ kernel reconstruct error vs its packer: QSNR = 25.0 dB (bf16-rounded)
+
+isolated DEQUANT latency  (OUT=4096, K=4096, u3/gs4, 16.8M elems -> bf16)
+   MXFP8-MSAQ E3M4 (6.0b) :   64.21 us
+   MXINT8-MSAQ     (6.0b) :   64.10 us   (E3M4 / INT8-MSAQ = 1.002x)
+   plain MXINT8    (8.25b):   86.33 us   (E3M4 / plain MXINT8 = 0.744x)
