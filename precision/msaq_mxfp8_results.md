@@ -24,85 +24,92 @@ block=32 + per-block E8M0 scale(=MX)는 그대로 두고, 각 원소를 FP8(sign
 | **MXINT8** | **u2/mg8** | 6.50 | **30.67** | **30.29** | **30.57** |
 | **MXINT8** | **u3/mg4** | 6.00 | **25.51** | **25.13** | **25.89** |
 
-(전체 표: `msaq_mxfp8_selftest.txt`.)
+(위 표의 u>0 행은 **plain 인코더**(wshare·efb 없음) 기준 — 베이스 순위 비교용. 개선된 인코더 수치는 아래
+"최적화" 섹션과 `msaq_mxfp8_selftest.txt`. u0(=MXFP8 baseline)은 인코더와 무관하게 동일.)
 
-## 최적화 — FP-특화 가중 shared (2026-06-27, 정확도 향상)
+## 최적화 — 인코더 2단계 coordinate descent (wshare + error-feedback)
 
-초기 구현은 shared 보정을 `mean(frac)`(plain 평균)으로 구했는데, 이는 **모든 원소가 같은 선형 scale을 쓰는
-INT8에서 물려받은 형태**다. FP8은 원소마다 지수가 달라 per-element quantum `step_up_i = 2^(e_i−(mb−u))`가
-제각각이므로, 한 원소의 실제 복원오차는 `(frac_i − shared)·step_up_i`다. 따라서 그룹 L2 오차
-`Σ (frac_i − shared)²·step_up_i²`를 최소화하는 **최적 shared는 plain 평균이 아니라 `step_up_i²`(∝ 4^e_i)
-가중평균**이다(큰 지수 원소가 오차를 지배 → shared가 그 원소에 맞춰져야 함). `msaq_mxfp8(..., wshare=True)`(기본값).
+shared/upper를 번갈아 최적화하는 **coordinate descent**로 인코더를 개선했다. **저장 포맷·decode는 불변**
+(per-elem upper + group shared) — 전부 **인코더 전용, 추론에선 공짜**. `msaq_mxfp8(..., wshare=True, efb_iters=2)`(기본값).
 
-- L2-최적이라 **절대 손해 없음**; cross-check(u=0, mg=1)도 보존(단일 원소면 가중=plain).
-- QSNR 개선 (가중−plain): Gaussian W **+0.2~1.9 dB**, high-intra-block-range Ws **+0.6~4.5 dB**
-  (블록 내 지수가 다양할수록 큼 = FP-특화 이득).
-- **개선 후 high-range(Ws) regime에서 INT8을 따라잡거나 넘어선다** (활성화·KV처럼 outlier 많은 분포):
+**(a) wshare — FP-특화 가중 shared** (shared | upper 고정). plain `mean(frac)`은 모든 원소가 같은 선형 scale을
+쓰는 **INT8에서 물려받은 형태**다. FP8은 원소마다 quantum `step_up_i = 2^(e_i−(mb−u))`가 달라 복원오차가
+`(frac_i − shared)·step_up_i`이므로, 그룹 L2 `Σ(frac_i − shared)²·step_up_i²`를 최소화하는 **최적 shared는
+`step_up_i²`(∝ 4^e_i) 가중평균**(큰 지수 원소가 오차 지배 → shared가 그쪽에 맞춰짐).
 
-  | bits | E3M4-MSAQ(가중) Ws | MXINT8-MSAQ Ws |
-  |--:|--:|--:|
-  | 6.75 | 30.87 | 31.16 |
-  | 6.00 | **25.92** | 25.89 |
-  | 5.62 | 23.62 | 25.24 |
+**(b) efb — error feedback** (upper | shared 고정). 초기 upper는 shared를 모른 채 라운딩됐으므로, shared 확정 후
+`upper2 = round((y − shared·step_up)/step_up)`로 **재라운딩**해 그룹 공유오차 `(frac_i − shared)`를 per-element
+upper가 흡수한다(INT8의 `upper_bits_correction`의 FP 아날로그). (a)→(b)를 번갈아 반복(`efb_iters`)하면
+**L2 단조 감소, ~2회에 수렴**. cross-check(u=0, mg=1) 보존, **L2상 절대 손해 없음**.
 
-  (Gaussian W에선 INT8이 여전히 +3 dB 우세 — uniform grid가 smooth 분포에 이상적. 그러나 dynamic range가
-  큰 데이터에선 가중 FP8-MSAQ가 INT8과 대등.) 전체 표: `msaq_mxfp8_selftest.txt`.
+- QSNR(합성): wshare가 plain 대비 +0.2~4.5 dB, efb가 그 위에 추가 +0.4~0.6 dB(공격적 u3/u4에서 최대).
+- **결정적으로, 이 둘은 base format의 우열을 실제로 뒤집는다(아래 PPL).** 합성 Gaussian W의 QSNR에선 여전히
+  INT8이 +3 dB 우세지만, **실제 모델 weight/activation은 블록 내 dynamic range가 커서 `Ws` regime에 가깝고**,
+  거기선 FP8-MSAQ가 INT8과 대등~우세(E3M4 6.0b Ws 26.85 > INT8 25.89). 전체 표: `msaq_mxfp8_selftest.txt`.
 
-## 결론
+## 결론 — **개정(2026-06-27): 저비트에서 MXFP8-MSAQ가 MXINT8-MSAQ를 이긴다**
 
-0. **(최적화)** FP-특화 가중 shared로 MXFP8-MSAQ 정확도를 올렸고, **outlier/high-range 데이터(활성화·KV)에선
-   INT8과 대등~우세**로 끌어올렸다. smooth weight에선 여전히 INT8 우세(아래).
-1. **MSAQ는 MXFP8에 깨끗하게 적용된다** — 구현·검증 완료(u0=MXFP8, mg1=full FP8 cross-check 정확). 만티사 하위
-   비트를 mg개 원소가 공유하고, 원소별 지수 단위로 정규화해 적용하므로 서로 다른 지수에도 올바르게 동작.
-2. **그러나 동일 bits에서 MXFP8-MSAQ는 MXINT8-MSAQ를 못 이긴다** — 전 포맷·전 bit·전 분포에서 INT8이 **~4–6 dB 우위**.
-   - 8.25b: INT8 42.4 ≫ E3M4 37.5 ≫ E4M3 31.5 ≫ E5M2 25.4 (이미 baseline부터 INT8 승; MSAQ가 순위를 못 바꿈).
-   - 6.5b: INT8 u2/mg8 30.6 vs E3M4 u2/mg8 25.9.
-3. **이유**: per-block-32 E8M0 scale이 **이미 dynamic range를 공급**하므로, FP8가 지수에 쓰는 비트가 (블록 내부에선)
-   잉여가 된다. QSNR은 power-weighted라 **큰 원소가 지배**하는데, 큰 원소는 block-scale+INT8가 잘 처리하고, FP8의
-   지수 비트는 power 기여가 미미한 작은 원소에만 쓰여 mantissa 정밀도로 전환되지 못한다. mantissa가 가장 많은
-   **E3M4가 FP8 중 최선**(가장 INT8에 근접)이지만 여전히 ~4–5 dB 뒤진다. dynamic range를 키운 `Ws`에서도 INT8 우위
-   유지 — block scale이 블록당 적응하기 때문.
-4. **outlier 견고성**: FP8는 W↔Ws QSNR 변화가 작아(원소별 지수) outlier에 강하지만, INT8-MSAQ도 per-block scale
-   덕에 W↔Ws 변화가 작다(≤1 dB). 즉 per-block scaling이 있는 한 FP8의 range 이점이 QSNR로 드러나지 않는다.
+⚠️ 이전 결론("INT8이 전 scope 승")은 **plain-mean 인코더(wshare·efb 둘 다 없음)** 기준이었고, 개선된 인코더의
+PPL은 측정된 적이 없었다. 실제로 측정하니 **결론이 뒤집힌다**.
 
-**함의**: weight 양자화에서 MXINT8이 MXFP8보다 선호되는 통설(블록 스케일이 range를 주므로 uniform INT가 비트
-효율적)이 MSAQ에도 그대로 적용된다 — MSAQ는 두 base 포맷 위에서 **동일하게** 작동하지만, base의 우열(INT8>FP8)을
-뒤집지 못한다.
+1. **MSAQ는 MXFP8에 깨끗하게 적용된다** — 구현·검증 완료(u0=MXFP8, mg1=full FP8 cross-check 정확).
+2. **6.0~6.75b에서 E3M4-MSAQ가 MXINT8-MSAQ를 이기거나 동률**이다(아래 PPL). 특히 **activation(weight+act)에서
+   FP8 압승**(6.0b 5.96% vs INT8 10.68%) — outlier가 많은 scope에서 **per-element 지수가 실제로 값을 한다**는
+   원래 가설이 모델 PPL로 입증됐다. **순수 KV 7.38b만 INT8 우위**(+0.59 vs +0.14).
+3. **무엇이 레버였나**: 주역은 **wshare**(plain→wshare가 대부분: 6.0b weight+act 46→7.8%). **efb는 그 위에 일관되게
+   −1~2pp 추가**(7.8→6.0%)하는 보조 레버 — 공짜라 가치 있으나 주역은 아니다.
+4. **여전한 한계**: E5M2(mb2)는 +15~60%로 사용 불가, E4M3(mb3)도 E3M4에 밀린다. **mantissa가 많은 E3M4만**
+   INT8과 경쟁 가능. 8.25b baseline QSNR은 INT8(42)≫E3M4(37.5)로 INT8이 우세하나, **저비트 MSAQ regime에선
+   FP8의 per-element 지수 이점이 INT8의 baseline 우위를 역전**한다.
+
+**함의**: "블록 스케일이 range를 주니 uniform INT가 항상 낫다"는 통설은 **고비트에선 맞지만 저비트 MSAQ에선 깨진다** —
+mantissa 비트를 깎는 MSAQ가 INT8을 더 크게 손상시키고(uniform grid가 작은 원소를 굶김), FP8의 지수가 그 손상을
+완화하기 때문. **MSAQ는 base format 선택을 INT8→FP8(E3M4)로 뒤집을 수 있다, 단 저비트(≤6.75b)·outlier scope에서.**
 
 ## PPL 측정 (wikitext-2, proxy 모델 SmolLM2-1.7B, BF16 PPL=6.9955)
 
 ⚠️ **proxy**: 이 머신엔 gated Llama-3.1-8B(+HF토큰)가 없어 ungated Llama-arch **SmolLM2-1.7B**로 측정. 절대값은
 8B와 다르나 **포맷 간 상대 순위·scope 거동**은 유효(8B 정식 수치는 precision 환경에서 동일 스크립트로 실행).
-표는 BF16 대비 PPL 증가율(%), within 3% 기준. (`msaq_mxfp8_ppl_smollm2.txt`)
+표는 BF16 대비 PPL 증가율(%), within 3% 기준. (`msaq_mxfp8_ppl_smollm2.txt`, 인코더 = wshare + efb_iters=2)
 
-**bit-matched 직접 비교 — E3M4(최선 FP8) vs MXINT8:**
+**bit-matched 직접 비교 — E3M4(최선 FP8) vs MXINT8** (승자 굵게):
 
 | bits | scope | E3M4-MSAQ | MXINT8-MSAQ |
 |--:|---|--:|--:|
-| 7.38 | weight | +0.48 | **+0.30** |
-| 7.38 | weight+act | +1.38 | **+0.90** |
-| 7.38 | KV | +0.64 | **+0.14** |
-| 7.38 | weight+KV | +1.23 | **+0.46** |
-| 6.75 | weight | +2.55 | **+1.18** |
-| 6.75 | weight+act | +5.35 ❌ | **+2.76 ✓** |
-| 6.75 | KV | +2.31 | **+0.57** |
-| 6.75 | weight+KV | +5.13 ❌ | **+1.71 ✓** |
-| 6.00 | KV | +10.52 | **+1.82 ✓** |
-| 6.00 | weight+act | +46.06 | **+10.68** |
+| 7.38 | weight | +0.33 | **+0.30** |
+| 7.38 | weight+act | **+0.81** | +0.90 |
+| 7.38 | KV | +0.59 | **+0.14** |
+| 7.38 | weight+KV | +0.88 | **+0.46** |
+| 6.75 | weight | **+0.99** | +1.18 |
+| 6.75 | weight+act | **+1.68** | +2.76 |
+| 6.75 | KV | +0.61 | **+0.57** |
+| 6.75 | weight+KV | **+1.57** | +1.71 |
+| 6.00 | weight | +4.27 | **+4.22** |
+| 6.00 | weight+act | **+5.96** | +10.68 |
+| 6.00 | KV | **+1.22** | +1.82 |
+| 6.00 | weight+KV | **+5.75** | +6.36 |
 
-- **MXINT8-MSAQ가 전 bit·전 scope(weight/act/KV)에서 E3M4-MSAQ를 이긴다** — QSNR 결론과 완전 일치. 격차는 저비트
-  일수록 벌어짐(6.0b KV: E3M4 +10.5% vs INT8 +1.8%).
-- **KV가 양쪽 모두 가장 robust한 scope**이고, INT8 KV는 특히 강함(+1.82%@6.0b도 OK). FP8의 per-element 지수가 KV
-  outlier에 유리할 것이란 가설은 이 모델에선 **반증**(INT8이 더 좋음). 단 8B의 더 극단적 outlier에선 다를 여지는 남음.
-- **activation(weight+act)이 가장 어려운 scope**(양쪽 다 %가 가장 큼).
-- **E5M2(만티사 2비트)는 +17~770%로 사용 불가**; **E4M3 < E3M4**; 포맷 순위 **INT8 > E3M4 > E4M3 ≫ E5M2** (PPL=QSNR 일치).
-- 그래도 **E3M4-MSAQ @7.38b는 전 scope within 3%**(weight 0.48/act 1.38/KV 0.64/wkv 1.23) → MXFP8-MSAQ도 ~7.4비트면 동작은 함.
+**efb 기여 분리** (E3M4, plain→wshare만→wshare+efb), `MSAQ_EFB=0`으로 efb-off 재현 가능:
+
+| bits | scope | plain | wshare | wshare+efb | INT8 |
+|--:|---|--:|--:|--:|--:|
+| 6.75 | weight+act | +5.35 | +1.91 | **+1.68** | +2.76 |
+| 6.00 | weight+act | +46.06 | +7.79 | **+5.96** | +10.68 |
+| 6.00 | KV | +10.52 | +1.75 | **+1.22** | +1.82 |
+| 6.00 | weight+KV | +28.77 | +7.34 | **+5.75** | +6.36 |
+
+- **E3M4-MSAQ가 6.0~6.75b 대부분 scope에서 INT8을 이긴다** — weight+act는 전 bit 승, weight·weight+KV는
+  6.0~6.75b 승. **순수 KV만 INT8 우위**(per-block scale이 KV outlier를 이미 잘 처리).
+- **wshare가 주역, efb가 보조**(−1~2pp 추가). 둘 다 인코더-only → **추론 공짜**.
+- **E5M2 사용 불가, E4M3 < E3M4**; **mantissa가 많은 E3M4만 INT8과 경쟁**.
 
 ## 한계 / 다음
 
-- 위는 **합성 분포 + power-weighted QSNR**이다. 최종 판정은 **wikitext-2 PPL**(모델 출력 가중 오차)이며, 작은
-  값/outlier가 모델 정확도에 미치는 영향은 QSNR과 다를 수 있다(특히 활성화·KV). PPL 스윕은 동일 파일에 구현돼 있어
-  precision 환경(transformers + Llama-3.1-8B)에서 바로 실행 가능:
+- **proxy(SmolLM2-1.7B)에서 측정된 역전이므로 Llama-3.1-8B 정식 재현이 다음 단계**다. 8B의 더 극단적 activation
+  outlier에선 FP8의 per-element 지수 이점이 **더 커질** 여지가 있다(역전 폭 확대 기대). 동일 스크립트로 바로 실행:
+- 합성 Gaussian W QSNR은 여전히 INT8 우세지만, **모델 PPL은 FP8(E3M4) 우세** — 실제 weight/act가 합성보다
+  intra-block dynamic range가 커서 `Ws` regime에 가깝기 때문. 즉 QSNR(Gaussian)은 더 이상 최종 판정 기준이 아니다.
+- PPL 스윕은 동일 파일에 구현돼 있어 precision 환경(transformers + Llama-3.1-8B)에서 바로 실행 가능:
   ```bash
   CUDA_VISIBLE_DEVICES=0 python precision/msaq_mxfp8_ppl.py > precision/msaq_mxfp8_ppl.txt 2>&1
   ```

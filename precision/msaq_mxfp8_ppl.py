@@ -36,14 +36,22 @@ def _fp_round(y, e, step, maxval):
     return q.clamp(-maxval, maxval)
 
 
-def msaq_mxfp8(x, u, mg, eb, mb, wshare=True):
+def msaq_mxfp8(x, u, mg, eb, mb, wshare=True, efb_iters=2):
     """MSAQ-MXFP8: FP8(E{eb}M{mb}) elements with low-u mantissa bits shared over mg.
     u=0 -> plain MXFP8; u<mb keeps (mb-u) per-element mantissa + u shared.
     wshare=True: the shared u-bit fraction is the step_up^2-weighted mean of the group's
     residual fractions (L2-optimal for FP, since each element's reconstruction error is
     (frac_i-shared)*step_up_i and step_up_i differs per element). wshare=False = plain mean
     (the INT8-inherited form). The weighted mean never hurts L2 and helps when a group spans
-    multiple exponents (the large-exponent element dominates the error -> shared should fit it)."""
+    multiple exponents (the large-exponent element dominates the error -> shared should fit it).
+    efb_iters>0: ERROR-FEEDBACK coordinate descent (FP analog of upper_bits_correction). Each
+    iteration solves (optimal shared | fixed upper) [wshare] then re-rounds (optimal upper |
+    fixed shared) [the feedback]. The per-element upper code was first rounded without knowing
+    the group's shared term, so re-rounding it against `shared` absorbs each element's
+    (frac_i - shared) sharing error. Strictly non-increasing L2; converges by ~2 iters (the
+    extra gain over 1 iter is +0.4-0.5 dB at aggressive u3/u4). SAME stored format/decode
+    (per-elem upper + group shared) regardless of efb_iters -> FREE at inference, encoder-only.
+    efb_iters=0 reduces to wshare-only. Cross-checks (u=0, mg=1) are preserved."""
     assert 0 <= u <= mb, f"u={u} must be in [0,{mb}]"
     emin, maxexp, maxval = _fmt_params(eb, mb)
     xf = x.reshape(-1, BLOCK).to(torch.float32)
@@ -58,17 +66,24 @@ def msaq_mxfp8(x, u, mg, eb, mb, wshare=True):
     upper = _fp_round(y, e, step_up, maxval)               # per-element FP8 with (mb-u) mantissa bits
     if u == 0:
         return (upper * s_base).reshape(x.shape)
-    res = y - upper
-    frac = res / step_up                                   # normalized residual in [-0.5, 0.5)
-    fg = frac.reshape(frac.shape[0], -1, mg)
-    if wshare:
-        w = step_up.reshape(fg.shape).pow(2)               # weight = step_up_i^2 (∝ 4^e_i): L2-optimal
-        frac_avg = ((fg * w).sum(-1, keepdim=True) / w.sum(-1, keepdim=True).clamp(min=1e-30))
-    else:
-        frac_avg = fg.mean(-1, keepdim=True)
-    frac_avg = frac_avg.expand(-1, -1, mg).reshape(frac.shape)
     half = 1 << (u - 1)
-    shared = (torch.round(frac_avg * float(1 << u)).clamp(-half, half - 1)) / float(1 << u)   # u-bit signed fraction
+    w = step_up.reshape(step_up.shape[0], -1, mg).pow(2) if wshare else None
+    shared = None
+    for it in range(max(1, efb_iters + 1)):
+        # (1) optimal shared | fixed upper
+        frac = (y - upper) / step_up                       # normalized residual in [-0.5, 0.5)
+        fg = frac.reshape(frac.shape[0], -1, mg)
+        if wshare:                                         # weight = step_up_i^2 (∝ 4^e_i): L2-optimal
+            frac_avg = (fg * w).sum(-1, keepdim=True) / w.sum(-1, keepdim=True).clamp(min=1e-30)
+        else:
+            frac_avg = fg.mean(-1, keepdim=True)
+        frac_avg = frac_avg.expand(-1, -1, mg).reshape(frac.shape)
+        shared = (torch.round(frac_avg * float(1 << u)).clamp(-half, half - 1)) / float(1 << u)  # u-bit signed
+        if it == efb_iters:
+            break
+        # (2) optimal upper | fixed shared: re-round the per-element upper so it absorbs the
+        # group-sharing error (frac_i - shared) of each element.
+        upper = _fp_round(y - shared * step_up, e, step_up, maxval)
     rec = upper + shared * step_up
     return (rec * s_base).reshape(x.shape)
 
@@ -164,9 +179,10 @@ def run_ppl():
     CFG = {"e4m3": [(1, 8), (1, 4), (2, 4)], "e5m2": [(1, 8), (1, 4), (2, 4)],
            "e3m4": [(1, 8), (2, 4), (3, 4)]}
     _S = {"eb": 4, "mb": 3, "base": "fp8"}
+    EFB = int(os.environ.get("MSAQ_EFB", "2"))             # error-feedback iters (0 = wshare-only)
     def Q(x, u, mg):
         if _S["base"] == "int8": return msaq_mxint8(x, u, mg).to(x.dtype)
-        return msaq_mxfp8(x, u, mg, _S["eb"], _S["mb"]).to(x.dtype)
+        return msaq_mxfp8(x, u, mg, _S["eb"], _S["mb"], efb_iters=EFB).to(x.dtype)
 
     def is_target(n, m): return isinstance(m, torch.nn.Linear) and any(p in n for p in LINEAR_KEYS)
     def patch_act(targets, u, mg):

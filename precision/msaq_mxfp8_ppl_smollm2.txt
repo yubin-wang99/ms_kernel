@@ -2,24 +2,24 @@ wikitext-2: 304,838 tokens | BF16 PPL = 6.9955 | block=32 | criterion within 3%
 
 ================  MSAQ-MXFP8 element = E4M3  (block=32)  ================
       scope | u1/mg8(7.38b) u1/mg4(7.50b) u2/mg4(6.75b) | within 3%?
-     weight |  +3.48%   +3.66%  +14.17% | FAIL FAIL FAIL
- weight+act |  +7.54%   +7.50%  +27.65% | FAIL FAIL FAIL
-         KV |  +2.78%   +2.94%  +11.19% | OK OK FAIL
-  weight+KV |  +7.09%   +6.84%  +30.51% | FAIL FAIL FAIL
+     weight |  +3.06%   +2.64%   +5.23% | FAIL OK FAIL
+ weight+act |  +5.44%   +4.63%   +8.62% | FAIL FAIL FAIL
+         KV |  +2.57%   +2.16%   +2.40% | OK OK OK
+  weight+KV |  +5.61%   +5.07%   +7.99% | FAIL FAIL FAIL
 
 ================  MSAQ-MXFP8 element = E5M2  (block=32)  ================
       scope | u1/mg8(7.38b) u1/mg4(7.50b) u2/mg4(6.75b) | within 3%?
-     weight | +17.04%  +16.50%  +76.93% | FAIL FAIL FAIL
- weight+act | +38.17%  +38.62%  +601.83% | FAIL FAIL FAIL
-         KV | +12.96%  +12.80%  +86.50% | FAIL FAIL FAIL
-  weight+KV | +44.24%  +43.83%  +770.34% | FAIL FAIL FAIL
+     weight | +14.52%  +18.51%  +20.98% | FAIL FAIL FAIL
+ weight+act | +29.17%  +35.47%  +39.51% | FAIL FAIL FAIL
+         KV | +10.91%   +9.55%  +10.62% | FAIL FAIL FAIL
+  weight+KV | +35.62%  +59.48%  +46.84% | FAIL FAIL FAIL
 
 ================  MSAQ-MXFP8 element = E3M4  (block=32)  ================
       scope | u1/mg8(7.38b) u2/mg4(6.75b) u3/mg4(6.00b) | within 3%?
-     weight |  +0.48%   +2.55%  +13.22% | OK OK FAIL
- weight+act |  +1.38%   +5.35%  +46.06% | OK FAIL FAIL
-         KV |  +0.64%   +2.31%  +10.52% | OK OK FAIL
-  weight+KV |  +1.23%   +5.13%  +28.77% | OK FAIL FAIL
+     weight |  +0.33%   +0.99%   +4.27% | OK OK FAIL
+ weight+act |  +0.81%   +1.68%   +5.96% | OK OK FAIL
+         KV |  +0.59%   +0.61%   +1.22% | OK OK OK
+  weight+KV |  +0.88%   +1.57%   +5.75% | OK OK FAIL
 
 ================  MSAQ-MXINT8 (reference, INT8 element)  (block=32)  ================
       scope | u1/mg8(7.38b) u2/mg4(6.75b) u3/mg4(6.00b) | within 3%?
