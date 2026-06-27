@@ -572,6 +572,65 @@ __global__ void wonly_gemv_batched_unsigned(
     }
 }
 
+// MXFP8-MSAQ (E3M4) wide W-only GEMV (M=1): identical structure to wonly_gemv_wide_uspec
+// but the weight comes from the FP8 streamer (fval already includes sign+exp+mantissa), so
+// the dot is acc += (fval*scale)*x. SAME bytes as MXINT8-MSAQ -> measures fused decode ALU.
+template<int U_, int GS_>
+__global__ void wonly_gemv_wide_fp8(
+        const __nv_bfloat16* __restrict__ x, const int8_t* __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int OUT, int NB, int splitK) {
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int sp = blockIdx.y, per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    float acc = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+        ms::stream_block_uspec_fp8_e3m4<U_, GS_>(upper_cm, shared_cm, (long)blk * OUT + o,
+            [&](int k, float fval) { acc += (fval * scale) * __bfloat162float(x[blk * BLOCK + k]); });
+    }
+    partial[(long)sp * OUT + o] = acc;
+}
+
+// MXFP8-MSAQ (E3M4) batched W-only GEMV: mirror of wonly_gemv_batched_uspec (shared-activation
+// staging) with the FP8 streamer.
+template<int U_, int GS_, int MR>
+__global__ void wonly_gemv_batched_fp8(
+        const __nv_bfloat16* __restrict__ x, const int8_t* __restrict__ scale_exp,
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        float* __restrict__ partial, int M, int OUT, int NB, int splitK) {
+    __shared__ float As[MR][BLOCK];
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sp = blockIdx.y, row0 = blockIdx.z * MR, tid = threadIdx.x;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int K = NB * BLOCK;
+    const bool active = (o < OUT);
+    float acc[MR];
+    #pragma unroll
+    for (int j = 0; j < MR; ++j) acc[j] = 0.0f;
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < MR * BLOCK; idx += blockDim.x) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (row0 + m < M) ? __bfloat162float(x[(long)(row0 + m) * K + blk * BLOCK + k]) : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
+            const float scale = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+            ms::stream_block_uspec_fp8_e3m4<U_, GS_>(upper_cm, shared_cm, (long)blk * OUT + o,
+                [&](int k, float fval) {
+                    const float wf = fval * scale;
+                    #pragma unroll
+                    for (int j = 0; j < MR; ++j) acc[j] += wf * As[j][k];
+                });
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < MR; ++j) { const int m = row0 + j; if (m < M) partial[((long)sp * M + m) * OUT + o] = acc[j]; }
+    }
+}
+
 // REGISTER-ALIGNED batched W-only GEMV: same shared-activation structure, weight from
 // the register-aligned plane via stream_block_ra (1 bfe/code). Tests whether cutting the
 // unpack ALU raises MLP/BW and beats MXINT8.
@@ -1509,6 +1568,71 @@ torch::Tensor wonly_gemv_batched_cuda(
         (int)M, (int)OUT, splitK);
     return y;
 }
+
+// ---- MXFP8-MSAQ (E3M4) GEMV launchers (same splitK/combine as the MSAQ-INT8 twins) --------
+#define MSFP8_SPEC(MACRO) MACRO(3,4) MACRO(3,16) MACRO(2,8) MACRO(2,4)
+torch::Tensor msfp8_gemv_wide_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    auto y = torch::empty({OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    auto partial = torch::empty({(int64_t)splitK, OUT}, x.options().dtype(torch::kFloat32));
+    auto go = [&](auto Ut, auto Gt) {
+        wonly_gemv_wide_fp8<decltype(Ut)::value, decltype(Gt)::value>
+            <<<dim3(blocks, splitK), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)OUT, (int)NB, splitK); };
+    bool launched = false;
+    #define DISP(UU,GG) if (!launched && (int)u==UU && (int)gs==GG) { \
+        go(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}); launched = true; }
+    MSFP8_SPEC(DISP)
+    #undef DISP
+    TORCH_CHECK(launched, "msfp8_gemv_wide: unsupported (u,gs); add to MSFP8_SPEC");
+    gemv_combine_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()), (int)OUT, splitK);
+    return y;
+}
+
+torch::Tensor msfp8_gemv_batched_cuda(
+        torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be CUDA bf16");
+    auto y = torch::empty({M, OUT}, x.options());
+    const int threads = 128, blocks = (int)((OUT + threads - 1) / threads);
+    const int splitK = ms::gemv_splitk_count(blocks, (int)NB, 16);
+    int MR = 1; while (MR < (int)M && MR < 32) MR <<= 1;
+    const int nTiles = (int)((M + MR - 1) / MR);
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, x.options().dtype(torch::kFloat32));
+    dim3 grid(blocks, splitK, nTiles);
+    auto go = [&](auto Ut, auto Gt, auto MRt) {
+        wonly_gemv_batched_fp8<decltype(Ut)::value, decltype(Gt)::value, decltype(MRt)::value>
+            <<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), scale_exp.data_ptr<int8_t>(),
+            upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+            partial.data_ptr<float>(), (int)M, (int)OUT, (int)NB, splitK); };
+    auto disp_mr = [&](auto Ut, auto Gt) {
+        switch (MR) {
+            case 1:  go(Ut, Gt, std::integral_constant<int,1>{});  break;
+            case 2:  go(Ut, Gt, std::integral_constant<int,2>{});  break;
+            case 4:  go(Ut, Gt, std::integral_constant<int,4>{});  break;
+            case 8:  go(Ut, Gt, std::integral_constant<int,8>{});  break;
+            case 16: go(Ut, Gt, std::integral_constant<int,16>{}); break;
+            default: go(Ut, Gt, std::integral_constant<int,32>{}); break; } };
+    bool launched = false;
+    #define DISP(UU,GG) if (!launched && (int)u==UU && (int)gs==GG) { \
+        disp_mr(std::integral_constant<int,UU>{}, std::integral_constant<int,GG>{}); launched = true; }
+    MSFP8_SPEC(DISP)
+    #undef DISP
+    TORCH_CHECK(launched, "msfp8_gemv_batched: unsupported (u,gs); add to MSFP8_SPEC");
+    gemv_combine_batched_kernel<<<dim3(blocks, (int)M), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return y;
+}
+#undef MSFP8_SPEC
 
 // VECTORIZED nibble-relayout GEMV (u3/gs16 only): high nibble -> float via
 // __byte_perm magic (8 at a time), low_un(1b) folded as a float select. Tests

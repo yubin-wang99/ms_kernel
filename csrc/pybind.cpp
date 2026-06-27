@@ -78,6 +78,15 @@ torch::Tensor ms_dequant_bf16_cuda(
 torch::Tensor msfp8_dequant_bf16_cuda(
     torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
     int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor msfp8_gemv_wide_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t OUT, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor msfp8_gemv_batched_cuda(
+    torch::Tensor x, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t M, int64_t OUT, int64_t NB, int64_t u, int64_t gs);
+torch::Tensor msfp8_gemm_cuda(
+    torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+    int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
 torch::Tensor wonly_gemm_tc_cuda(
     torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
     int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
@@ -236,6 +245,12 @@ TORCH_LIBRARY(msaq, m) {
           "int OUT, int K, int NB, int u, int gs) -> Tensor", &ms_dequant_bf16_cuda);
     m.def("msfp8_dequant_bf16(Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
           "int OUT, int K, int NB, int u, int gs) -> Tensor", &msfp8_dequant_bf16_cuda);
+    m.def("msfp8_gemv_wide(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int OUT, int NB, int u, int gs) -> Tensor", &msfp8_gemv_wide_cuda);
+    m.def("msfp8_gemv_batched(Tensor x, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int M, int OUT, int NB, int u, int gs) -> Tensor", &msfp8_gemv_batched_cuda);
+    m.def("msfp8_gemm(Tensor X, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
+          "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &msfp8_gemm_cuda);
     m.def("wonly_gemm_tc(Tensor X, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wonly_gemm_tc_cuda);
     m.def("wonly_gemm_fused_skinny(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "

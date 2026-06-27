@@ -168,18 +168,67 @@ max err 0). 핵심 통찰: E3M4 u3의 per-element 필드 폭 = 1+eb+(mb−u) = 1
   입력 0.75B/elem)라 추가 FP 복원 ALU가 write 뒤에 완전히 숨는다. **정확도 우위가 디코드 지연 없이 공짜.**
 - plain MXINT8(8.25b)보다는 빠르다(바이트 적음). 즉 6.0b E3M4는 **INT8-MSAQ 대비 정확도↑·속도=, plain MXINT8 대비
   bits↓·속도↑**.
-- ⚠️ 격리 dequant 기준. 융합 GEMV/attention에서 언팩이 compute와 overlap될 때의 거동은 별도(저비트 W-decode가
-  구조적으로 불리하다는 기존 결과와 함께 봐야 함). 그러나 메모리 트래픽이 INT8-MSAQ와 동일하므로 융합에서도
-  INT8-MSAQ와 대등할 것으로 기대.
+- ⚠️ 위는 **격리 dequant**(write-bound) 기준. 융합 커널에서의 overlap 거동은 아래 별도 섹션.
+
+## 융합 GEMV/GEMM — overlap 거동 ★ (E3M4 vs INT8-MSAQ)
+
+융합 커널 구현(`csrc`: `wonly_gemv_wide_fp8`/`wonly_gemv_batched_fp8` via `stream_block_uspec_fp8_e3m4`;
+GEMM은 `wonly_gemm_wmma_pipe<CM,FP8>` + `dequant_col_stream_fp8`. 런처 `msfp8_gemv_wide/batched/gemm`,
+벤치 `tests/msfp8_gemv_gemm_bench.py`). correctness rel ~1.7e-3 (bf16 수준). **핵심: dequant은 write-bound라
+ALU가 숨지만, 융합 GEMV(M=1)는 latency/extraction-bound라 FP 복원 ALU(`ldexpf`)가 노출된다.**
+
+| 연산 | M | E3M4 / INT8-MSAQ | 해석 |
+|---|--:|--:|---|
+| 격리 dequant | — | **1.00×** | write-bound, ALU 완전 은닉 |
+| 디코드 GEMV (wide) | 1 | **1.74×** (느림) | overlap 없음 → `ldexpf` 완전 노출 |
+| batched GEMV | 4 | 1.46× | compute 늘며 점점 은닉 |
+| batched GEMV | 8 | 1.35× | |
+| batched GEMV | 16 | 1.18× | |
+| batched GEMV | 32 | 1.18× | |
+| prefill GEMM (wmma_pipe) | 128 | **0.99×** (동률) | column dequant이 WMMA와 overlap → 은닉 |
+| prefill GEMM | 256–1024 | 1.07× | |
+
+(GEMV는 둘 다 fast uspec 경로가 있는 u3/gs16에서 공정 비교 — gs4에선 INT8 batched가 generic fallback이라 불공정.)
+
+- **E3M4의 FP-복원 오버헤드는 compute가 많을수록 숨는다**: M=1(1.74×) → batched(1.2–1.5×) → GEMM(≈1.0×).
+- **decode(M=1)에서 E3M4는 INT8-MSAQ보다 느리다** — 기존 "저비트 W-decode는 MXINT8에 구조적으로 불리" 결과의 연장
+  (FP 복원이 그 위에 ldexpf를 더함). [[msaq-vs-mxint8-w-decode-state]]와 같이 봐야 함.
+- **GEMM(prefill)에선 정확도 우위가 사실상 공짜** (≈INT8-MSAQ). 즉 **E3M4는 compute-bound(prefill/배치) 경로에 적합**,
+  latency-bound 단일 decode엔 불리.
+- 참고: 이 wmma_pipe GEMM 경로는 bf16 cuBLAS보다 5–9× 느리다(MSAQ·INT8 공통; 빠른 `fused_skinny`는 u3/gs16·u2/gs8
+  전용이라 gs4 미지원). E3M4의 결론(overlap 시 ALU 은닉)은 경로와 무관.
+
+## Blackwell MXFP8 하드웨어 활용 — 조사 결과 (2026-06-28)
+
+**결론: E3M4-MSAQ는 Blackwell 텐서코어 경로를 전혀 탈 수 없다 (2중 차단).**
+
+1. **E3M4는 하드웨어 포맷이 아니다** — OCP MX v1.0 / PTX ISA / FP8 표준(arXiv 2209.05433) 모두 FP8 = **E4M3·E5M2뿐**
+   (FP6=E3M2/E2M3, FP4=E2M1). E3M4는 학술 포맷, 텐서코어 datapath 없음(sm_100·sm_120 공통).
+2. **공유-mantissa / 임의 sub-byte 메커니즘이 없다** — block-scaled MMA(`tcgen05.mma`/`mma.sync ... block_scale`)는
+   고정된 `{e4m3,e5m2,e3m2,e2m3,e2m1}` + UE8M0/UE4M3 scale(block 32, NVFP4만 16)만 받는다. 게다가 `mxf8f6f4`에선
+   6-bit·4-bit도 **바이트 패딩**(1B/elem)이라 sub-byte 저장 이득도 MMA 경계에선 없음(진짜 패킹은 FP4 전용 `mxf4`).
+   → 6.0b 공유-mantissa는 MMA 전에 표준 MX 원소로 **언팩**해야 하고, 그 언팩이 바로 우리가 아끼려던 ALU.
+
+**그래도 남는 활용 방안(실행 가능 옵션):**
+- **(권장) MSAQ를 표준 MX 원소를 직접 내보내도록 재정식화** — 예: E3M2/E2M3(MXFP6) 또는 E4M3(MXFP8)을 UE8M0 블록
+  스케일로 바로 출력하면 per-element 언팩 없이 native block-scaled 텐서코어에 올린다. 이때만 하드웨어 가속이 가능.
+  단 MXFP6/8은 6.0b MSAQ보다 비트가 크거나(8.25b) 정밀도가 다르므로, accuracy↔throughput 재평가 필요.
+- **소비자 5090(sm_120) 주의**: FP8을 FP32 누산하면 텐서 처리량이 **절반**(BF16 수준)이라 FP8의 2× 이점이 상쇄 —
+  즉 bf16-WMMA fallback의 손해가 생각보다 작다. FP4/block-scaled 경로는 스로틀 없음.
+- 요구 버전: block-scaled MXFP8 GEMM은 CUDA≥12.8(권장 12.9)·CUTLASS≥3.8(현 4.x). 예제 `72/79/84_blackwell_*`,
+  cuBLASLt `LtMxfp8Matmul`. sm_120은 `sm_120a` 타깃 필요(ptxas/lowering 버그 잔존, version-fragile).
 
 ## 한계 / 다음
 
 - ✅ **Llama-3.1-8B 정식 재현 완료**(bit-storable 인코더) — 6.0b E3M4 4/4승, activation 6.75b까지 우세. 위 ★ 섹션.
-- ✅ **디코드 커널 구현·측정 완료** — E3M4 6.0b dequant = INT8-MSAQ 6.0b 속도(정확도 우위 공짜). 위 디코드 커널 섹션.
+- ✅ **디코드/융합 커널 구현·측정 완료** — 격리 dequant=동률, GEMM=동률(overlap 은닉), 단 M=1 decode는 1.74× 느림
+  (ALU 노출). 위 두 ★ 섹션.
+- ✅ **Blackwell MXFP8 조사 완료** — E3M4·공유mantissa 모두 HW 경로 없음; 재정식화(표준 MX 원소 출력)만이 가속 옵션.
 - 합성 Gaussian W QSNR은 여전히 INT8 우세지만, **모델 PPL은 저비트에서 FP8(E3M4) 우세** — 실제 weight/act가 합성보다
   intra-block dynamic range가 커서 `Ws` regime에 가깝기 때문. 즉 QSNR(Gaussian)은 더 이상 최종 판정 기준이 아니다.
-- **다음**: (1) E3M4 6.0b를 **융합 GEMV/attention** 커널로 — 언팩이 compute와 overlap될 때도 INT8-MSAQ와 대등한지
-  (격리 dequant은 동률 확인). (2) crossover(~6.75b)를 sub-scope별로 더 촘촘히. (3) 다른 모델군(Qwen/Mistral) 일반화.
+- **다음**: (1) E3M4 batched/GEMV의 M=1 ALU 노출을 줄일 수 있는지(`ldexpf` 제거·정수 지수 삽입 등) — 단 INT8의
+  sepsc 우위는 구조적. (2) **Blackwell 가속을 노린다면 MSAQ→표준 MXFP6(E3M2/E2M3) 재정식화** + accuracy↔throughput
+  재평가. (3) crossover(~6.75b) sub-scope별 정밀화. (4) attention(KV) 융합 경로. (5) 다른 모델군 일반화.
 - PPL 스윕은 동일 파일에 구현돼 있어 precision 환경에서 재실행 가능(`MSAQ_MODEL`로 모델 지정):
   ```bash
   # 정식 8B(미러). MSAQ_EFB=0 으로 efb 끄고 wshare-only 기여도 분리 가능.

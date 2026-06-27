@@ -226,6 +226,55 @@ __device__ __forceinline__ void stream_block_uspec_unsigned(
     }
 }
 
+// --- MXFP8-MSAQ (E3M4) streaming unpack. SAME dense plane layout as stream_block_uspec
+//   (upper field width 8-U_, shared U_-bit signed), but each upper field is an FP8 E3M4
+//   element [sign:1|exp:3|upmant:(MB-U_)] -> yields the reconstructed FP8 VALUE (float, before
+//   the block scale): val = sign * 2^(ee-MB) * (m_up*2^U_ + sh). Bit-exact to msaq_mxfp8(e3m4)
+//   / msfp8_e3m4_dequant_bf16_kernel. The ONLY difference vs the INT path is per-element ALU
+//   (exp/mantissa split + ldexpf); memory traffic is identical -> isolates fused decode ALU.
+template<int U_, int GS_, typename F>
+__device__ __forceinline__ void stream_block_uspec_fp8_e3m4(
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        long base, F per_elem) {
+    constexpr int MXB = 32, EB = 3, MB = 4, BIAS = 3, EMIN = -2;
+    constexpr int WBITS = 8 - U_, MBUP = MB - U_;
+    constexpr int UBc = MXB * WBITS / 8;
+    constexpr int SBc = ((MXB / GS_) * U_ + 7) / 8;
+    constexpr int NW  = UBc / 4;
+    constexpr int NSW = (SBc + 3) / 4 > 0 ? (SBc + 3) / 4 : 1;
+    constexpr uint32_t umask = (1u << WBITS) - 1u;
+    constexpr uint32_t expmask = (1u << EB) - 1u, upmask = (1u << MBUP) - 1u, lead = 1u << MBUP;
+    constexpr uint32_t smask = (1u << U_) - 1u, ssign = 1u << (U_ - 1);
+    constexpr int gsmask = GS_ - 1;
+    uint32_t sreg[NSW] = {0u};
+    #pragma unroll
+    for (int i = 0; i < SBc; ++i) sreg[i >> 2] |= (uint32_t)shared_cm[base * SBc + i] << (8 * (i & 3));
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UBc);
+    uint32_t ureg[NW];
+    #pragma unroll
+    for (int i = 0; i < NW; ++i) ureg[i] = src[i];
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < MXB; ++k) {
+        if (unb < WBITS) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const uint32_t field = (uint32_t)ubuf & umask;
+        ubuf >>= WBITS; unb -= WBITS;
+        const uint32_t sgn = field >> (WBITS - 1);
+        const uint32_t expf = (field >> MBUP) & expmask;
+        const int m_up = (int)((expf ? lead : 0u) | (field & upmask));
+        const int ee = expf ? (int)expf - BIAS : EMIN;
+        if ((k & gsmask) == 0) {
+            if (snb < U_) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+            sbuf >>= U_; snb -= U_;
+        }
+        int mag = m_up << U_;
+        if (sgn) mag = -mag;
+        per_elem(k, ldexpf((float)(mag + sh_code), ee - MB));   // FP8 value (pre block-scale)
+    }
+}
+
 // --- DENSE + SELECTIVE-bfe unpack: reads the EXISTING dense upper_cm plane (pack_weight,
 //   0.66x bytes, NO repack) but extracts each code with a SINGLE bfe.s32 when it does not
 //   cross a 32-bit register boundary (compile-time known), and funnelshift+bfe only for the

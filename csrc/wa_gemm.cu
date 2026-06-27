@@ -525,7 +525,61 @@ __device__ __forceinline__ void dequant_col_stream_bf16(
     }
 }
 
+// MXFP8-MSAQ (E3M4) column dequant: SAME byte gather as dequant_col_stream_bf16, but each
+// upper field decodes as an FP8 E3M4 element (sign/exp/mantissa + ldexpf). Bit-exact to
+// msaq_mxfp8(e3m4). Only the per-element reconstruction differs -> isolates fused GEMM ALU.
 template<bool CM>
+__device__ __forceinline__ void dequant_col_stream_fp8(
+        const uint8_t* __restrict__ upper, const uint8_t* __restrict__ shared,
+        int blk, int o, int OUT, int u, int gs, int UB, int SB,
+        float scale, __nv_bfloat16* dst) {
+    constexpr int EB = 3, MB = 4, BIAS = 3, EMIN = -2;
+    const int wbits = 8 - u, mbup = MB - u;
+    const uint32_t umask = (1u << wbits) - 1u;
+    const uint32_t expmask = (1u << EB) - 1u, upmask = (1u << mbup) - 1u, lead = 1u << mbup;
+    const uint32_t smask = (1u << u) - 1u, ssign = 1u << (u - 1);
+    const int gsmask = gs - 1;
+    uint32_t ureg[6] = {0u,0u,0u,0u,0u,0u};
+    uint32_t sreg[3] = {0u,0u,0u};
+    if constexpr (CM) {
+        const long base = (long)blk * OUT + o;
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(upper + base * UB);
+        #pragma unroll
+        for (int i = 0; i < 6; ++i) if (i < (UB >> 2)) ureg[i] = src[i];
+        #pragma unroll
+        for (int bi = 0; bi < 8; ++bi)
+            if (bi < SB) sreg[bi >> 2] |= (uint32_t)shared[base * SB + bi] << (8 * (bi & 3));
+    } else {
+        #pragma unroll
+        for (int bi = 0; bi < 24; ++bi)
+            if (bi < UB) ureg[bi >> 2] |= (uint32_t)upper[((long)blk*UB + bi)*OUT + o] << (8*(bi&3));
+        #pragma unroll
+        for (int bi = 0; bi < 8; ++bi)
+            if (bi < SB) sreg[bi >> 2] |= (uint32_t)shared[((long)blk*SB + bi)*OUT + o] << (8*(bi&3));
+    }
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < BLOCK; ++k) {
+        if (unb < wbits) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const uint32_t field = (uint32_t)ubuf & umask;
+        ubuf >>= wbits; unb -= wbits;
+        const uint32_t sgn = field >> (wbits - 1);
+        const uint32_t expf = (field >> mbup) & expmask;
+        const int m_up = (int)((expf ? lead : 0u) | (field & upmask));
+        const int ee = expf ? (int)expf - BIAS : EMIN;
+        if ((k & gsmask) == 0) {
+            if (snb < u) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+            sbuf >>= u; snb -= u;
+        }
+        int mag = m_up << u;
+        if (sgn) mag = -mag;
+        dst[k] = __float2bfloat16(ldexpf((float)(mag + sh_code), ee - MB) * scale);
+    }
+}
+
+template<bool CM, bool FP8 = false>
 __global__ void wonly_gemm_wmma_pipe(
         const __nv_bfloat16* __restrict__ X, const int8_t* __restrict__ scale_exp,
         const uint8_t* __restrict__ upper, const uint8_t* __restrict__ shared,
@@ -554,7 +608,10 @@ __global__ void wonly_gemm_wmma_pipe(
             const int o = o0 + oc;
             if (o < OUT) {
                 const float sc = ms::e8m0_to_scale(scale_exp[b * OUT + o]);
-                dequant_col_stream_bf16<CM>(upper, shared, b, o, OUT, u, gs, UB, SB, sc, &Bs[buf][oc][0]);
+                if constexpr (FP8)
+                    dequant_col_stream_fp8<CM>(upper, shared, b, o, OUT, u, gs, UB, SB, sc, &Bs[buf][oc][0]);
+                else
+                    dequant_col_stream_bf16<CM>(upper, shared, b, o, OUT, u, gs, UB, SB, sc, &Bs[buf][oc][0]);
             } else {
                 #pragma unroll
                 for (int k = 0; k < BLOCK; ++k) Bs[buf][oc][k] = __float2bfloat16(0.0f);
@@ -1231,6 +1288,23 @@ torch::Tensor wonly_gemm_tc_cuda(
     int UB, SB; gemm_dims(u, gs, UB, SB);
     auto Y = torch::empty({M, OUT}, X.options());
     wonly_gemm_wmma_pipe<true><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+        scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, (int)K, (int)NB, (int)u, (int)gs, UB, SB);
+    return Y;
+}
+
+// MXFP8-MSAQ (E3M4) prefill GEMM: same wmma_pipe (column dequant overlaps WMMA) as
+// wonly_gemm_tc but the weight column dequants as FP8 E3M4 (dequant_col_stream_fp8).
+torch::Tensor msfp8_gemm_cuda(
+        torch::Tensor X, torch::Tensor scale_exp,
+        torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    int UB, SB; gemm_dims(u, gs, UB, SB);
+    auto Y = torch::empty({M, OUT}, X.options());
+    wonly_gemm_wmma_pipe<true, true><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
         scale_exp.data_ptr<int8_t>(), upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
