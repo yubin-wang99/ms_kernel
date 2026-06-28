@@ -147,6 +147,43 @@ __device__ __forceinline__ int unpack_ms_weight_elem(
 //   `upper_cm + base*UBc` (column-major weight: base=blk*OUT+o; token-major KV:
 //   base=(hk*NB+blk)*Lcap+key); per_elem(k, word) called for each reconstructed word.
 //   With U_/GS_ compile-time, WBITS/UBc/SBc and the masks/shifts are constants and the
+//   SEPARATED variant: yields (kd, up_code, sh_code) separately (not the combined word) so the
+//   caller can do separated-scale (sepsc) accumulation: dot = scale*(2^u*Σq·up + Σ_g qg·sh).
+//   Same rolling-buffer unpack as stream_block_uspec; sh_code is the current group's code.
+template<int U_, int GS_, typename F>
+__device__ __forceinline__ void stream_block_uspec_sep(
+        const uint8_t* __restrict__ upper_cm, const uint8_t* __restrict__ shared_cm,
+        long base, F per_elem) {
+    constexpr int MXB = 32;
+    constexpr int Up = U_ > 0 ? U_ : 1, Gp = GS_ > 0 ? GS_ : 1;   // guards: this template is also
+    constexpr int UBc = MXB * (8 - Up) / 8, SBc = ((MXB / Gp) * Up + 7) / 8;  // INSTANTIATED (dead) for
+    constexpr int NW = UBc / 4, NSW = (SBc + 3) / 4 > 0 ? (SBc + 3) / 4 : 1;  // U_=-1 (u4) -> avoid <<(-)
+    constexpr uint32_t umask = (1u << (8 - Up)) - 1u, usign = 1u << (8 - Up - 1);
+    constexpr uint32_t smask = (1u << Up) - 1u, ssign = 1u << (Up - 1);
+    constexpr int gsmask = Gp - 1, WBITS = 8 - Up;
+    uint32_t sreg[NSW] = {0u};
+    #pragma unroll
+    for (int i = 0; i < SBc; ++i) sreg[i >> 2] |= (uint32_t)shared_cm[base * SBc + i] << (8 * (i & 3));
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(upper_cm + base * UBc);
+    uint32_t ureg[NW];
+    #pragma unroll
+    for (int i = 0; i < NW; ++i) ureg[i] = src[i];
+    uint64_t ubuf = 0; int unb = 0, uwi = 0;
+    uint64_t sbuf = 0; int snb = 0, swi = 0; int sh_code = 0;
+    #pragma unroll
+    for (int k = 0; k < MXB; ++k) {
+        if (unb < WBITS) { ubuf |= (uint64_t)ureg[uwi++] << unb; unb += 32; }
+        const int up_code = (int)(((uint32_t)ubuf & umask) ^ usign) - (int)usign;
+        ubuf >>= WBITS; unb -= WBITS;
+        if ((k & gsmask) == 0) {
+            if (snb < U_) { sbuf |= (uint64_t)sreg[swi++] << snb; snb += 32; }
+            sh_code = (int)(((uint32_t)sbuf & smask) ^ ssign) - (int)ssign;
+            sbuf >>= U_; snb -= U_;
+        }
+        per_elem(k, up_code, sh_code);
+    }
+}
+
 //   k-loop unroll makes the rolling-buffer schedule static -> ureg register-resident.
 //   Bit-exact to the runtime streaming unpack. (kernel_ver3.md / compile_time_optimization.md.)
 template<int U_, int GS_, typename F>

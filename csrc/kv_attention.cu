@@ -582,9 +582,19 @@ __global__ void kv_decode_wide_kernel(
                 } else if constexpr (U_ > 0) {              // u2/u3 (u,gs)-SPECIALIZED streaming
                     // compile-time U_/GS_: register-resident rolling buffer + constant
                     // masks/shifts (the W-only GEMV compile-time win, ported to the KV read).
-                    ms::stream_block_uspec<U_, GS_>(ku, kh, kbase, [&](int kd, int w) {
-                        dot += q_sh[blk * BLOCK + kd] * (w * ksc);
-                    });
+                    if (sepsc) {                            // separated-scale (ported from the u4 path):
+                        // dot = scale*(2^u*Σq·up + Σ_g qg·sh) — avoids per-elem (·2^u+sh) and per-elem ·ksc.
+                        float bup = 0.0f, bsh = 0.0f;
+                        ms::stream_block_uspec_sep<U_, GS_>(ku, kh, kbase, [&](int kd, int up_code, int sh_code) {
+                            bup += q_sh[blk * BLOCK + kd] * up_code;
+                            if ((kd & (GS_ - 1)) == 0) bsh += qg_sh[blk * BLOCK + (kd >> gs_shift)] * sh_code;
+                        });
+                        dot += ksc * ((float)(1 << U_) * bup + bsh);
+                    } else {
+                        ms::stream_block_uspec<U_, GS_>(ku, kh, kbase, [&](int kd, int w) {
+                            dot += q_sh[blk * BLOCK + kd] * (w * ksc);
+                        });
+                    }
                 } else {                                    // u2/u3: runtime STREAMING bit-buffer unpack
                     // thread-per-key unpacks ALL 32 codes of its key sequentially, so the
                     // rolling 64-bit buffer (one shift+mask per code, refill a word only when
@@ -686,6 +696,20 @@ __global__ void kv_decode_wide_kernel(
                         else    d8[(long)blk * chunk * BLOCK + i * BLOCK + kd] = code;
                     }
                 }
+            } else if (U_ > 0 && v8) {
+                // u2/u3 generalization of the int8-staged V (vt layout [blk][kd][kk], CH=chunk+4):
+                // reconstruct each key's 32 codes to int8 (up*2^u+sh in [-124,123]) via the funnel
+                // unpack, store TRANSPOSED so Pass-2 reads contiguous int8 (full-sector, no funnel).
+                int8_t* d8 = (int8_t*)pVu;
+                const int CH = chunk + 4;
+                for (int i = tid; i < nC; i += NT) {
+                    const long vkb = (long)(hk * NB + blk) * Lcap + cs + i;
+                    ms::stream_block_uspec_sep<U_, GS_>(vu, vh, vkb, [&](int kd, int up_code, int sh_code) {
+                        const int8_t code = (int8_t)(up_code * (1 << U_) + sh_code);
+                        if (vt) d8[(long)blk * BLOCK * CH + kd * CH + i] = code;    // [blk][kd][kk]
+                        else    d8[(long)blk * chunk * BLOCK + i * BLOCK + kd] = code;
+                    });
+                }
             } else if constexpr (U4) {
                 const uint4* src4 = reinterpret_cast<const uint4*>(
                         vu + ((long)(hk * NB + blk) * Lcap + cs) * UB);
@@ -699,7 +723,7 @@ __global__ void kv_decode_wide_kernel(
                 for (int i = tid; i < nw; i += NT) d32[i] = s32[i];
             }
             if constexpr (!VPACK) {        // v8/vpack consumed the shared plane during reconstruct/pack
-                if (!(U4 && v8)) {
+                if (!v8) {                 // v8 (u4 OR u2/u3) reconstructed int8 -> no separate shared plane
                     const unsigned char* srch = vh + ((long)(hk * NB + blk) * Lcap + cs) * SB;
                     unsigned char* dsth = pVh + (long)blk * chunk * SB;
                     for (int i = tid; i < nC * SB; i += NT) dsth[i] = srch[i];  // tiny shared plane
@@ -779,7 +803,7 @@ __global__ void kv_decode_wide_kernel(
                 a += (p * ms::e8m0_to_scale(vs[vscb + kk])) * (float)V;
             }
         }} else {                          // close if(active) + if constexpr(VPACK)
-        if (active && U4 && v8 && vt) {
+        if (active && v8 && vt) {          // u4 OR u2/u3: V staged as int8 [blk][kd][kk] (full-sector)
             // transposed+padded staging: this thread's kk-codes are CONTIGUOUS -> read 4 at a
             // time via one int32 (conflict-free, 4x fewer shared transactions). p/exp unchanged.
             const int CH = chunk + 4;
@@ -807,7 +831,7 @@ __global__ void kv_decode_wide_kernel(
                 const int j = cs + kk;
                 const float vsc = ms::e8m0_to_scale(vs[(hk * NB + blk) * Lcap + j]);
                 float vv;
-                if (U4 && v8)
+                if (v8)            // u4 OR u2/u3: V staged as reconstructed int8 (non-vt layout)
                     vv = (float)((const int8_t*)pVu)[(long)blk * chunk * BLOCK + kk * BLOCK + kd];
                 else if constexpr (U4)
                     vv = (float)ms::unpack_ms_kv_elem_u4(pVu, pVh,
@@ -2073,10 +2097,12 @@ torch::Tensor kv_decode_attention_batched_cuda(
     auto part_l = torch::empty({B, H, (int64_t)S}, fopt);
     int vpack = ((int)u == 4 && (int)gs <= 2) ? 1 : 0;
     if (const char* e = getenv("MS_KV_VPACK")) vpack = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
-    int v8 = (!vpack && (int)u == 4 && (int)gs <= 2) ? 1 : 0;
-    if (const char* e = getenv("MS_KV_V8")) v8 = (!vpack && (int)u == 4 && atoi(e) != 0) ? 1 : 0;
-    int sepsc = ((int)u == 4) ? 1 : 0;
-    if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
+    // v8: stage V reconstructed to int8 (up*2^u+sh, fits int8 since |up|<=q_max). u4/gs<=2 and
+    // ALL u2/u3 (non-vpack) -> Pass-2 reads ONE int8/elem (full-sector, no funnel) like MXINT8.
+    int v8 = (!vpack && (((int)u == 4 && (int)gs <= 2) || ((int)u == 2 || (int)u == 3))) ? 1 : 0;
+    if (const char* e = getenv("MS_KV_V8")) v8 = (!vpack && atoi(e) != 0) ? 1 : 0;
+    int sepsc = ((int)u >= 2) ? 1 : 0;             // sepsc now also for u2/u3 (specialized K-dot)
+    if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u >= 2 && atoi(e) != 0) ? 1 : 0;
     int vt = v8 ? 1 : 0;
     if (const char* e = getenv("MS_KV_VT")) vt = (v8 && atoi(e) != 0) ? 1 : 0;
     int qrot = 0;                                  // fused online Q-rotation (H_D)
