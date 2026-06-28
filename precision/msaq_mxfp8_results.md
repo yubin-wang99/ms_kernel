@@ -1,9 +1,9 @@
 # MSAQ on MXFP8 — mantissa-sharing applied to FP8 elements (E4M3 / E5M2 / E3M4)
 
-> ⚠️ **2026-06-28 PIVOT — 이 문서의 커스텀 MSAQ-E3M4(6.0b)는 하드웨어-native MXFP6-E2M3(6.25b)로 대체됨.**
-> E2M3가 정확도(8B 전 scope within-3%, MSAQ 대비 4~6배 낮은 열화)와 하드웨어(텐서코어 native, 언팩 불필요)
-> **두 축 모두**에서 E3M4-MSAQ를 능가한다. → **`precision/mxfp6_results.md`**. 아래 내용은 그 결론에 도달한
-> 여정(MSAQ가 MXINT8을 이긴 것까지는 유효; 그러나 native FP6가 둘 다 능가)으로 읽을 것.
+> ⚠️ **2026-06-28 PIVOT — 6비트 타깃이면 커스텀 MSAQ 대신 하드웨어-native MXFP6-E2M3 권장.**
+> bits-vs-QSNR Pareto에서 E2M3(6.25b)가 ~30dB를 가장 싸게 주고 **유일하게 텐서코어 native**(언팩 불필요).
+> 정정: 보정 MSAQ(efb)는 정당한 frontier 경쟁자로 **MXINT6를 이긴다**(처음의 "sharing이 손해"는 6.0b vs 6.25b
+> 비트 불공정에서 온 착시였음). E2M3가 이기는 건 "더 싼 frontier 점 + HW-native" 조합 때문. → **`precision/mxfp6_results.md`**.
 
 `precision/msaq_mxfp8_ppl.py`. MSAQ까지 INT8(MXINT8)에 적용해온 mantissa-sharing을 **FP8 원소**에 적용한다.
 block=32 + per-block E8M0 scale(=MX)는 그대로 두고, 각 원소를 FP8(sign + eb지수 + mb만티사)로 두되
