@@ -1,29 +1,29 @@
 GQA Hq=32 Hkv=8 D=128 | MXINT8 = 8.25 b/elem baseline
 
-Lk=  4096 B=1:  MXINT8    78.1us  (   111 GB/s eff)
+Lk=  4096 B=1:  MXINT8    78.0us  (   111 GB/s eff)
          cfg bytes MS/MX    MS us MX/MS spd    GB/s  (want spd≈1/(MS/MX))
-   u2/gs4        0.818    128.2    0.609x     55   ideal 1.22x
-   u3/gs16       0.667     78.0    1.000x     74   ideal 1.50x
-   u4/gs16       0.545     50.0    1.561x     94   ideal 1.83x
-   u4/gs32       0.545     49.5    1.576x     95   ideal 1.83x
+   u2/gs4        0.818     92.2    0.846x     77   ideal 1.22x
+   u3/gs16       0.667     54.0    1.444x    107   ideal 1.50x
+   u4/gs16       0.545     49.9    1.561x     94   ideal 1.83x
+   u4/gs32       0.545     49.4    1.579x     96   ideal 1.83x
 
-Lk=  4096 B=8:  MXINT8   727.2us  (    95 GB/s eff)
+Lk=  4096 B=8:  MXINT8   726.6us  (    95 GB/s eff)
          cfg bytes MS/MX    MS us MX/MS spd    GB/s  (want spd≈1/(MS/MX))
-   u2/gs4        0.818    875.4    0.831x     65   ideal 1.22x
-   u3/gs16       0.667    563.0    1.292x     82   ideal 1.50x
-   u4/gs16       0.545    315.3    2.306x    120   ideal 1.83x
-   u4/gs32       0.545    311.7    2.333x    121   ideal 1.83x
+   u2/gs4        0.818    570.7    1.273x     99   ideal 1.22x
+   u3/gs16       0.667    322.1    2.256x    143   ideal 1.50x
+   u4/gs16       0.545    314.6    2.310x    120   ideal 1.83x
+   u4/gs32       0.545    311.0    2.336x    121   ideal 1.83x
 
-Lk= 16384 B=1:  MXINT8   269.6us  (   128 GB/s eff)
+Lk= 16384 B=1:  MXINT8   269.4us  (   128 GB/s eff)
          cfg bytes MS/MX    MS us MX/MS spd    GB/s  (want spd≈1/(MS/MX))
-   u2/gs4        0.818    419.6    0.642x     67   ideal 1.22x
-   u3/gs16       0.667    281.2    0.959x     82   ideal 1.50x
-   u4/gs16       0.545    169.0    1.595x    112   ideal 1.83x
-   u4/gs32       0.545    167.1    1.613x    113   ideal 1.83x
+   u2/gs4        0.818    265.6    1.014x    107   ideal 1.22x
+   u3/gs16       0.667    170.0    1.585x    136   ideal 1.50x
+   u4/gs16       0.545    168.8    1.597x    112   ideal 1.83x
+   u4/gs32       0.545    167.2    1.612x    113   ideal 1.83x
 
-Lk= 16384 B=8:  MXINT8  2916.8us  (    95 GB/s eff)
+Lk= 16384 B=8:  MXINT8  2914.4us  (    95 GB/s eff)
          cfg bytes MS/MX    MS us MX/MS spd    GB/s  (want spd≈1/(MS/MX))
-   u2/gs4        0.818   3691.9    0.790x     61   ideal 1.22x
-   u3/gs16       0.667   2733.9    1.067x     68   ideal 1.50x
-   u4/gs16       0.545   1470.5    1.983x    103   ideal 1.83x
-   u4/gs32       0.545   1430.9    2.038x    106   ideal 1.83x
+   u2/gs4        0.818   2416.9    1.206x     94   ideal 1.22x
+   u3/gs16       0.667   1543.4    1.888x    120   ideal 1.50x
+   u4/gs16       0.545   1466.7    1.987x    103   ideal 1.83x
+   u4/gs32       0.545   1437.6    2.027x    105   ideal 1.83x

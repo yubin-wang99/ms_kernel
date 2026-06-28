@@ -696,19 +696,27 @@ __global__ void kv_decode_wide_kernel(
                         else    d8[(long)blk * chunk * BLOCK + i * BLOCK + kd] = code;
                     }
                 }
-            } else if (U_ > 0 && v8) {
-                // u2/u3 generalization of the int8-staged V (vt layout [blk][kd][kk], CH=chunk+4):
-                // reconstruct each key's 32 codes to int8 (up*2^u+sh in [-124,123]) via the funnel
-                // unpack, store TRANSPOSED so Pass-2 reads contiguous int8 (full-sector, no funnel).
-                int8_t* d8 = (int8_t*)pVu;
-                const int CH = chunk + 4;
-                for (int i = tid; i < nC; i += NT) {
-                    const long vkb = (long)(hk * NB + blk) * Lcap + cs + i;
-                    ms::stream_block_uspec_sep<U_, GS_>(vu, vh, vkb, [&](int kd, int up_code, int sh_code) {
-                        const int8_t code = (int8_t)(up_code * (1 << U_) + sh_code);
-                        if (vt) d8[(long)blk * BLOCK * CH + kd * CH + i] = code;    // [blk][kd][kk]
-                        else    d8[(long)blk * chunk * BLOCK + i * BLOCK + kd] = code;
-                    });
+            } else if constexpr (U_ > 0) {                 // if constexpr -> NOT instantiated for u4 (U_=-1)
+                if (v8) {
+                    // u2/u3 generalization of int8-staged V (vt layout [blk][kd][kk], CH=chunk+4):
+                    // reconstruct each key's 32 codes to int8 (up*2^u+sh in [-124,123]) via the funnel
+                    // unpack, store TRANSPOSED so Pass-2 reads contiguous int8 (full-sector, no funnel).
+                    int8_t* d8 = (int8_t*)pVu;
+                    const int CH = chunk + 4;
+                    for (int i = tid; i < nC; i += NT) {
+                        const long vkb = (long)(hk * NB + blk) * Lcap + cs + i;
+                        ms::stream_block_uspec_sep<U_, GS_>(vu, vh, vkb, [&](int kd, int up_code, int sh_code) {
+                            const int8_t code = (int8_t)(up_code * (1 << U_) + sh_code);
+                            if (vt) d8[(long)blk * BLOCK * CH + kd * CH + i] = code;    // [blk][kd][kk]
+                            else    d8[(long)blk * chunk * BLOCK + i * BLOCK + kd] = code;
+                        });
+                    }
+                } else {                                   // u2/u3 non-v8: raw coalesced uint32 copy
+                    const uint32_t* s32 = reinterpret_cast<const uint32_t*>(
+                            vu + ((long)(hk * NB + blk) * Lcap + cs) * UB);
+                    uint32_t* d32 = reinterpret_cast<uint32_t*>(pVu + (long)blk * chunk * UB);
+                    const int nw = (nC * UB) >> 2;
+                    for (int i = tid; i < nw; i += NT) d32[i] = s32[i];
                 }
             } else if constexpr (U4) {
                 const uint4* src4 = reinterpret_cast<const uint4*>(
@@ -2005,11 +2013,12 @@ torch::Tensor kv_decode_attention_cuda(
         // ratio ~0.85 -> ~0.52, byte-roofline) at no accuracy cost. MS_KV_VPACK=0 to revert.
         int vpack = ((int)u == 4) ? 1 : 0;
         if (const char* e = getenv("MS_KV_VPACK")) vpack = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
-        int v8 = (!vpack && (int)u == 4 && (int)gs <= 2) ? 1 : 0;
-        if (const char* e = getenv("MS_KV_V8")) v8 = (!vpack && (int)u == 4 && atoi(e) != 0) ? 1 : 0;
-        // separated-scale K dot (u4): factor scales to block level, shared term per-group.
-        int sepsc = ((int)u == 4) ? 1 : 0;
-        if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
+        // v8 int8-staged V: u4/gs<=2 and ALL u2/u3 (full-sector Pass-2). vt follows (transposed).
+        int v8 = (!vpack && (((int)u == 4 && (int)gs <= 2) || ((int)u == 2 || (int)u == 3))) ? 1 : 0;
+        if (const char* e = getenv("MS_KV_V8")) v8 = (!vpack && atoi(e) != 0) ? 1 : 0;
+        // separated-scale K dot (u2/u3/u4): factor scales to block level, shared term per-group.
+        int sepsc = ((int)u >= 2) ? 1 : 0;
+        if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u >= 2 && atoi(e) != 0) ? 1 : 0;
         // vt: transposed+padded int8 V staging -> conflict-free vectorized Pass-2 reads.
         int vt = v8 ? 1 : 0;
         if (const char* e = getenv("MS_KV_VT")) vt = (v8 && atoi(e) != 0) ? 1 : 0;
