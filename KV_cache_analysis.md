@@ -82,6 +82,28 @@ and the 18% byte saving converts only ~20% (kernel is L1TEX/staging-bound, not p
 (nibble/vpack). At B=1 (launch-bound) nibble is even marginally *slower*. So the real KV levers are
 **byte count + staging quality (vpack/v8/vt)**; nibble unpack is a ~4% bonus, not decisive.
 
+### 2c. Can u4 be sped up via the u2/u3 (v8/vt) direction? — No, vpack is already optimal
+
+u2/u3 were recently sped up to ≈u4 speed via **int8-staged V (v8/vt)** + sepsc. Does applying that same
+direction to u4 help? Measured (Lk4096, vpack default vs `MS_KV_VPACK=0 MS_KV_V8=1`):
+
+| config | vpack (current) | v8+vt (u2/u3 direction) | v8/vpack |
+|---|--:|--:|--:|
+| u4/gs2 B32 | 1872 µs (0.63) | 2257 µs (0.76) | **1.21× slower** |
+| u4/gs16 B32 | 1526 µs (0.52) | 1926 µs (0.65) | **1.26× slower** |
+
+**v8/vt is 20–26% SLOWER for u4.** Structural reason: u4's 4-bit nibble field enables **vpack**
+(packed-transposed nibble V staging — dense, smaller smem 13 vs 16.5 KB → higher occupancy). u2/u3
+(5/6-bit) *can't* nibble-pack, so v8 (reconstruct to int8, full-sector Pass-2) is their best-available
+staging; the recent v8/vt work brought them UP to u4's level, it didn't surpass it. Every transferable
+lever is already on u4: **sepsc** was u4-first (later extended to u2/u3); the transpose/conflict-free
+idea is built into vpack. So there is **no untransferred u2/u3 optimization for u4** — it's at its
+practical optimum (ncu u4/gs16 B16: DRAM 17%, L1TEX 70%, occ 37%, shared-mem-capped at 6 blk; the
+incremental occupancy levers — chunk<128, prob-buffer, warpT, GQA — are all documented NO-WIN). The
+only remaining accelerant is the cp.async + tensor-core MMA GQA flash-decode REWRITE, which is common
+to all configs (not u4-specific) and high-risk (Phase-37 WMMA-P·V failed). Driver: `tests/kv_batch_bench.py`
+with `MS_KV_VPACK`/`MS_KV_V8` env toggles.
+
 ---
 
 ## 3. Accuracy budget (gs sweep)
