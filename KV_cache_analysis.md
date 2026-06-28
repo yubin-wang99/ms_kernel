@@ -63,6 +63,25 @@ At gs16 MSAQ reads at **higher** useful BW than MXINT8 (98 vs 93 GB/s) AND fewer
 0.545 byte-roofline. **ncu** (gs16, B16): DRAM **17%**, L1TEX **70%** (bottleneck), occ 37% (shared-mem
 caps at 6 blk). The kernel is L1TEX/shared-bound, not DRAM-bound.
 
+### 2b. Does nibble alignment matter? — modest (~4%), not decisive
+
+Measured u4 (nibble) vs u3/u2 (straddle) at the SAME gs16 (only the unshared-field width differs),
+KV decode, Lk4096:
+
+| | u2/gs16 (26 B/blk) | u3/gs16 (22 B/blk) | u4/gs16 (18 B/blk, nibble) |
+|---|--:|--:|--:|
+| B=1  | 57.4 µs (0.45) | 57.4 µs (0.45) | 59.5 µs (0.46) |
+| B=16 | 898.7 µs (0.59) | 859.8 µs (0.57) | **823.9 µs (0.55)** |
+| B=32 | 1622.6 µs (0.55) | 1596.7 µs (0.54) | **1536.0 µs (0.52)** |
+
+Unlike weight read (byte-flat — see `nibble_analysis.md`), KV decode **is** read/byte-sensitive: at
+B≥16 the time is **monotonic in bytes** (u4 18B < u3 22B < u2 26B), so the read is on the critical
+path. **But nibble alignment per se is only a ~4% edge**: u4 vs u3 at B32 = 1536 vs 1597 µs (3.8%),
+and the 18% byte saving converts only ~20% (kernel is L1TEX/staging-bound, not pure-byte-bound). The
+**v8/vt int8-staging closed most of the straddle penalty**, so u3 (straddle) nearly matches u4
+(nibble/vpack). At B=1 (launch-bound) nibble is even marginally *slower*. So the real KV levers are
+**byte count + staging quality (vpack/v8/vt)**; nibble unpack is a ~4% bonus, not decisive.
+
 ---
 
 ## 3. Accuracy budget (gs sweep)

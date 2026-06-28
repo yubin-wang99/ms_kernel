@@ -15,8 +15,9 @@ unpack). Question: does the cheap nibble unpack make weight READ faster?
 something *other* than the quantized read/unpack (output write, WMMA compute, or launch latency), so
 the cheap nibble unpack never converts to time. Measured u4 (nibble) directly against u2/u3 (straddle)
 on every vehicle, including a u4/gs16 spec added to the deployed throughput kernel: u4 is identical
-(fused_skinny) or even *slower* (decode GEMV), never a meaningful win. This is the **opposite** of KV
-read, where nibble (u4) is decisive because the unpack/staging is on the critical path.
+(fused_skinny) or even *slower* (decode GEMV), never a meaningful win. Contrast KV read, where the
+read IS on the critical path so nibble has a **modest ~4% edge** (still not decisive — byte count and
+staging quality matter more; see Contrast section).
 
 ---
 
@@ -89,16 +90,20 @@ u4 1.73 < u3 1.99 < u2 2.02 ms — here nibble *is* faster. But this path is **1
 In none of them is the quantized **read/unpack** the critical path, so the nibble's cheap-`bfe`
 advantage never converts. Plus weight accuracy forces u2/u3 (u4 dead), so deployment is non-nibble.
 
-## Contrast — KV read, where nibble DOES matter
+## Contrast — KV read, where nibble has a (modest) edge
 
-| | nibble (u4) decisive? | binding constraint |
+| | nibble (u4) edge | binding constraint |
 |---|---|---|
-| **weight read** | ❌ no | bf16 write / WMMA compute / launch |
-| **KV read** | ✅ yes | per-element unpack + L1TEX shared staging (on the critical path) |
+| **weight read** | ❌ 0% (or slower) | bf16 write / WMMA compute / launch |
+| **KV read** | ⚠️ ~4% (B≥16) | per-element unpack + L1TEX shared staging (read on the critical path) |
 
-KV decode is L1TEX/shared-bound on per-element unpack+staging; u4 (nibble) enables the fast **vpack**
-V-staging path → u4/gs16 wins (KV-read mq/mx 0.52, byte-roofline). See `KV_cache_analysis.md`.
-**Rule: nibble alignment helps only where unpack is the bottleneck. Weight read isn't; KV read is.**
+KV decode IS read/byte-sensitive (unlike weight): measured u4/u3/u2 at gs16, B32 = 1536 / 1597 /
+1623 µs — **monotonic in bytes** (18/22/26 B/blk), so the read binds. **But nibble per se is only a
+~4% edge** (u4 vs u3 B32 = 3.8%): the 18% byte saving converts only ~20% (L1TEX/staging-bound, not
+pure-byte), and the v8/vt int8-staging closed most of the straddle penalty so u3 nearly matches u4.
+The real KV levers are **byte count + staging quality (vpack/v8/vt)**, not nibble unpack. Full numbers
+in `KV_cache_analysis.md` §2b. **Rule: nibble helps where the read/unpack binds — KV read (~4%) yes,
+weight read (write/compute-bound) no.**
 
 ---
 
