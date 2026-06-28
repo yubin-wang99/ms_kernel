@@ -1,0 +1,7 @@
+wikitext-2: 304,838 tokens | BF16 PPL = 6.9955 | block=32 | * = HW-native MX element
+
+      scope |MXFP6-E3M2*(6.25b)MXFP6-E2M3*(6.25b)  E3M4-MSAQ(6.00b)MXINT8-MSAQ(6.00b)MXFP8-E4M3*(8.25b)
+     weight |          +8.60% X         +0.87% OK          +4.14% X          +4.22% X         +0.60% OK
+ weight+act |          +8.60% X         +2.11% OK          +6.59% X         +10.68% X         +1.40% OK
+         KV |          +3.69% X         +0.75% OK         +1.52% OK         +1.82% OK         +0.79% OK
+  weight+KV |         +14.37% X         +1.61% OK          +6.10% X          +6.36% X         +1.29% OK

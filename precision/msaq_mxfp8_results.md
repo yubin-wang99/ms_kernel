@@ -1,5 +1,10 @@
 # MSAQ on MXFP8 — mantissa-sharing applied to FP8 elements (E4M3 / E5M2 / E3M4)
 
+> ⚠️ **2026-06-28 PIVOT — 이 문서의 커스텀 MSAQ-E3M4(6.0b)는 하드웨어-native MXFP6-E2M3(6.25b)로 대체됨.**
+> E2M3가 정확도(8B 전 scope within-3%, MSAQ 대비 4~6배 낮은 열화)와 하드웨어(텐서코어 native, 언팩 불필요)
+> **두 축 모두**에서 E3M4-MSAQ를 능가한다. → **`precision/mxfp6_results.md`**. 아래 내용은 그 결론에 도달한
+> 여정(MSAQ가 MXINT8을 이긴 것까지는 유효; 그러나 native FP6가 둘 다 능가)으로 읽을 것.
+
 `precision/msaq_mxfp8_ppl.py`. MSAQ까지 INT8(MXINT8)에 적용해온 mantissa-sharing을 **FP8 원소**에 적용한다.
 block=32 + per-block E8M0 scale(=MX)는 그대로 두고, 각 원소를 FP8(sign + eb지수 + mb만티사)로 두되
 **만티사 하위 u비트를 mg개 원소가 공유**(원소별 지수 단위로 정규화해 적용 → 서로 다른 지수에도 올바르게 더해짐).
