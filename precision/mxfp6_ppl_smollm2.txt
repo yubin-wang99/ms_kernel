@@ -1,7 +1,10 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/218 [00:00<?, ?it/s]Loading weights: 100%|██████████| 218/218 [00:00<00:00, 6949.33it/s]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (304838 > 8192). Running this sequence through the model will result in indexing errors
 wikitext-2: 304,838 tokens | BF16 PPL = 6.9955 | block=32 | * = HW-native MX element
 
-      scope |MXFP6-E3M2*(6.25b)MXFP6-E2M3*(6.25b)  E3M4-MSAQ(6.00b)MXINT8-MSAQ(6.00b)MXFP8-E4M3*(8.25b)
-     weight |          +8.60% X         +0.87% OK          +4.14% X          +4.22% X         +0.60% OK
- weight+act |          +8.60% X         +2.11% OK          +6.59% X         +10.68% X         +1.40% OK
-         KV |          +3.69% X         +0.75% OK         +1.52% OK         +1.82% OK         +0.79% OK
-  weight+KV |         +14.37% X         +1.61% OK          +6.10% X          +6.36% X         +1.29% OK
+      scope |  MXFP6-E2M3*(6.25b)INT8-MSAQ.efb(6.00b)INT8-MSAQ.efb(6.50b)INT8-MSAQ.mean(6.00b)E3M4-MSAQ.efb(6.00b)  MXFP8-E4M3*(8.25b)
+     weight |           +0.87% OK            +3.46% X           +1.52% OK            +4.22% X            +4.14% X           +0.60% OK
+ weight+act |           +2.11% OK            +9.09% X            +3.33% X           +10.68% X            +6.59% X           +1.40% OK
+         KV |           +0.75% OK           +1.60% OK           +0.56% OK           +1.82% OK           +1.52% OK           +0.79% OK
+  weight+KV |           +1.61% OK            +5.50% X           +2.14% OK            +6.36% X            +6.10% X           +1.29% OK

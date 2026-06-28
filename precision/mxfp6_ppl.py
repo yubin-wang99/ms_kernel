@@ -12,7 +12,7 @@ Plain MXFP{6,8} = msaq_mxfp8(u=0) (no sharing). Run:
         python precision/mxfp6_ppl.py > precision/mxfp6_ppl_llama31_8b.txt 2>&1
 """
 import os, torch, torch.nn.functional as F
-from msaq_mxfp8_ppl import msaq_mxfp8, msaq_mxint8, BLOCK
+from msaq_mxfp8_ppl import msaq_mxfp8, msaq_mxint8, msaq_mxint8_efb, BLOCK
 
 DEV = "cuda"
 MAXLEN, STRIDE, MAX_WINDOWS = 2048, 1024, 30
@@ -23,11 +23,12 @@ LABEL = {"weight": "weight", "wa": "weight+act", "kv": "KV", "wkv": "weight+KV"}
 # (name, bits/elem, quant fn) — the columns. Plain MXFP6/8 are hardware-native (no sharing);
 # the two 6.0b MSAQ formats are the custom (CUDA-core) references.
 COLUMNS = [
-    ("MXFP6-E3M2*", 6.25, lambda x: msaq_mxfp8(x, 0, 1, 3, 2)),   # HW-native
-    ("MXFP6-E2M3*", 6.25, lambda x: msaq_mxfp8(x, 0, 1, 2, 3)),   # HW-native
-    ("E3M4-MSAQ",   6.00, lambda x: msaq_mxfp8(x, 3, 4, 3, 4, efb_iters=2)),
-    ("MXINT8-MSAQ", 6.00, lambda x: msaq_mxint8(x, 3, 4)),
-    ("MXFP8-E4M3*", 8.25, lambda x: msaq_mxfp8(x, 0, 1, 4, 3)),   # HW-native anchor (more bits)
+    ("MXFP6-E2M3*",   6.25, lambda x: msaq_mxfp8(x, 0, 1, 2, 3)),          # HW-native (the candidate)
+    ("INT8-MSAQ.efb", 6.00, lambda x: msaq_mxint8_efb(x, 3, 4, 2)),        # CORRECTED INT MSAQ, matched-ish
+    ("INT8-MSAQ.efb", 6.50, lambda x: msaq_mxint8_efb(x, 2, 8, 2)),        # CORRECTED, slightly more bits
+    ("INT8-MSAQ.mean", 6.00, lambda x: msaq_mxint8(x, 3, 4)),              # naive (correction delta)
+    ("E3M4-MSAQ.efb", 6.00, lambda x: msaq_mxfp8(x, 3, 4, 3, 4, efb_iters=2)),
+    ("MXFP8-E4M3*",   8.25, lambda x: msaq_mxfp8(x, 0, 1, 4, 3)),          # HW-native anchor (more bits)
 ]  # * = standard MX element -> rides native block-scaled tensor cores
 
 
@@ -96,13 +97,13 @@ def main():
         _KV["on"] = False; restore()
         return (p / bf - 1) * 100
 
-    hdr = "".join(f"{nm}({b:.2f}b)".rjust(18) for nm, b, _ in COLUMNS)
+    hdr = "".join(f"{nm}({b:.2f}b)".rjust(20) for nm, b, _ in COLUMNS)
     print(f"{'scope':>11} |{hdr}", flush=True)
     for scope in SCOPES:
         cells = []
         for nm, b, qfn in COLUMNS:
             pct = run(scope, qfn)
-            cells.append(f"{pct:+.2f}% {'OK' if pct <= 3 else 'X'}".rjust(18))
+            cells.append(f"{pct:+.2f}% {'OK' if pct <= 3 else 'X'}".rjust(20))
         print(f"{LABEL[scope]:>11} |" + "".join(cells), flush=True)
 
 

@@ -143,6 +143,29 @@ def msaq_mxint8(x, u, mg):
     return (q_un * s_un + shared * s_base).reshape(x.shape)
 
 
+def msaq_mxint8_efb(x, u, mg, efb_iters=2):
+    """MXINT8-MSAQ with ERROR-FEEDBACK coordinate descent (the INT analog of msaq_mxfp8's efb).
+    For INT8 all elements share one linear scale, so wshare = plain mean (uniform weight); the gain
+    is re-rounding the upper code after `shared` is fixed. efb_iters=0 reduces to msaq_mxint8 (mean).
+    Same stored format (upper (8-u)-bit + shared u-bit/mg + E8M0) -> decode unchanged, encoder-only."""
+    xf = x.reshape(-1, BLOCK).to(torch.float32)
+    absmax = xf.abs().amax(-1, keepdim=True).clamp(min=1e-30)
+    q_max = (1 << (7 - u)) - 1
+    s_base = torch.exp2(torch.floor(torch.log2(absmax / 64.0)))
+    s_un = s_base * float(1 << u)
+    s_min, s_max = -(1 << (u - 1)), (1 << (u - 1)) - 1
+    q_un = torch.round(xf / s_un).clamp(-q_max, q_max)
+    shared = None
+    for it in range(max(1, efb_iters + 1)):
+        res = xf - q_un * s_un
+        shared = torch.round(res.reshape(res.shape[0], -1, mg).mean(-1, keepdim=True)
+                             .expand(-1, -1, mg).reshape(res.shape) / s_base).clamp(s_min, s_max)
+        if it == efb_iters:
+            break
+        q_un = torch.round((xf - shared * s_base) / s_un).clamp(-q_max, q_max)   # efb: re-round upper
+    return (q_un * s_un + shared * s_base).reshape(x.shape)
+
+
 def bits_mxint8(u, mg):
     return (8 - u) + u / mg + 8.0 / BLOCK
 

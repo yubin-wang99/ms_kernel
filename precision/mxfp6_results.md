@@ -4,25 +4,28 @@
 직접 내보내야 가속 가능")의 후속으로, **하드웨어-native MXFP6**(E3M2/E2M3, 6-bit 원소 + UE8M0 블록 스케일 = 6.25 b/elem)가
 커스텀 6.0b MSAQ와 정확도가 대등한지 측정했다.
 
-## 결과 — 결정적: MXFP6-E2M3가 모든 ~6비트 MSAQ를 압도
+## 결과 — MXFP6-E2M3 vs **보정** MSAQ (efb 포함, 공정 비교)
 
-**Llama-3.1-8B** (wikitext-2, BF16 PPL=5.6877). BF16 대비 PPL 증가율(%), within 3% 기준. `*` = 표준 MX 원소(텐서코어 native).
+**Llama-3.1-8B** (wikitext-2, BF16 PPL=5.6877). BF16 대비 PPL 증가율(%), within 3% 기준. `*` = 표준 MX 원소
+(텐서코어 native). INT8-MSAQ는 **보정(efb)** 과 naive(mean)를 함께 표기.
 
-| scope | MXFP6-E3M2* 6.25b | **MXFP6-E2M3* 6.25b** | E3M4-MSAQ 6.0b | MXINT8-MSAQ 6.0b | MXFP8-E4M3* 8.25b |
-|---|--:|--:|--:|--:|--:|
-| weight | +1.68 ✓ | **+0.54 ✓** | +2.57 ✓ | +2.98 ✓ | +0.48 ✓ |
-| weight+act | +3.54 ✗ | **+1.17 ✓** | +4.27 ✗ | +6.02 ✗ | +0.88 ✓ |
-| KV | +1.52 ✓ | **+0.36 ✓** | +0.96 ✓ | +0.99 ✓ | +0.36 ✓ |
-| weight+KV | +3.08 ✗ | **+0.87 ✓** | +3.48 ✗ | +4.29 ✗ | +0.79 ✓ |
+| scope | **E2M3* 6.25b** | INT8-MSAQ.efb 6.0b | INT8-MSAQ.efb 6.5b | INT8-MSAQ.mean 6.0b | E3M4-MSAQ.efb 6.0b | E4M3* 8.25b |
+|---|--:|--:|--:|--:|--:|--:|
+| weight | **+0.54** | +2.70 | +0.82 | +2.98 | +2.57 | +0.48 |
+| weight+act | **+1.17** | +5.50 ✗ | +1.73 | +6.02 ✗ | +4.27 ✗ | +0.88 |
+| KV | +0.36 | +0.94 | **+0.28** | +0.99 | +0.96 | +0.36 |
+| weight+KV | **+0.87** | +3.73 ✗ | +1.18 | +4.29 ✗ | +3.48 ✗ | +0.79 |
 
-(proxy SmolLM2-1.7B도 동일 순위, 격차 더 큼: E2M3 weight+act +2.11 vs E3M4 +6.59 vs INT8 +10.68. `mxfp6_ppl_smollm2.txt`.)
+(proxy SmolLM2도 동일 경향: INT8-MSAQ.efb 6.5b weight+act +3.33 vs E2M3 +2.11; KV +0.56 vs +0.75. `mxfp6_ppl_smollm2.txt`.)
 
-- **MXFP6-E2M3가 ~6비트에서 유일하게 전 scope within-3%.** E3M4-MSAQ·MXINT8-MSAQ 대비 큰 차로 우세.
-  ⚠️ 단 위 표의 MSAQ는 **6.0b**라 0.25b 불리하고, INT8-MSAQ는 **naive(mean)** 였다 — **보정 MSAQ를 같은/조금 더 많은
-  비트로 주면 격차가 크게 좁혀진다**(아래 "검증" Pareto frontier 참조). E2M3의 진짜 우위는 "frontier에서 ~30dB를 가장
-  싸게 + 하드웨어-native"이지, "MSAQ가 못 쓴다"가 아니다.
-- **8.25b E4M3에 근접**(weight+act +1.17 vs +0.88)하면서 **2비트 저렴**.
-- **E3M2(지수3/만티사2)는 나쁘다**(+3.5%) — 지수에 비트를 낭비. **E2M3(지수2/만티사3)가 정답**.
+- **보정(efb)이 naive(mean)를 일관되게 개선** — 6.0b 전 scope에서 mean보다 낮음(weight 2.98→2.70, act 6.02→5.50,
+  wKV 4.29→3.73). 처음 비교에 쓴 naive INT-MSAQ는 MSAQ에 불리했다.
+- **INT8-MSAQ.efb 6.5b는 진짜 경쟁자** — 8B 전 scope within-3% 통과(act +1.73), 그리고 **KV에선 E2M3를 이긴다**
+  (+0.28 vs +0.36; 정수 grid가 KV outlier에 강함). 즉 **"보정 MSAQ가 못 쓴다"는 틀렸다**(사용자 지적 맞음).
+- **그래도 E2M3 6.25b가 전체 최선** — weight/act/wKV 모두 우세, **+0.25b 더 싸고**(6.25 vs 6.5), 8.25b E4M3에 근접
+  (act 1.17 vs 0.88)하며 2비트 저렴. **결정타는 E2M3만 하드웨어-native**라는 점(아래 함의).
+- 요약: **E2M3 ≈ INT8-MSAQ.efb 6.5b**로 박빙(E2M3가 약간 앞·약간 쌈, INT은 KV 강점). 동률에 가까우면 **HW-native인
+  E2M3가 이긴다**. 둘 다 ~6비트에서 실사용 가능.
 
 ## 검증 — confound 아님, 그리고 더 일반적인 진실 (`mxfp6_verify.py`)
 
