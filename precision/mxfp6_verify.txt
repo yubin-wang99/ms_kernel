@@ -1,0 +1,32 @@
+(A) E2M3 msaq vs independent-clean: max|Δ|=3.91e-03  (0 ⇒ msaq_mxfp8(u=0,2,3) IS standard MXFP6-E2M3)
+(B) E2M3 per-block scale: blocks=131072 (=numel/32=131072), max frac(log2 s)=0.0e+00 (0 ⇒ pure E8M0 power-of-2, per-32-block, NOT per-tensor)
+
+== synthetic Gaussian W*0.02  shape=(2048, 2048)  absmax=0.102 ==
+             format  bits  QSNR(dB)
+         E2M3(msaq)  6.25     31.05
+        E2M3(clean)  6.25     31.05
+             MXINT6  6.25     30.13
+       E3M4-MSAQ6.0  6.00     23.47
+       E3M4-MSAQ6.5  6.50     27.28
+     MXINT8-MSAQ6.0  6.00     25.51
+         E4M3(8.25)  8.25     31.45
+
+== real Llama layers.0.mlp.down_proj.weight  shape=(4096, 14336)  absmax=0.617 ==
+             format  bits  QSNR(dB)
+         E2M3(msaq)  6.25     30.90
+        E2M3(clean)  6.25     30.90
+             MXINT6  6.25     29.53
+       E3M4-MSAQ6.0  6.00     23.55
+       E3M4-MSAQ6.5  6.50     27.33
+     MXINT8-MSAQ6.0  6.00     24.97
+         E4M3(8.25)  8.25     31.41
+
+== real Llama layers.0.self_attn.q_proj.weight  shape=(4096, 4096)  absmax=0.754 ==
+             format  bits  QSNR(dB)
+         E2M3(msaq)  6.25     29.98
+        E2M3(clean)  6.25     29.98
+             MXINT6  6.25     27.65
+       E3M4-MSAQ6.0  6.00     25.72
+       E3M4-MSAQ6.5  6.50     28.75
+     MXINT8-MSAQ6.0  6.00     23.42
+         E4M3(8.25)  8.25     31.37

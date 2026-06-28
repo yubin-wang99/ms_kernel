@@ -22,6 +22,32 @@
 - **8.25b E4M3에 근접**(weight+act +1.17 vs +0.88)하면서 **2비트 저렴**.
 - **E3M2(지수3/만티사2)는 나쁘다**(+3.5%) — 지수에 비트를 낭비. **E2M3(지수2/만티사3)가 정답**.
 
+## 검증 — confound 아님, 그리고 더 일반적인 진실 (`mxfp6_verify.py`)
+
+"6.25b가 6.0b를 4~6배 이기는 게 이상하다, per-tensor scale이나 다른 요소가 침투한 것 아니냐"는 의심을 직접 점검:
+
+- **(A) 구현 버그 없음**: `msaq_mxfp8(u=0,2,3)` == 독립 재구현(E2M3 FP6 그리드를 직접 enumerate해 nearest-snap)
+  이 max|Δ|=3.9e-3(bf16 수준). 진짜 표준 MXFP6-E2M3다.
+- **(B) per-tensor scale 침투 없음**: 스케일이 순수 E8M0 power-of-2(`frac(log2 s)=0`), 블록 수 = numel/32 정확
+  → **per-32-block E8M0뿐, per-tensor 아님**. 모든 비교 포맷이 동일한 블록 스케일을 쓴다.
+- **(C) 신뢰성 있는 새 사실 — "E2M3 마법"이 아니라 sharing 자체가 손해**: 공유 없는 **MXINT6**(plain 6-bit 정수
+  + 같은 E8M0, 6.25b)조차 MSAQ 6.0b를 5~7 dB 이긴다. 즉 핵심은 E2M3가 아니라 **비트-공유(MSAQ) vs 비공유**다.
+- **(D) 비트 예산 차이 아님**: MSAQ에 0.25b를 더 줘도(E3M4-MSAQ 6.5b = 28.8 dB) E2M3 6.25b(30.0 dB)를 못 따라온다.
+
+QSNR(dB), 실제 Llama q_proj 가중치 (전체 표 `mxfp6_verify.txt`, 합성·down_proj도 동일 순위):
+
+| 포맷 | bits | QSNR | 공유? |
+|---|--:|--:|---|
+| **MXFP6-E2M3** | 6.25 | **29.98** | 비공유(native FP6) |
+| MXINT6 (plain) | 6.25 | 27.65 | 비공유(native INT6) |
+| E3M4-MSAQ 6.5b | 6.50 | 28.75 | 공유 |
+| E3M4-MSAQ 6.0b | 6.00 | 25.72 | 공유 |
+| MXINT8-MSAQ 6.0b | 6.00 | 23.42 | 공유 |
+| MXFP8-E4M3 8.25b | 8.25 | 31.37 | 비공유 |
+
+→ **비공유 6.25b(E2M3>INT6)가 공유 6.0b(E3M4·MXINT8 MSAQ)를 일관되게 능가.** MSAQ의 mantissa/bit 공유가
+  ~6비트에선 역효과. E2M3는 그 중 최고(mantissa 중심 FP6) + 유일한 하드웨어 native.
+
 ## 왜 — MSAQ가 푼 문제가 애초에 잘못됐다
 
 per-block E8M0 스케일이 이미 dynamic range를 공급하므로, 6비트는 **지수가 아니라 mantissa에 써야** 한다(E2M3: 3/6이
