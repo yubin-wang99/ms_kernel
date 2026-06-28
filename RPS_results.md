@@ -396,3 +396,38 @@ How much the KV-quant win grows when decode dominates total (prefill = tie). Eac
 | 128 | 1.15× | 1.09× | 1.08× | 1.08× |
 | 512 | 1.17× | 1.14× | 1.11× | 1.13× |
 
+---
+
+## S3 KV-only — rotation-free u3 variants (L_in=1024, L_out=128)
+
+KV **u3** (5-bit unshared) is robust **without** H128 rotation (gs16 +1.20% PPL, gs32 +1.19%), whereas
+**u4** needs rotation (+2.58% with, +6.44% without — see `KV_cache_analysis.md`). How does a
+rotation-free u3 KV compare to the deployed **u4/gs16** in RPS? (S3 = bf16 weights, MSAQ KV.)
+
+**Request throughput — RPS (req/s):**
+
+| B | bf16 | MXINT8 | u4/gs16 (4.5b, +rot) | u3/gs16 (5.5b, **no-rot**) | u3/gs32 (5.5b, **no-rot**) |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 0.258 | 0.261 | 0.269 | 0.270 | 0.265 |
+| 8 | 0.981 | 1.117 | 1.311 | 1.304 | 1.241 |
+| 16 | 1.209 | 1.654 | 1.813 | 1.801 | 1.692 |
+| 32 | 1.452 | 2.169 | 2.458 | **2.465** | 2.311 |
+
+**Speedup (mq/mx · mq/bf):**
+
+| B | u4/gs16 | u3/gs16 (no-rot) | u3/gs32 (no-rot) |
+|--:|--:|--:|--:|
+| 8 | 1.17× · 1.34× | 1.17× · 1.33× | 1.11× · 1.27× |
+| 16 | 1.10× · 1.50× | 1.09× · 1.49× | 1.02× · 1.40× |
+| 32 | 1.13× · 1.69× | **1.14× · 1.70×** | 1.07× · 1.59× |
+
+**Findings:**
+- **u3/gs16 ≈ u4/gs16 in RPS** (B32 2.465 vs 2.458; mq/mx 1.14 vs 1.13) — matches the deployed config
+  while being **rotation-free** and **more accurate** (+1.20% vs +2.58% PPL). Cost: **+1.0 bits/elem**
+  (5.5 vs 4.5). The extra byte doesn't slow RPS because KV decode is L1TEX/staging-bound (the ~4%
+  isolated-decode gap dilutes to ~0 in this prefill-heavy L_out=128 workload).
+- **u3/gs32 is worse** (B32 RPS 2.311 vs u3/gs16 2.465) despite identical bytes (both 5.5b) — the gs32
+  kernel path is slower with no accuracy gain. **u3/gs16 dominates u3/gs32.**
+- Bottom line: **u3/gs16 is a compelling rotation-free alternative to u4/gs16** — same RPS, no QuaRot
+  rotation, better accuracy, at +1 bit/elem.
+
