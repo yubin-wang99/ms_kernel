@@ -9,11 +9,13 @@ import torch
 ap = argparse.ArgumentParser()
 ap.add_argument("--reps", type=int, default=12)
 ap.add_argument("--Bs", default="1,8,32")
+ap.add_argument("--lout", type=int, default=128)
 a = ap.parse_args()
 BS = [int(x) for x in a.Bs.split(",")]
-LIN, LOUT = 1024, 128
+LIN, LOUT = 1024, a.lout
+SUF = "" if LOUT == 128 else f"_l{LOUT}"            # keep base name for the canonical L_out=128 run
 outdir = os.path.dirname(os.path.abspath(__file__))
-jf = open(os.path.join(outdir, "harness_perscope_results_260625.jsonl"), "w")
+jf = open(os.path.join(outdir, f"harness_perscope_results_260625{SUF}.jsonl"), "w")
 lines = []
 def emit(s): print(s, flush=True); lines.append(s)
 
@@ -50,6 +52,6 @@ for scn, wstyle, kvq in H.SCENARIOS:
 
 emit("(mq=MSAQ mx=MXINT8 bf=bf16. prefill=TTFT(1024 tok), decode=integrated over 128 steps, total=sum.)")
 jf.close()
-with open(os.path.join(outdir, "harness_perscope_results_260625.md"), "w") as f:
+with open(os.path.join(outdir, f"harness_perscope_results_260625{SUF}.md"), "w") as f:
     f.write("\n".join(lines) + "\n")
 print(f"\n[wrote] tests/harness_perscope_results_260625.md + .jsonl")

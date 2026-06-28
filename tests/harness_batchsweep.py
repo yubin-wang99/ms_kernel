@@ -344,7 +344,7 @@ def variants(u=4, gs=2):                                 # (fmt,u,gs); only MSAQ
     return [("bf16", u, gs), ("mxint8", u, gs), ("msaq", u, gs)]
 
 # per-scope max-aggressive robust config (scope_uvgs_results.md; S3 uses the u=4 nibble since robust)
-PERSCOPE_CFG = {"S1 W-only": (3, 16), "S2 W+A": (2, 8), "S3 KV-only": (4, 2),
+PERSCOPE_CFG = {"S1 W-only": (3, 16), "S2 W+A": (2, 8), "S3 KV-only": (4, 16),
                 "S4 W-only+KV": (2, 8), "S5 W+A+KV": (2, 8),
                 "S6 W+A+KV+AA": (2, 8)}    # AA forces u2 everywhere (u4 nibble accuracy-dead)
 

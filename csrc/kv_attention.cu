@@ -2000,7 +2000,10 @@ torch::Tensor kv_decode_attention_cuda(
         // smem costs occupancy, so default off there. MS_KV_V8 forces (0/1).
         // vpack (transposed-packed nibble V staging) is DEFAULT for u4/gs<=2 -- beats v8+vt ~10%
         // (smaller smem 13 vs 16.5 KB -> higher occupancy). MS_KV_VPACK=0 falls back to v8+vt.
-        int vpack = ((int)u == 4 && (int)gs <= 2) ? 1 : 0;
+        // vpack is the fast V path for ALL u4 gs (was gated gs<=2; gs>2 fell to the slow
+        // plain-staging fallback). Measured: forcing vpack at gs4/8/16/32 wins (B32 KV-read
+        // ratio ~0.85 -> ~0.52, byte-roofline) at no accuracy cost. MS_KV_VPACK=0 to revert.
+        int vpack = ((int)u == 4) ? 1 : 0;
         if (const char* e = getenv("MS_KV_VPACK")) vpack = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
         int v8 = (!vpack && (int)u == 4 && (int)gs <= 2) ? 1 : 0;
         if (const char* e = getenv("MS_KV_V8")) v8 = (!vpack && (int)u == 4 && atoi(e) != 0) ? 1 : 0;
@@ -2095,7 +2098,7 @@ torch::Tensor kv_decode_attention_batched_cuda(
     auto part_o = torch::empty({B, H, (int64_t)S, D}, fopt);
     auto part_m = torch::empty({B, H, (int64_t)S}, fopt);
     auto part_l = torch::empty({B, H, (int64_t)S}, fopt);
-    int vpack = ((int)u == 4 && (int)gs <= 2) ? 1 : 0;
+    int vpack = ((int)u == 4) ? 1 : 0;             // vpack default for ALL u4 gs (see single-token note)
     if (const char* e = getenv("MS_KV_VPACK")) vpack = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
     // v8: stage V reconstructed to int8 (up*2^u+sh, fits int8 since |up|<=q_max). u4/gs<=2 and
     // ALL u2/u3 (non-vpack) -> Pass-2 reads ONE int8/elem (full-sector, no funnel) like MXINT8.
