@@ -110,6 +110,8 @@ def wonly_gemm(p, X_bf16):
     shc = torch.from_numpy(p["shared_cm"]).to(dev)
     if os.environ.get("MS_GEMM_SCALAR") == "1":
         return _OPS.wonly_gemm_cm(X_bf16, s, upc, shc, *args)
+    # wonly_gemm_tc itself routes small-M (<=64, u3/gs16 & u2/gs8) to the skinny
+    # split-K kernel — the dispatch lives in the kernel host (csrc/wa_gemm.cu).
     return _OPS.wonly_gemm_tc(X_bf16, s, upc, shc, *args)
 
 

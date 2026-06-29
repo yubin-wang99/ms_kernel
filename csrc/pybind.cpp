@@ -96,6 +96,9 @@ torch::Tensor wonly_gemm_fused_skinny_cuda(
 torch::Tensor mxint8_gemm_fused_skinny_cuda(
     torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
     int64_t M, int64_t OUT, int64_t K, int64_t NB);
+torch::Tensor mxint8_wa_gemm_fused_skinny_cuda(
+    torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+    int64_t M, int64_t OUT, int64_t K, int64_t NB);
 torch::Tensor wa_gemm_fused_imma_cuda(
     torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
     int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
@@ -274,6 +277,8 @@ TORCH_LIBRARY(msaq, m) {
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wonly_gemm_fused_skinny_cuda);
     m.def("mxint8_gemm_fused_skinny(Tensor X, Tensor scale_exp, Tensor qweight_cm, "
           "int M, int OUT, int K, int NB) -> Tensor", &mxint8_gemm_fused_skinny_cuda);
+    m.def("mxint8_wa_gemm_fused_skinny(Tensor X, Tensor scale_exp, Tensor qweight_cm, "
+          "int M, int OUT, int K, int NB) -> Tensor", &mxint8_wa_gemm_fused_skinny_cuda);
     m.def("wa_gemm_fused_imma(Tensor X, Tensor scale_exp, Tensor upper_cm, Tensor shared_cm, "
           "int M, int OUT, int K, int NB, int u, int gs) -> Tensor", &wa_gemm_fused_imma_cuda);
     m.def("wa_gemm(Tensor X, Tensor scale_exp, Tensor upper, Tensor shared, "

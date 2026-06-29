@@ -1173,9 +1173,25 @@ torch::Tensor mxint8_wa_gemv_batched_wide_cuda(
     return y;
 }
 
+// Defined in wa_gemm.cu ("FAIR MXINT8 twin" of the MSAQ skinny host): same adaptive
+// NT + split-K + combine dispatch, only the weight format differs. Forward-declared
+// here so the small-M dispatch below can route to it (matched to the MSAQ path).
+torch::Tensor mxint8_gemm_fused_skinny_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB);
+
 torch::Tensor mxint8_gemm_cm_cuda(
         torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
         int64_t M, int64_t OUT, int64_t K, int64_t NB) {       // BF16 WMMA pipe + column-major
+    // Small-M: the 64x64 tile underfills the GPU; route to the skinny 16-row + split-K
+    // kernel so the MSAQ-vs-MXINT8 comparison stays matched (each format on its own best
+    // path). Capped at M<=128: plain int8 needs no unpack, so the base WMMA-pipe is
+    // already efficient at moderate M and skinny's split-K overhead turns net-negative by
+    // M=256 (measured 0.71x) — unlike MSAQ (expensive unpack) which keeps winning to 256.
+    // Override with MS_NO_SKINNY=1.
+    if (M <= 128 && !(getenv("MS_NO_SKINNY") && atoi(getenv("MS_NO_SKINNY")) != 0)) {
+        return mxint8_gemm_fused_skinny_cuda(X, scale_exp, qweight_cm, M, OUT, K, NB);
+    }
     auto Y = torch::empty({M, OUT}, X.options());
     mxint8_gemm_wmma_pipe<true><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
@@ -1184,9 +1200,22 @@ torch::Tensor mxint8_gemm_cm_cuda(
     return Y;
 }
 
+// Defined in wa_gemm.cu (FAIR MXINT8 W+A twin of the MSAQ skinny path). Forward-declared
+// so the small-M dispatch below can route to it (matched to the MSAQ W+A path).
+torch::Tensor mxint8_wa_gemm_fused_skinny_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB);
+
 torch::Tensor mxint8_wa_gemm_cm_cuda(
         torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
         int64_t M, int64_t OUT, int64_t K, int64_t NB) {       // INT8 IMMA + column-major
+    // Small-M: route to the split-K IMMA skinny twin so the MXINT8 W+A path matches the
+    // MSAQ W+A path. Capped at M<=96 (not 128): plain int8 needs no unpack, so the base
+    // IMMA tile is already efficient and skinny's split-K overhead turns net-negative by
+    // M=128 (measured 0.94x) — earlier than MSAQ W+A (wins to 128). Override MS_NO_SKINNY=1.
+    if (M <= 96 && !(getenv("MS_NO_SKINNY") && atoi(getenv("MS_NO_SKINNY")) != 0)) {
+        return mxint8_wa_gemm_fused_skinny_cuda(X, scale_exp, qweight_cm, M, OUT, K, NB);
+    }
     auto Y = torch::empty({M, OUT}, X.options());
     auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
     auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));

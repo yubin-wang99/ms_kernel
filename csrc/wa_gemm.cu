@@ -1155,6 +1155,74 @@ __global__ void wa_gemm_fused_imma(
     }
 }
 
+// FAIR MXINT8 W+A twin of wa_gemm_fused_imma: identical IMMA split-K vehicle, but the
+// weight is plain int8 (qweight_cm) read DIRECTLY — no MSAQ upper/shared unpack. Matches
+// the MXINT8 W+A small-M path to the MSAQ W+A skinny path (each format, same dispatch).
+template<int MT>
+__global__ void mxint8_wa_gemm_fused_skinny(
+        const int8_t* __restrict__ qx, const int8_t* __restrict__ sa_exp,
+        const int8_t* __restrict__ scale_exp, const int8_t* __restrict__ qweight_cm,
+        float* __restrict__ partial, int M, int OUT, int K, int NB, int splitK) {
+    constexpr int WI = BLOCK + 16;
+    __shared__ int8_t As[16 * MT][WI];
+    __shared__ int8_t Bs[64][WI];
+    __shared__ int32_t iscr[4][16][16];
+    __shared__ float accf[16 * MT][64];
+    __shared__ float swsh[64];
+    __shared__ float sash[16 * MT];
+    const int o0 = blockIdx.x * 64, sp = blockIdx.y;
+    const int per = (NB + splitK - 1) / splitK, b0 = sp * per, b1 = min(b0 + per, NB);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (int idx = tid; idx < 16 * MT * 64; idx += 128) accf[idx / 64][idx % 64] = 0.0f;
+    __syncthreads();
+    for (int blk = b0; blk < b1; ++blk) {
+        for (int idx = tid; idx < 16 * MT * BLOCK; idx += 128) {
+            const int m = idx / BLOCK, k = idx % BLOCK;
+            As[m][k] = (m < M) ? qx[(long)m * K + blk * BLOCK + k] : 0;
+        }
+        if (tid < 64) {
+            const int o = o0 + tid;
+            if (o < OUT) {                               // plain int8 weight: read 32 contiguous codes
+                swsh[tid] = ms::e8m0_to_scale(scale_exp[blk * OUT + o]);
+                const int8_t* col = qweight_cm + ((long)blk * OUT + o) * BLOCK;
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) Bs[tid][k] = col[k];
+            } else {
+                swsh[tid] = 0.0f;
+                #pragma unroll
+                for (int k = 0; k < BLOCK; ++k) Bs[tid][k] = 0;
+            }
+        }
+        if (tid < 16 * MT) sash[tid] = (tid < M) ? ms::e8m0_to_scale(sa_exp[(long)tid * NB + blk]) : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> acc;
+            wmma::fill_fragment(acc, 0);
+            #pragma unroll
+            for (int wk = 0; wk < BLOCK / 16; ++wk) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b;
+                wmma::load_matrix_sync(a, &As[mi * 16][wk * 16], WI);
+                wmma::load_matrix_sync(b, &Bs[warp * 16][wk * 16], WI);
+                wmma::mma_sync(acc, a, b, acc);
+            }
+            wmma::store_matrix_sync(&iscr[warp][0][0], acc, 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) {
+                const int lm = e >> 4, lo = e & 15, m = mi * 16 + lm;
+                accf[m][warp * 16 + lo] += (float)iscr[warp][lm][lo] * sash[m] * swsh[warp * 16 + lo];
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+    for (int idx = tid; idx < 16 * MT * 64; idx += 128) {
+        const int m = idx / 64, oc = idx % 64, o = o0 + oc;
+        if (m < M && o < OUT) partial[((long)sp * M + m) * OUT + o] = accf[m][oc];
+    }
+}
+
 __global__ void gemm_skinny_combine(const float* __restrict__ partial,
         __nv_bfloat16* __restrict__ Y, int M, int OUT, int splitK) {
     const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1276,6 +1344,12 @@ torch::Tensor wonly_gemm_cm_cuda(
     return Y;
 }
 
+// Defined below; forward-declared so the small-M dispatch in wonly_gemm_tc_cuda
+// can route to it (the 16-row skinny tile + auto split-K fills the GPU at small M).
+torch::Tensor wonly_gemm_fused_skinny_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs);
+
 // TENSOR-CORE W-only prefill GEMM: BF16 WMMA (software-pipelined) with the weight
 // dequant wide-loading the COLUMN-MAJOR planes (coalesced, overlaps the MMA). Combines
 // tensor cores + coalesced unpack -> the fastest W-only prefill path. bf16 operands
@@ -1285,6 +1359,14 @@ torch::Tensor wonly_gemm_tc_cuda(
         torch::Tensor upper_cm, torch::Tensor shared_cm,
         int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    // Small-M (<=64): the 64x64 WMMA tile wastes most of its rows and the grid is
+    // too small to fill the GPU (~8-11x slower, bandwidth-starved). Route to the
+    // skinny 16-row + split-K kernel. Only u3/gs16 & u2/gs8 are specialized; other
+    // (u,gs) fall through. Override with MS_NO_SKINNY=1.
+    if (M <= 256 && ((u == 3 && gs == 16) || (u == 2 && gs == 8))
+            && !(getenv("MS_NO_SKINNY") && atoi(getenv("MS_NO_SKINNY")) != 0)) {
+        return wonly_gemm_fused_skinny_cuda(X, scale_exp, upper_cm, shared_cm, M, OUT, K, NB, u, gs);
+    }
     int UB, SB; gemm_dims(u, gs, UB, SB);
     auto Y = torch::empty({M, OUT}, X.options());
     wonly_gemm_wmma_pipe<true><<<dim3(((int)OUT + 63) / 64, ((int)M + 63) / 64), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -1318,10 +1400,16 @@ torch::Tensor wonly_gemm_fused_skinny_cuda(
         torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper_cm, torch::Tensor shared_cm,
         int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
-    int NT = ((int)M >= 32) ? 128 : 64;                   // dequant-thread tile width (NT=128 wins at M>=32:
-                                                          // NS=2 accumulator frags/warp add mma ILP -> hides long_sb)
+    // MT = #16-row tiles a block handles. Round UP to a supported instantiation:
+    // the kernel guards `m < M`, so over-provisioning rows is correct (extra rows
+    // are zero). Set {1,2,3,4,6,8,12,16} covers M up to 256 (16*16).
+    const int MTneed = ((int)M + 15) / 16;
+    const int MT = MTneed <= 4 ? MTneed : MTneed <= 6 ? 6 : MTneed <= 8 ? 8 : MTneed <= 12 ? 12 : 16;
+    // NT=128 (NS=2) doubles accumulator frags/warp -> register pressure scales with
+    // MT*NS. Safe only for short tiles; force NT=64 once MT>4 (tall tiles) to avoid spills.
+    int NT = (MT <= 4 && (int)M >= 32) ? 128 : 64;
     if (const char* e = getenv("MS_FUSED_NT")) { int v = atoi(e); NT = (v == 128) ? 128 : (v == 64 ? 64 : NT); }
-    const int MT = ((int)M + 15) / 16, gx = ((int)OUT + NT - 1) / NT;
+    const int gx = ((int)OUT + NT - 1) / NT;
     int splitK = ms::gemv_splitk_count(gx, (int)NB, 7);   // ~8x SM blocks (swept optimum)
     if (const char* e = getenv("MS_FUSED_SPLITK")) { int v = atoi(e); if (v > 0) splitK = v; }
     auto partial = torch::empty({(int64_t)splitK, M, OUT}, X.options().dtype(torch::kFloat32));
@@ -1339,15 +1427,16 @@ torch::Tensor wonly_gemm_fused_skinny_cuda(
         else if (NT==128) go(wonly_gemm_fused_skinny<decltype(Ut)::value, decltype(Gt)::value, decltype(MTt)::value, false, 128>);
         else if (ra)      go(wonly_gemm_fused_skinny<decltype(Ut)::value, decltype(Gt)::value, decltype(MTt)::value, true>);
         else              go(wonly_gemm_fused_skinny<decltype(Ut)::value, decltype(Gt)::value, decltype(MTt)::value, false>); };
+#define FSC(UU,GG,MM) case MM: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,MM>{}); break;
 #define FSMT(UU,GG) switch (MT) { \
-        case 1: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{}); break; \
-        case 2: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{}); break; \
-        case 3: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,3>{}); break; \
-        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{}); break; }
+        FSC(UU,GG,1) FSC(UU,GG,2) FSC(UU,GG,3) FSC(UU,GG,4) \
+        FSC(UU,GG,6) FSC(UU,GG,8) FSC(UU,GG,12) \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,16>{}); break; }
     if      ((int)u==3 && (int)gs==16) { FSMT(3,16); }
     else if ((int)u==2 && (int)gs==8)  { FSMT(2,8); }
     else TORCH_CHECK(false, "fused skinny: only u3/gs16, u2/gs8");
 #undef FSMT
+#undef FSC
     const int tot = (int)(M * OUT), thr = 256;
     gemm_skinny_combine<<<(tot + thr - 1) / thr, thr, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
@@ -1361,9 +1450,13 @@ torch::Tensor mxint8_gemm_fused_skinny_cuda(
         torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
         int64_t M, int64_t OUT, int64_t K, int64_t NB) {
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
-    int NT = ((int)M >= 32) ? 128 : 64;
+    // Round MT up to a supported instantiation (kernel guards m<M); {1,2,3,4,6,8,12,16}
+    // covers M up to 256. Force NT=64 for tall tiles (MT>4) to bound register pressure.
+    const int MTneed = ((int)M + 15) / 16;
+    const int MT = MTneed <= 4 ? MTneed : MTneed <= 6 ? 6 : MTneed <= 8 ? 8 : MTneed <= 12 ? 12 : 16;
+    int NT = (MT <= 4 && (int)M >= 32) ? 128 : 64;
     if (const char* e = getenv("MS_FUSED_NT")) { int v = atoi(e); NT = (v == 128) ? 128 : (v == 64 ? 64 : NT); }
-    const int MT = ((int)M + 15) / 16, gx = ((int)OUT + NT - 1) / NT;
+    const int gx = ((int)OUT + NT - 1) / NT;
     int splitK = ms::gemv_splitk_count(gx, (int)NB, 7);
     if (const char* e = getenv("MS_FUSED_SPLITK")) { int v = atoi(e); if (v > 0) splitK = v; }
     auto partial = torch::empty({(int64_t)splitK, M, OUT}, X.options().dtype(torch::kFloat32));
@@ -1375,11 +1468,11 @@ torch::Tensor mxint8_gemm_fused_skinny_cuda(
             (int)M, (int)OUT, (int)K, (int)NB, splitK); };
         if (NT==128) go(mxint8_gemm_fused_skinny<decltype(MTt)::value, 128>);
         else         go(mxint8_gemm_fused_skinny<decltype(MTt)::value, 64>); };
+#define MXC(MM) case MM: L(std::integral_constant<int,MM>{}); break;
     switch (MT) {
-        case 1: L(std::integral_constant<int,1>{}); break;
-        case 2: L(std::integral_constant<int,2>{}); break;
-        case 3: L(std::integral_constant<int,3>{}); break;
-        default: L(std::integral_constant<int,4>{}); break; }
+        MXC(1) MXC(2) MXC(3) MXC(4) MXC(6) MXC(8) MXC(12)
+        default: L(std::integral_constant<int,16>{}); break; }
+#undef MXC
     const int tot = (int)(M * OUT), thr = 256;
     gemm_skinny_combine<<<(tot + thr - 1) / thr, thr, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
@@ -1396,7 +1489,12 @@ torch::Tensor wa_gemm_fused_imma_cuda(
     auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
     ms_launch_quant_act_msaq(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
                              qx.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB, (int)u, (int)gs);
-    const int MT = ((int)M + 15) / 16, gx = ((int)OUT + 63) / 64;
+    // Round MT up to a supported instantiation (kernel guards m<M). This IMMA kernel
+    // stages int8 qx + dequant planes in shared mem, so MT>8 overflows the 48KB static
+    // smem limit -> cap at MT=8 (M<=128). (bf16 W-only twin goes to MT=16/M=256.)
+    const int MTneed = ((int)M + 15) / 16;
+    const int MT = MTneed <= 4 ? MTneed : MTneed <= 6 ? 6 : 8;
+    const int gx = ((int)OUT + 63) / 64;
     int splitK = ms::gemv_splitk_count(gx, (int)NB, 7);
     if (const char* e = getenv("MS_FUSED_SPLITK")) { int v = atoi(e); if (v > 0) splitK = v; }
     auto partial = torch::empty({(int64_t)splitK, M, OUT}, X.options().dtype(torch::kFloat32));
@@ -1407,15 +1505,50 @@ torch::Tensor wa_gemm_fused_imma_cuda(
             qx.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
             upper_cm.data_ptr<uint8_t>(), shared_cm.data_ptr<uint8_t>(),
             partial.data_ptr<float>(), (int)M, (int)OUT, (int)K, (int)NB, splitK); };
+#define IMC(UU,GG,MM) case MM: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,MM>{}); break;
 #define IMT(UU,GG) switch (MT) { \
-        case 1: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,1>{}); break; \
-        case 2: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,2>{}); break; \
-        case 3: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,3>{}); break; \
-        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,4>{}); break; }
+        IMC(UU,GG,1) IMC(UU,GG,2) IMC(UU,GG,3) IMC(UU,GG,4) IMC(UU,GG,6) \
+        default: L(std::integral_constant<int,UU>{},std::integral_constant<int,GG>{},std::integral_constant<int,8>{}); break; }
     if      ((int)u==3 && (int)gs==16) { IMT(3,16); }
     else if ((int)u==2 && (int)gs==8)  { IMT(2,8); }
     else TORCH_CHECK(false, "imma: only u3/gs16, u2/gs8");
 #undef IMT
+#undef IMC
+    const int tot = (int)(M * OUT), thr = 256;
+    gemm_skinny_combine<<<(tot + thr - 1) / thr, thr, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
+        (int)M, (int)OUT, splitK);
+    return Y;
+}
+
+// FAIR MXINT8 W+A twin host of wa_gemm_fused_imma_cuda. Same Stage-0 quant + split-K IMMA
+// + combine dispatch; weight is plain int8 (no u/gs). MT capped at 8 (M<=128) by the same
+// shared-mem limit as the MSAQ IMMA twin.
+torch::Tensor mxint8_wa_gemm_fused_skinny_cuda(
+        torch::Tensor X, torch::Tensor scale_exp, torch::Tensor qweight_cm,
+        int64_t M, int64_t OUT, int64_t K, int64_t NB) {
+    TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    auto qx = torch::empty({M, K}, X.options().dtype(torch::kInt8));
+    auto sa = torch::empty({M, NB}, X.options().dtype(torch::kInt8));
+    ms_launch_quant_act(reinterpret_cast<const __nv_bfloat16*>(X.data_ptr<at::BFloat16>()),
+                        qx.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), (int)M, (int)K, (int)NB);
+    const int MTneed = ((int)M + 15) / 16;
+    const int MT = MTneed <= 4 ? MTneed : MTneed <= 6 ? 6 : 8;
+    const int gx = ((int)OUT + 63) / 64;
+    int splitK = ms::gemv_splitk_count(gx, (int)NB, 7);
+    if (const char* e = getenv("MS_FUSED_SPLITK")) { int v = atoi(e); if (v > 0) splitK = v; }
+    auto partial = torch::empty({(int64_t)splitK, M, OUT}, X.options().dtype(torch::kFloat32));
+    auto Y = torch::empty({M, OUT}, X.options());
+    auto L = [&](auto MTt) {
+        mxint8_wa_gemm_fused_skinny<decltype(MTt)::value>
+            <<<dim3(gx, splitK), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+            qx.data_ptr<int8_t>(), sa.data_ptr<int8_t>(), scale_exp.data_ptr<int8_t>(),
+            qweight_cm.data_ptr<int8_t>(), partial.data_ptr<float>(),
+            (int)M, (int)OUT, (int)K, (int)NB, splitK); };
+#define MWC(MM) case MM: L(std::integral_constant<int,MM>{}); break;
+    switch (MT) { MWC(1) MWC(2) MWC(3) MWC(4) MWC(6)
+        default: L(std::integral_constant<int,8>{}); break; }
+#undef MWC
     const int tot = (int)(M * OUT), thr = 256;
     gemm_skinny_combine<<<(tot + thr - 1) / thr, thr, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(Y.data_ptr<at::BFloat16>()),
@@ -1490,6 +1623,16 @@ torch::Tensor wa_gemm_cm_cuda(
         torch::Tensor upper_cm, torch::Tensor shared_cm,
         int64_t M, int64_t OUT, int64_t K, int64_t NB, int64_t u, int64_t gs) {
     TORCH_CHECK(X.is_cuda() && X.scalar_type() == torch::kBFloat16, "X must be CUDA bf16");
+    // Small-M (<=64): the 64x64 IMMA tile wastes most of its rows and the grid is
+    // too small to fill the GPU. Route to the fused split-K IMMA kernel (16-row tile
+    // + auto split-K). Only u3/gs16 & u2/gs8 are specialized; other (u,gs) fall
+    // through. Override with MS_NO_SKINNY=1. (W-only twin: wonly_gemm_tc_cuda.)
+    // Capped at M<=128 (not 256): the IMMA kernel's larger shared-mem footprint limits
+    // it to MT<=8; the bf16 W-only path has no such limit and routes up to M=256.
+    if (M <= 128 && ((u == 3 && gs == 16) || (u == 2 && gs == 8))
+            && !(getenv("MS_NO_SKINNY") && atoi(getenv("MS_NO_SKINNY")) != 0)) {
+        return wa_gemm_fused_imma_cuda(X, scale_exp, upper_cm, shared_cm, M, OUT, K, NB, u, gs);
+    }
     int UB, SB; gemm_dims(u, gs, UB, SB);
     auto Y = torch::empty({M, OUT}, X.options());
     auto qX = torch::empty({M, K}, X.options().dtype(torch::kInt8));
