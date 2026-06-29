@@ -1,0 +1,14 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 6676.93it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tok | BF16 PPL = 5.6877 | NL=32 NH=8 | head-wise KV alloc
+
+head_sens (cheap across all layers): 0:+0.22 1:+0.16 2:+0.34 3:+0.27 4:+0.30 5:+0.31 6:+0.48 7:+0.43
+layer_sens rank(least->most): 8:-0.06 5:-0.06 10:-0.02 15:-0.01 6:-0.00 11:+0.00 4:+0.00 13:+0.01 28:+0.03 25:+0.04 2:+0.04 21:+0.05 16:+0.05 18:+0.05 24:+0.06 26:+0.06 30:+0.07 17:+0.07 31:+0.08 23:+0.09 29:+0.09 19:+0.09 20:+0.09 9:+0.11 27:+0.11 12:+0.13 0:+0.14 14:+0.15 1:+0.16 22:+0.16 7:+0.20 3:+0.29
+
+head-wise vs per-layer (FULL 30w):
+avg b/elem |  per-layer dPPL  head-wise dPPL
+     5.875 |          +0.77%          +0.62%
+     5.500 |          +1.51%          +1.34%
+     5.125 |          +2.04%          +1.94%
