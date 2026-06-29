@@ -50,16 +50,19 @@ def stop_server(p, log):
     finally:
         log.close()
 
-def run_bench(vllm_bin, model, port, rate, in_len, out_len, num_prompts, seed, out_json):
+def run_bench(vllm_bin, model, port, rate, in_len, out_len, num_prompts, seed, out_json,
+              dataset="random", dataset_path=None):
     cmd = [vllm_bin, "bench", "serve",
            "--backend", "openai", "--endpoint", "/v1/completions",
            "--host", "127.0.0.1", "--port", str(port), "--model", model,
-           "--dataset-name", "random", "--random-input-len", str(in_len),
-           "--random-output-len", str(out_len), "--random-range-ratio", "0",
-           "--num-prompts", str(num_prompts), "--request-rate", str(rate),
-           "--ignore-eos", "--seed", str(seed),
+           "--num-prompts", str(num_prompts), "--request-rate", str(rate), "--seed", str(seed),
            "--percentile-metrics", "ttft,tpot,e2el", "--metric-percentiles", "99",
            "--save-result", "--result-filename", out_json]
+    if dataset == "sharegpt":          # realistic variable-length distribution
+        cmd += ["--dataset-name", "sharegpt", "--dataset-path", dataset_path]
+    else:                              # random fixed-length (--random-range-ratio 0) + ignore-eos
+        cmd += ["--dataset-name", "random", "--random-input-len", str(in_len),
+                "--random-output-len", str(out_len), "--random-range-ratio", "0", "--ignore-eos"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if not os.path.exists(out_json):
         sys.stderr.write(f"[bench rate={rate}] no result json. tail:\n{r.stdout[-800:]}\n{r.stderr[-400:]}\n")
@@ -77,8 +80,12 @@ def main():
     ap.add_argument("--model", default="NousResearch/Meta-Llama-3.1-8B")
     ap.add_argument("--kv-dtypes", default="auto,fp8")
     ap.add_argument("--rates", default="1,1.5,2,2.5,inf", help="offered req/s sweep ('inf'=all at once)")
+    ap.add_argument("--dataset", default="random", choices=["random", "sharegpt"],
+                    help="random=fixed in/out len (capacity-isolating); sharegpt=realistic dist")
+    ap.add_argument("--dataset-path", default=None, help="path to ShareGPT json (for --dataset sharegpt)")
     ap.add_argument("--in-len", type=int, default=2048)
     ap.add_argument("--out-len", type=int, default=256)
+    ap.add_argument("--max-model-len", type=int, default=0, help="server max_model_len (0=auto from in/out)")
     ap.add_argument("--num-prompts", type=int, default=150)
     ap.add_argument("--util", type=float, default=0.90)
     ap.add_argument("--port", type=int, default=8013)
@@ -88,13 +95,18 @@ def main():
     a = ap.parse_args()
     vllm_bin = os.path.join(os.path.dirname(a.venv), "vllm")   # console script next to python
     os.makedirs(a.resdir, exist_ok=True)
+    if a.dataset == "sharegpt" and not a.dataset_path:
+        sys.exit("--dataset sharegpt requires --dataset-path <ShareGPT json>")
     dtypes = [d.strip() for d in a.kv_dtypes.split(",")]
     rates = [r.strip() for r in a.rates.split(",")]
-    mml = a.in_len + a.out_len + 64
+    mml = a.max_model_len or (a.in_len + a.out_len + 64)
 
-    print(f"# vLLM online Pareto — {a.model}, random in={a.in_len}/out={a.out_len}, "
-          f"{a.num_prompts} prompts/rate, util={a.util}")
-    print(f"# server: vllm openai api_server per kv_dtype; client: vllm bench serve. ctx={a.in_len+a.out_len}\n")
+    if a.dataset == "sharegpt":
+        desc = f"sharegpt (realistic var-len dist), max_model_len={mml}"
+    else:
+        desc = f"random in={a.in_len}/out={a.out_len} (ctx {a.in_len+a.out_len})"
+    print(f"# vLLM online Pareto — {a.model}, {desc}, {a.num_prompts} prompts/rate, util={a.util}")
+    print(f"# server: vllm openai api_server per kv_dtype; client: vllm bench serve.\n")
 
     results = {d: {} for d in dtypes}
     for d in dtypes:
@@ -108,7 +120,7 @@ def main():
             for rate in rates:
                 rj = os.path.join(a.resdir, f"res_{d}_r{rate}.json")
                 res = run_bench(vllm_bin, a.model, a.port, rate, a.in_len, a.out_len,
-                                a.num_prompts, a.seed, rj)
+                                a.num_prompts, a.seed, rj, a.dataset, a.dataset_path)
                 if res is None: continue
                 results[d][rate] = res
                 print(f"#   rate={rate:>4}: RPS={g(res,'request_throughput'):.2f} "
