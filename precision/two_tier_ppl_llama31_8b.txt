@@ -1,0 +1,13 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7304.44it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tokens | BF16 PPL = 5.6877 | block=32 | weight-only frontier
+
+             cfg   bits |       PPL    dPPL%
+     MXFP4(E2M1)  4.250 |    6.3786  +12.15%
+         E2M1+u2  4.562 |    6.3060  +10.87%
+         E2M1+u4  4.625 |    6.3094  +10.93%
+ MXINT8-MSAQ.efb  6.000 |    5.8415   +2.70%
+    E2M3(native)  6.250 |    5.7239   +0.64%
+         E2M3+u4  6.625 |    5.7248   +0.65%

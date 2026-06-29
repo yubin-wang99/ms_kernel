@@ -1,0 +1,27 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 6777.37it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+wikitext-2: test 288,937 tok | BF16 PPL = 5.6877 | gs sweep (one resid E8M0/block)
+
+collecting within-group Hessian on TRAIN (16x2048)...
+done.
+
+                       cfg   bits |       PPL    dPPL%
+        MXFP4(E2M1) native  4.250 |    6.3786  +12.15%
+           MXINT8-MSAQ.efb  6.000 |    5.8415   +2.70%
+               E2M3 native  6.250 |    5.7239   +0.64%
+  --- E2M1+u4 A-weighted, gs sweep ---
+              E2M1+u4 gs32  4.625 |    6.1387   +7.93%
+              E2M1+u4 gs16  4.750 |    6.0729   +6.77%
+               E2M1+u4 gs8  5.000 |    6.0272   +5.97%
+               E2M1+u4 gs4  5.500 |    5.9414   +4.46%
+               E2M1+u4 gs2  6.500 |    5.8341   +2.57%
+  --- MX+ E2M1+u4 A-weighted, gs sweep ---
+          MX+ E2M1+u4 gs32  4.781 |    5.9915   +5.34%
+          MX+ E2M1+u4 gs16  4.906 |    5.9556   +4.71%
+           MX+ E2M1+u4 gs8  5.156 |    5.9316   +4.29%
+           MX+ E2M1+u4 gs4  5.656 |    5.8694   +3.19%
+           MX+ E2M1+u4 gs2  6.656 |    5.7936   +1.86%

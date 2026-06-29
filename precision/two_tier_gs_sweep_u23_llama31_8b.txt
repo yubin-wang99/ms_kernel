@@ -1,0 +1,36 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7550.62it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+wikitext-2: test 288,937 tok | BF16 PPL = 5.6877 | gs sweep (one resid E8M0/block)
+
+collecting within-group Hessian on TRAIN (16x2048)...
+done.
+
+                       cfg   bits |       PPL    dPPL%
+  --- E2M1+u2 A-weighted, gs sweep ---
+              E2M1+u2 gs32  4.562 |    6.1381   +7.92%
+              E2M1+u2 gs16  4.625 |    6.0716   +6.75%
+               E2M1+u2 gs8  4.750 |    6.0505   +6.38%
+               E2M1+u2 gs4  5.000 |    6.0083   +5.64%
+               E2M1+u2 gs2  5.500 |    5.9492   +4.60%
+  --- MX+ E2M1+u2 A-weighted, gs sweep ---
+          MX+ E2M1+u2 gs32  4.719 |    5.9880   +5.28%
+          MX+ E2M1+u2 gs16  4.781 |    5.9461   +4.54%
+           MX+ E2M1+u2 gs8  4.906 |    5.9370   +4.38%
+           MX+ E2M1+u2 gs4  5.156 |    5.9166   +4.02%
+           MX+ E2M1+u2 gs2  5.656 |    5.8667   +3.15%
+  --- E2M1+u3 A-weighted, gs sweep ---
+              E2M1+u3 gs32  4.594 |    6.1389   +7.93%
+              E2M1+u3 gs16  4.688 |    6.0772   +6.85%
+               E2M1+u3 gs8  4.875 |    6.0258   +5.94%
+               E2M1+u3 gs4  5.250 |    5.9374   +4.39%
+               E2M1+u3 gs2  6.000 |    5.8458   +2.78%
+  --- MX+ E2M1+u3 A-weighted, gs sweep ---
+          MX+ E2M1+u3 gs32  4.750 |    5.9926   +5.36%
+          MX+ E2M1+u3 gs16  4.844 |    5.9533   +4.67%
+           MX+ E2M1+u3 gs8  5.031 |    5.9254   +4.18%
+           MX+ E2M1+u3 gs4  5.406 |    5.8674   +3.16%
+           MX+ E2M1+u3 gs2  6.156 |    5.7958   +1.90%

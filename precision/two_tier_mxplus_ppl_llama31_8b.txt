@@ -1,0 +1,18 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7643.29it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+wikitext-2: test 288,937 tok | BF16 PPL = 5.6877 | block=32 | MX+ + residual
+
+collecting within-group Hessian on TRAIN (16x2048)...
+done.
+
+                   cfg   bits |       PPL    dPPL%
+    MXFP4(E2M1) native  4.250 |    6.3786  +12.15%
+    E2M1+u2 A-weighted  4.562 |    6.1381   +7.92%
+   MX+ E2M1 (no resid)  4.406 |    6.0969   +7.19%
+    MX+ E2M1 +u2 A-wgt  4.719 |    5.9880   +5.28%
+    MX+ E2M1 +u4 A-wgt  4.781 |    5.9915   +5.34%
+     E2M3 native (ref)  6.250 |    5.7239   +0.64%
