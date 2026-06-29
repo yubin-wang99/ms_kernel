@@ -35,6 +35,19 @@ vLLM이 **이미 `--kv-cache-dtype fp8`** 을 지원한다. fp16-KV vs fp8-KV로
 - throughput-vs-request-rate, **긴 컨텍스트에서 fp16이 OOM나는 지점**을 확인.
 → **"저비트 KV → block↑ → throughput↑"라는 우리 주장의 메커니즘을 vLLM에서 재현**(우리 기여 없이). 이게 baseline이자 sanity check. **여기서 이미 1차 그림이 나온다.**
 
+**✅ Phase 0 측정 결과 (`vllm_phase0_capacity.py`, 실행됨).**
+vLLM 0.23.0(V1) + Llama-3.1-8B를 RTX PRO 4000 Blackwell(sm_120, 24.5GB)에서 실측. kv_cache_dtype `auto`(bf16) vs `fp8`로 엔진을 init하고 vLLM 자체 프로파일러의 `num_gpu_blocks`를 직접 읽음:
+
+| kv_dtype | num_gpu_blocks | KV pool(tok) | seqs@1k | seqs@16k | KV pool ratio |
+|---|--:|--:|--:|--:|--:|
+| auto (bf16 KV) | 2615 | 41,840 | 40 | 2 | 1.00× |
+| **fp8 KV** | **5230** | **83,680** | **81** | **5** | **2.00×** |
+
+- **메커니즘 확정**: vLLM이 fp8에 **정확히 2.00× 블록**을 할당 → 동시 seq·컨텍스트 2×. 우리 `capacity_maxbatch.py`의 해석적 결과가 **gold-standard 서빙 스택에서 네이티브로 재현**됨(커널 기여 0).
+- **throughput 전환**: offline `generate()` 512 prompts @ctx1024/L_out128에서 **output tok/s 2884 → 3594 (1.25×)**. capacity 2×가 이 설정에선 1.25×로 부분 전환(짧은 ctx는 compute도 섞임) — capacity가 binding되는 **긴 컨텍스트일수록 2×에 근접**(capacity_model.py와 일치).
+- **운영 노트**: torch 다운그레이드(2.12→2.11)가 MSAQ 커널을 깨므로 **격리 venv `.venv-vllm`** 에 설치. sm_120에서 vLLM 0.23 정상 동작 확인.
+- 드라이버는 **kv_dtype당 엔진 1회 init**(2회)으로 풀을 읽고 컨텍스트별 seq를 도출 — block-pool은 길이 무관 단일 자원이므로 2×N init 불필요. online `benchmark_serving.py`(ShareGPT, throughput-vs-RPS·P99)는 후속.
+
 **Phase 1 — Weight 양자화 통합 (중간 난이도).**
 우리 weight GEMM을 vLLM `QuantizationConfig`로 등록 → weight가 quantized-resident(bf16 master 제거). 측정: 같은 GPU에서 **weights GB↓ → num_gpu_blocks↑ → max_num_seqs↑ → throughput↑**. (vLLM의 AWQ/GPTQ 통합 코드가 템플릿.)
 
