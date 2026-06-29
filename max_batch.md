@@ -76,6 +76,53 @@ MSAQ는 그 바이트에 **2× 시퀀스**를 담아 step당 2× 토큰을 냄. 
 
 ---
 
+## 2b. capacity가 *진짜로* binding되는 곳 — 70B (binary 승리)
+
+§2의 8B@24GB는 솔직히 말하면 capacity가 **binding되기 직전**의 영역이다: B_max가 154–417로 **너무 커서**
+실제 서빙에선 compute/scheduler가 먼저 cap을 건다(continuous-batch의 동시성 한계, prefill compute). 거기서의
+2.04× ratio는 footprint상 실재하지만 **"이미 충분히 큰 배치를 더 키우는"** projection에 가깝다. capacity가
+**실제 병목이 되는** 곳은 **큰 모델 / 긴 컨텍스트**, 즉 B_max가 한 자리 수로 떨어지는 영역이다.
+
+### 70B @ 1×H100-80GB — MXINT8은 아예 안 올라간다 (binary)
+`python capacity_model.py --model llama70b --gpu h100` (HBM 80GB × util0.9 − 2GB = 70GB usable):
+
+| 포맷 | weights | B_max@1k | B_max@16k | B_max@128k |
+|---|--:|--:|--:|--:|
+| bf16 (16b) | 141.2GB | **0 (OOM)** | 0 | 0 |
+| **MXINT8/MXFP8 (8.25b)** | 72.8GB | **0 (OOM)** | 0 | 0 |
+| W6.25 / KV8.25 | 55.2GB | 85 | 5 | 0 |
+| W6.25 / KV5.44 | 55.2GB | 130 | 8 | 1 |
+| **W6.25 / KV4.50** | 55.2GB | **157** | **9** | **1** |
+
+**MXINT8 weights(72.8GB)만으로 usable HBM(70GB)을 넘겨** KV 한 토큰도 못 얹는다 → 전 context에서 B_max=0.
+**W6.25 weight 양자화(55.2GB)가 있어야 70B가 단일 H100에 비로소 servable**해진다. 이건 "2× 더 큰 배치"가
+아니라 **"돌릴 수 있나 vs 없나"의 binary 승리** — ratio가 정의되지 않아 표에는 `inf`로 찍힌다(아래 §주의).
+
+### ⚠️ 정직한 caveat — "MXINT8 70B가 불가능"은 단일-GPU 한정
+실무에서 70B는 보통 **tensor-parallel로 2–8 GPU에 분산**한다. 그러니 MXINT8 70B가 *불가능*한 게 아니라
+**≥2 GPU가 필요**한 것이다. 정확한 프레이밍은 **"고정 GPU 예산"** 축이다:
+- weight-quant은 70B를 **더 적은 GPU에** 올린다(1×H100 vs MXINT8의 2×) → **TCO/대수 절감**,
+- 그 위에 KV-quant이 **배치·컨텍스트를 더 얹는다**.
+
+### 70B에서 ratio가 의미를 갖는 곳 — 1×H200-141GB (MXINT8 servable)
+MXINT8 weights(72.8GB)가 들어가는 더 큰 단일 GPU에선 ratio가 다시 의미를 갖고, 8B와 같은 ~2× 패턴이 재현된다:
+
+| 포맷 | B_max@1k | ratio | 비고 |
+|---|--:|--:|---|
+| MXINT8/MXFP8 | 301 | 1.00× | baseline (servable) |
+| W6.25 / KV8.25 | 403 | 1.34× | weight-only 효과 |
+| W6.25 / KV5.44 | 611 | 2.03× | + u3/gs16 KV |
+| **W6.25 / KV4.50** | **739** | **2.46×** | + u4 KV |
+
+(bf16 70B는 141GB weights ≈ 전체 HBM이라 단일 H200에도 **안 들어간다** → 0.00×. context가 길어질수록
+ratio는 더 커진다: KV4.50 @64k 2.75×.)
+
+**요지**: 8B@24GB는 capacity 이점의 *projection*(ratio 실재하나 binding 직전), **70B는 capacity가 실제로
+bind되는 곳** — 1×H100에선 **binary 승리**(MXINT8 불가), 1×H200에선 **2.46× ratio**. 이게
+`vllm_integration_plan.md`의 figure-3(긴 컨텍스트/큰 모델에서 baseline OOM 너머로 계속 servable) 시나리오다.
+
+---
+
 ## 3. 정직한 검증 — "B=32/64에서 OOM났는데 어떻게 154/314냐?"
 
 당신의 의심은 정당하다. 차이의 원인을 코드로 확인했고, **기존 하니스 OOM은 serving capacity와 무관한 microbench
@@ -121,6 +168,7 @@ artifact**임을 밝힌다.
 ```
 python capacity_maxbatch.py --model llama8b --ctx 1536        # max-B (할당 probe)
 python decode_throughput_maxbatch.py --ctx 1536               # tok/s @ max-B
-python capacity_model.py --model llama70b --gpu h100          # 분석적 sweep (커널 불필요)
+python capacity_model.py --model llama70b --gpu h100          # 70B binary 승리 (MXINT8 OOM -> 'inf')
+python capacity_model.py --model llama70b --gpu h200          # 70B ratio 승리 (MXINT8 servable, 2.46x)
 ```
 스크립트: `capacity_maxbatch.py`(할당 probe), `decode_throughput_maxbatch.py`(throughput), `capacity_model.py`(분석).

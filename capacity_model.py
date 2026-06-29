@@ -46,6 +46,11 @@ FORMATS = [
 def human(b):  # bytes -> GB
     return b / 1e9
 
+def rcell(num, den):  # ratio cell vs baseline; handles baseline-OOM (den=0) honestly
+    if den > 0:  return f"{num/den:>4.2f}x"   # normal ratio (bf16 OOM vs servable base -> 0.00x)
+    if num > 0:  return f"{'inf':>4}x"        # BINARY win: servable here while MXINT8 OOMs (no ratio)
+    return "  -  "                            # both OOM (neither servable)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="llama8b", choices=MODELS)
@@ -91,7 +96,10 @@ def main():
     print(f"{'format':>18} | " + " ".join(f"{L//1024}k" if L>=1024 else f"{L}" for L in Ls))
     for nm, *_ in [(f[0],) for f in FORMATS]:
         bm = rows[nm][2]
-        print(f"{nm:>18} | " + " ".join(f"{(b/bb):>4.2f}x" if bb else "  -  " for b, bb in zip(bm, base)))
+        print(f"{nm:>18} | " + " ".join(rcell(b, bb) for b, bb in zip(bm, base)))
+    print(f"#   'inf' = servable in this format while MXINT8 OOMs (BINARY capacity win, no ratio) —")
+    print(f"#   e.g. 70B on 1xH100: MXINT8 weights alone OOM, only W-quant fits. Frame on a FIXED GPU")
+    print(f"#   budget: weight-quant serves the model on FEWER GPUs; KV-quant then adds batch on top.")
 
     # ---- projected decode throughput at the capacity frontier ----
     #   memory-bound decode step: read weights once + each seq's full KV.
@@ -117,7 +125,7 @@ def main():
     print(f"{'format':>18} | " + " ".join(f"{L//1024}k" if L>=1024 else f"{L}" for L in Ls))
     for nm, *_ in [(f[0],) for f in FORMATS]:
         tt = tput[nm]
-        print(f"{nm:>18} | " + " ".join(f"{(t/b):>4.2f}x" if b else "  -  " for t, b in zip(tt, bt)))
+        print(f"{nm:>18} | " + " ".join(rcell(t, b) for t, b in zip(tt, bt)))
 
     # ---- dual view: max context at a fixed serving batch (the other compelling capacity figure) ----
     print(f"\n## Max context length at fixed batch (how long a context fits in HBM)")
