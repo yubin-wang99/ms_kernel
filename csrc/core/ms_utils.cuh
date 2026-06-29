@@ -473,6 +473,46 @@ __device__ __forceinline__ int unpack_ms_kv_elem_u4(
     return up_code * 16 + sh_code;
 }
 
+// --- KV variant, MXFP8-MSAQ (E3M4): single-element FP8 VALUE (pre-block-scale).
+//   FP8 analog of unpack_ms_kv_elem (token-major planes [.,L,BYTES]). Extracts the
+//   (8-u)-bit FP8 E3M4 field [sign|exp:3|upmant:(4-u)] for element k and the u-bit
+//   SIGNED group-shared code, returns the reconstructed FP8 value
+//     sign * 2^(ee-MB) * (m_up*2^u + sh_code)
+//   (the caller multiplies the E8M0 block scale). Bit-exact to
+//   stream_block_uspec_fp8_e3m4 / msaq_mxfp8(e3m4); same straddle handling as the
+//   INT unpack_ms_kv_elem (the ONLY change is the per-element FP decode). ---------
+__device__ __forceinline__ float unpack_ms_kv_elem_fp8(
+        const uint8_t* upper, const uint8_t* shared,
+        long base_u, long base_h, int key, int k,
+        int u, int gs, int UB, int SB) {
+    constexpr int EB = 3, MB = 4, BIAS = 3, EMIN = -2;   // E3M4
+    const int wbits = 8 - u, mbup = MB - u;
+    const int g = k >> (__ffs(gs) - 1);
+    const long ku = base_u + (long)key * UB;
+    const long kh = base_h + (long)key * SB;
+    // upper FP8 field (may straddle two bytes)
+    const int ub0 = (k * wbits) >> 3, uoff = (k * wbits) & 7;
+    uint32_t code = (uint32_t)upper[ku + ub0] >> uoff;
+    if (uoff + wbits > 8 && (ub0 + 1) < UB)
+        code |= (uint32_t)upper[ku + ub0 + 1] << (8 - uoff);
+    code &= (1u << wbits) - 1u;
+    const uint32_t sgn  = code >> (wbits - 1);
+    const uint32_t expf = (code >> mbup) & ((1u << EB) - 1u);
+    const uint32_t upm  = code & ((1u << mbup) - 1u);
+    const int m_up = (int)((expf ? (1u << mbup) : 0u) | upm);   // implicit leading 1 for normals
+    const int ee   = expf ? (int)expf - BIAS : EMIN;
+    // shared SIGNED u-bit code for group g (may straddle)
+    const int sb0 = (g * u) >> 3, soff = (g * u) & 7;
+    uint32_t sc = (uint32_t)shared[kh + sb0] >> soff;
+    if (soff + u > 8 && (sb0 + 1) < SB)
+        sc |= (uint32_t)shared[kh + sb0 + 1] << (8 - soff);
+    sc &= (1u << u) - 1u;
+    const int sh_code = sign_extend(sc, u);
+    int mag = m_up << u;
+    if (sgn) mag = -mag;
+    return ldexpf((float)(mag + sh_code), ee - MB);
+}
+
 // =============================================================================
 //  PACK / QUANTIZE primitives (device counterpart of ms_lib.pack.decompose) —
 //  shared by the KV write/append kernels (bit-pack tail) and the W+A activation
@@ -509,6 +549,80 @@ __device__ __forceinline__ int decompose_ms_block(
         r_shared[g] = max(smin, min(smax, (int)rintf(ravg / (float)gs / sa)));
     }
     return ea;
+}
+
+// MXFP8-MSAQ (E3M4) decompose: device counterpart of ms_lib.pack.decompose_msfp8
+// (efb_iters=2, wshare). One thread holds x[32]; produces (8-u)-bit FP8 E3M4 fields
+// field[32] = [sign|exp:3|upmant:(4-u)] and SIGNED u-bit group-shared r_shared[32/gs],
+// returns the E8M0 exponent (ONE exponent of headroom so the bit-storable encoder never
+// saturates). Numerically faithful (fp32) to decompose_msfp8 — the decode is then bit-exact.
+__device__ __forceinline__ int decompose_msfp8_block(
+        const float* __restrict__ x, int u, int gs, int* field, int* r_shared) {
+    constexpr int EB = 3, MB = 4, BIAS = 3, EMIN = -2, MAXEXP = 4;   // E3M4
+    const int mb_up = MB - u;
+    const float lead = (float)(1 << mb_up), mmax = (float)((1 << (mb_up + 1)) - 1);
+    const int ng = 32 / gs, half = 1 << (u - 1), efb_iters = 2;
+    float amax = 1e-30f;
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) amax = fmaxf(amax, fabsf(x[k]));
+    int s_exp = (int)floorf(log2f(amax)) - (MAXEXP - 1);            // headroom = 1
+    s_exp = max(-127, min(127, s_exp));
+    const float s_base = exp2f((float)s_exp);
+    float y[32], up[32], ee[32];
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) y[k] = x[k] / s_base;
+    // round_storable(t): nearest FP8 with (mb_up) stored mantissa bits; rounding PROMOTES
+    // the exponent at the top instead of saturating. Writes up (value) and ee (stored exp).
+    auto rstore = [&](float t, float& outv, float& oute) {
+        float et = floorf(log2f(fmaxf(fabsf(t), 1e-30f)));
+        et = fmaxf((float)EMIN, fminf((float)MAXEXP, et));
+        float m = rintf(fabsf(t) / exp2f(et - (float)mb_up));
+        if (m >= 2.0f * lead && et < (float)MAXEXP) { et += 1.0f; m = lead; }
+        m = fminf(m, mmax);
+        outv = copysignf(m * exp2f(et - (float)mb_up), t);
+        oute = et;
+    };
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) rstore(y[k], up[k], ee[k]);
+    int sh_g[32];
+    for (int it = 0; it <= efb_iters; ++it) {
+        // (1) optimal shared | fixed upper: wshare = step_up^2 (=4^ee) weighted group mean.
+        for (int g = 0; g < ng; ++g) {
+            float num = 0.0f, den = 0.0f;
+            for (int t = 0; t < gs; ++t) {
+                const int k = g * gs + t;
+                const float step_up = exp2f(ee[k] - (float)mb_up);
+                num += ((y[k] - up[k]) / step_up) * (step_up * step_up);
+                den += step_up * step_up;
+            }
+            int sv = (int)rintf((num / fmaxf(den, 1e-30f)) * (float)(1 << u));
+            sh_g[g] = max(-half, min(half - 1, sv));
+        }
+        if (it == efb_iters) break;
+        // (2) optimal upper | fixed shared: re-round each element absorbing the sharing error.
+        for (int g = 0; g < ng; ++g) {
+            const float shared_elem = (float)sh_g[g] / (float)(1 << u);
+            for (int t = 0; t < gs; ++t) {
+                const int k = g * gs + t;
+                const float step_up = exp2f(ee[k] - (float)mb_up);
+                rstore(y[k] - shared_elem * step_up, up[k], ee[k]);
+            }
+        }
+    }
+    // encode each upper element as the FP8 E3M4 field [sign|exp|upmant]
+    const int wbits = 8 - u;
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        const float step_up = exp2f(ee[k] - (float)mb_up);
+        const int m_up_abs = (int)rintf(fabsf(up[k]) / step_up);
+        const int sgn = (up[k] < 0.0f) ? 1 : 0;
+        const int normal = (m_up_abs >= (int)lead) ? 1 : 0;
+        const int expb = normal ? ((int)ee[k] + BIAS) : 0;
+        const int upm  = normal ? (m_up_abs - (int)lead) : m_up_abs;
+        field[k] = (sgn << (wbits - 1)) | (expb << mb_up) | upm;
+    }
+    for (int g = 0; g < ng; ++g) r_shared[g] = sh_g[g];
+    return s_exp;
 }
 
 // light-MS decompose: same stored format as decompose_ms_block, but INTEGER-friendly.

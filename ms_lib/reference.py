@@ -23,6 +23,7 @@ from ms_lib.pack import (
     _e8m0_scale, decompose,
     dequant_weight, weight_int8,
     dequant_weight_mxint8, weight_int8_mxint8,
+    dequant_weight_msfp8,
 )
 
 
@@ -102,6 +103,29 @@ def kv_attention_mxint8(Q, pK, pV, causal=True):
     for h in range(H):
         Kdq = dequant_weight_mxint8(pK["_per"][h])
         Vdq = dequant_weight_mxint8(pV["_per"][h])
+        Lk = Kdq.shape[0]
+        scores = (np.asarray(Q[h], np.float64) @ Kdq.T) / math.sqrt(D)
+        if causal:
+            m = np.triu(np.ones((Lq, Lk)), k=1 + (Lk - Lq))
+            scores = np.where(m > 0, -np.inf, scores)
+        scores = scores - scores.max(axis=1, keepdims=True)
+        pmat = np.exp(scores)
+        pmat /= pmat.sum(axis=1, keepdims=True)
+        out[h] = pmat @ Vdq
+    return out
+
+
+# =============================================================================
+#  MXFP8-MSAQ (E3M4) KV ORACLE  (same attention math, K/V in MXFP8-MSAQ)
+# =============================================================================
+def kv_attention_msfp8(Q, pK, pV, causal=True):
+    """Attention mirror with K/V stored in MXFP8-MSAQ (E3M4). Mirror of kv_attention
+    but the per-head dequant is dequant_weight_msfp8 (pK/pV from pack_kv_msfp8)."""
+    H, Lq, D = Q.shape
+    out = np.zeros((H, Lq, D), dtype=np.float64)
+    for h in range(H):
+        Kdq = dequant_weight_msfp8(pK["_per"][h])                  # [Lk, D]
+        Vdq = dequant_weight_msfp8(pV["_per"][h])                  # [Lk, D]
         Lk = Kdq.shape[0]
         scores = (np.asarray(Q[h], np.float64) @ Kdq.T) / math.sqrt(D)
         if causal:

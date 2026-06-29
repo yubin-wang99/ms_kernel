@@ -223,6 +223,33 @@ def pack_weight_msfp8(W, u, gs):
     return d
 
 
+def dequant_weight_msfp8(p):
+    """MXFP8-MSAQ (E3M4) packed planes -> dense float [OUT,K] (oracle). Bit-exact decode
+    mirror of csrc stream_block_uspec_fp8_e3m4 / msfp8_e3m4_dequant_bf16_kernel: each upper
+    field is an FP8 E3M4 element [sign|exp:3|upmant:(4-u)] with a per-GROUP signed u-bit shared
+    low-mantissa code; value = sign*(m_up*2^u + sh)*2^(ee-MB) * block_scale."""
+    OUT, nb, u, gs, wbits, n_group = (p["OUT"], p["nb"], p["u"], p["gs"], p["wbits"], p["n_group"])
+    EB, MB, BIAS, EMIN = 3, 4, 3, -2
+    mb_up = MB - u
+    exp = p["scale_exp"].T.astype(np.int64)                        # [OUT,nb]
+    up = np.ascontiguousarray(p["upper"].transpose(2, 0, 1))       # [OUT,nb,UB]
+    sh = np.ascontiguousarray(p["shared"].transpose(2, 0, 1))      # [OUT,nb,SB]
+    # unpack the per-element FP8 field as UNSIGNED wbits codes
+    bits = np.unpackbits(up, axis=-1, bitorder="little")[..., : BLOCK * wbits].reshape(*up.shape[:-1], BLOCK, wbits)
+    field = (bits.astype(np.int64) << np.arange(wbits, dtype=np.int64)).sum(axis=-1)   # [OUT,nb,32]
+    sgn = (field >> (wbits - 1)) & 1
+    expf = (field >> mb_up) & ((1 << EB) - 1)
+    upm = field & ((1 << mb_up) - 1)
+    m_up = np.where(expf > 0, (1 << mb_up) | upm, upm).astype(np.int64)
+    ee = np.where(expf > 0, expf - BIAS, EMIN).astype(np.int64)
+    # shared SIGNED u-bit code per group
+    r_shared = _unpack_codes_lsb(sh, n_group, u)                   # [OUT,nb,n_group] signed
+    sh_exp = np.repeat(r_shared, gs, axis=2)                       # [OUT,nb,32]
+    mag = np.where(sgn > 0, -(m_up << u), (m_up << u))
+    val = (mag + sh_exp).astype(np.float64) * (2.0 ** (ee - MB))   # FP8 value (pre block-scale)
+    return (val * (2.0 ** exp)[:, :, None]).reshape(OUT, p["K"])
+
+
 def pack_weight_ra(W, u, gs):
     """REGISTER-ALIGNED pack: SAME codes as pack_weight (signed q_upper/r_shared),
     but the upper plane is padded so each (8-u)-bit code lies WHOLLY inside one 32-bit
@@ -492,6 +519,25 @@ def pack_kv(KV, u, gs):
     H, L, D = KV.shape
     per = [pack_weight(KV[h], u, gs) for h in range(H)]
     # per-head upper/shared are [nb,UB,L]/[nb,SB,L]; move BYTES innermost -> [nb,L,UB]
+    up = np.stack([q["upper"] for q in per]).transpose(0, 1, 3, 2)             # [H,nb,L,UB]
+    sh = np.stack([q["shared"] for q in per]).transpose(0, 1, 3, 2)            # [H,nb,L,SB]
+    return dict(
+        scale_exp=np.ascontiguousarray(np.stack([q["scale_exp"] for q in per])),  # [H,nb,L]
+        upper=np.ascontiguousarray(up),                                        # [H,nb,L,UB]
+        shared=np.ascontiguousarray(sh),                                       # [H,nb,L,SB]
+        H=H, L=L, D=D, nb=per[0]["nb"], u=u, gs=gs, wbits=per[0]["wbits"],
+        UB=per[0]["UB"], SB=per[0]["SB"], n_group=per[0]["n_group"],
+        _per=per,
+    )
+
+
+def pack_kv_msfp8(KV, u, gs):
+    """KV float[H,L,D] -> token-major MXFP8-MSAQ (E3M4) planes (mirror of pack_kv).
+    Per head = pack_weight_msfp8 on [L,D] (blocks along head_dim, token innermost); the
+    byte planes are laid out BYTES-innermost ([H,nb,L,UB]/[H,nb,L,SB]) for coalesced reads.
+    dequant_weight_msfp8 reconstructs each head (used by reference.kv_attention_msfp8)."""
+    H, L, D = KV.shape
+    per = [pack_weight_msfp8(KV[h], u, gs) for h in range(H)]
     up = np.stack([q["upper"] for q in per]).transpose(0, 1, 3, 2)             # [H,nb,L,UB]
     sh = np.stack([q["shared"] for q in per]).transpose(0, 1, 3, 2)            # [H,nb,L,SB]
     return dict(

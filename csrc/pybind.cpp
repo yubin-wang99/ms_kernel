@@ -143,6 +143,23 @@ void kv_append_cuda(
 void kv_append_rot_cuda(
     torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
     int64_t H, int64_t D, int64_t NB, int64_t pos, int64_t Lcap, int64_t u, int64_t gs);
+// MXFP8-MSAQ (E3M4) KV — 1:1 analogs of the INT MSAQ KV ops
+torch::Tensor msfp8_kv_decode_attention_cuda(
+    torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
+    torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
+    int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs, int64_t Lcap);
+torch::Tensor msfp8_kv_decode_attention_batched_cuda(
+    torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
+    torch::Tensor vs, torch::Tensor vu, torch::Tensor vh,
+    int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs, int64_t Lcap);
+torch::Tensor msfp8_kv_kdot_cuda(
+    torch::Tensor q, torch::Tensor ks, torch::Tensor ku, torch::Tensor kh,
+    int64_t B, int64_t H, int64_t Hkv, int64_t Lk, int64_t D, int64_t NB, int64_t u, int64_t gs);
+std::vector<torch::Tensor> msfp8_kv_write_cuda(
+    torch::Tensor X, int64_t H, int64_t L, int64_t D, int64_t NB, int64_t u, int64_t gs);
+void msfp8_kv_append_cuda(
+    torch::Tensor X, torch::Tensor scale_exp, torch::Tensor upper, torch::Tensor shared,
+    int64_t H, int64_t D, int64_t NB, int64_t pos, int64_t Lcap, int64_t u, int64_t gs);
 
 // defined in rotate.cu
 torch::Tensor hadamard_rotate_cuda(torch::Tensor x);
@@ -273,6 +290,20 @@ TORCH_LIBRARY(msaq, m) {
           &kv_decode_attention_batched_cuda);
     m.def("kv_kdot_uspec(Tensor q, Tensor ks, Tensor ku, Tensor kh, int B, int H, int Hkv, "
           "int Lk, int D, int NB, int u, int gs) -> Tensor", &kv_kdot_uspec_cuda);
+    m.def("msfp8_kv_decode_attention(Tensor q, Tensor ks, Tensor ku, Tensor kh, "
+          "Tensor vs, Tensor vu, Tensor vh, "
+          "int H, int Hkv, int Lk, int D, int NB, int u, int gs, int Lcap=-1) -> Tensor",
+          &msfp8_kv_decode_attention_cuda);
+    m.def("msfp8_kv_decode_attention_batched(Tensor q, Tensor ks, Tensor ku, Tensor kh, "
+          "Tensor vs, Tensor vu, Tensor vh, "
+          "int B, int H, int Hkv, int Lk, int D, int NB, int u, int gs, int Lcap=-1) -> Tensor",
+          &msfp8_kv_decode_attention_batched_cuda);
+    m.def("msfp8_kv_kdot(Tensor q, Tensor ks, Tensor ku, Tensor kh, int B, int H, int Hkv, "
+          "int Lk, int D, int NB, int u, int gs) -> Tensor", &msfp8_kv_kdot_cuda);
+    m.def("msfp8_kv_write(Tensor X, int H, int L, int D, int NB, int u, int gs) -> Tensor[]",
+          &msfp8_kv_write_cuda);
+    m.def("msfp8_kv_append(Tensor X, Tensor(a!) scale_exp, Tensor(b!) upper, Tensor(c!) shared, "
+          "int H, int D, int NB, int pos, int Lcap, int u, int gs) -> ()", &msfp8_kv_append_cuda);
     m.def("kv_kdot_relayout(Tensor q, Tensor ks, Tensor hi4, Tensor lowun, Tensor shared, "
           "int B, int H, int Hkv, int Lk, int D, int NB, int u, int gs) -> Tensor", &kv_kdot_relayout_cuda);
     m.def("pv_wmma(Tensor P, Tensor vs, Tensor vu, Tensor vh, "

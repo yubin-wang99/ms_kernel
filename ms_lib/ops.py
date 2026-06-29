@@ -143,6 +143,18 @@ def kv_decode_attention(q_bf16, pK, pV):
                                     int(pK["nb"]), int(pK["u"]), int(pK["gs"]))
 
 
+def msfp8_kv_decode(q_bf16, pK, pV):
+    """MXFP8-MSAQ (E3M4) fused-dequant flash-decode attention. q_bf16 [H,D] (one decode
+    step); pK,pV from pack_kv_msfp8. Returns [H,D] bf16. 1:1 analog of kv_decode_attention."""
+    _require()
+    dev = q_bf16.device
+    ks, ku, kh = _kv_planes(pK, dev)
+    vs, vu, vh = _kv_planes(pV, dev)
+    return _OPS.msfp8_kv_decode_attention(q_bf16, ks, ku, kh, vs, vu, vh,
+                                          int(q_bf16.shape[0]), int(pK["H"]), int(pK["L"]),
+                                          int(pK["D"]), int(pK["nb"]), int(pK["u"]), int(pK["gs"]))
+
+
 # --- plain MXINT8 baselines (pack from pack_*_mxint8: scale_exp + qweight) ----
 def _mxint8_weight_planes(p, device):
     return (torch.from_numpy(p["scale_exp"]).to(device),
