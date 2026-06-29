@@ -1,0 +1,22 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7475.61it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tok | BF16 PPL = 5.6877 | scope=KV (K rot+D-block, V T-block)
+
+                  rung  b/elem |       PPL    dPPL%
+     E2M1 native (FP4)   4.250 |    5.8845   +3.46%
+     E2M3 native (FP6)   6.250 |    5.7049   +0.30%
+    MSAQ vpack u4/gs16    ~5.5 |    6.0538   +6.44%
+  --- MX+ E2M1+u2 (DC residual), gs sweep ---
+      MX+ E2M1+u2 gs32   4.719 |    5.8623   +3.07%
+      MX+ E2M1+u2 gs16   4.781 |    5.8559   +2.96%
+       MX+ E2M1+u2 gs8   4.906 |    5.8554   +2.95%
+       MX+ E2M1+u2 gs4   5.156 |    5.8336   +2.56%
+       MX+ E2M1+u2 gs2   5.656 |    5.7944   +1.88%
+  --- MX+ E2M1+u3 (DC residual), gs sweep ---
+      MX+ E2M1+u3 gs32   4.750 |    5.8419   +2.71%
+      MX+ E2M1+u3 gs16   4.844 |    5.8527   +2.90%
+       MX+ E2M1+u3 gs8   5.031 |    5.8400   +2.68%
+       MX+ E2M1+u3 gs4   5.406 |    5.8262   +2.43%
+       MX+ E2M1+u3 gs2   6.156 |    5.7931   +1.85%

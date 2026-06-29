@@ -1,0 +1,16 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 6338.70it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tok | BF16 PPL = 5.6877
+
+=== (A) K-rotation (scope=k only) ===
+                 cfg |   rot OFF    rot ON |  gain pp
+         E2M1 native |    +8.74%    +2.12% |   +6.62
+         E2M3 native |    +0.25%    +0.08% |   +0.17
+    MX+ E2M1+u3 gs32 |    +2.79%    +1.19% |   +1.60
+
+=== (B) MX+ contribution (DC vs MX+), rotated-K vs V ===
+               where |   DC only       MX+ |  gain pp
+      K (rot, 4.75b) |    +1.89%    +1.19% |   +0.71
+          V (no rot) |    +1.69%    +1.43% |   +0.26
