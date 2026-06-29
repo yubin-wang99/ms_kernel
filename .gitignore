@@ -14,3 +14,6 @@ __pycache__/
 
 # Claude Code local session settings
 .claude/
+
+# captured activations (regenerate with em_kv_capture.py)
+precision/kv_cap.pt
