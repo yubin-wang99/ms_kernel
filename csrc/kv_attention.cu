@@ -2195,8 +2195,15 @@ torch::Tensor kv_decode_attention_cuda(
         int vpack = ((int)u == 4) ? 1 : 0;
         if (const char* e = getenv("MS_KV_VPACK")) vpack = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
         // v8 int8-staged V: u4/gs<=2 and ALL u2/u3 (full-sector Pass-2). vt follows (transposed).
-        int v8 = (!vpack && (((int)u == 4 && (int)gs <= 2) || ((int)u == 2 || (int)u == 3))) ? 1 : 0;
-        if (const char* e = getenv("MS_KV_V8")) v8 = (!vpack && atoi(e) != 0) ? 1 : 0;
+        // v8 int8-staged V is implemented ONLY in the u4 path and the (u,gs)-SPECIALIZED
+        // u2/u3 instantiations (the `if constexpr(U_>0)` staging, dispatched for gs in {8,16}).
+        // The generic U_=-1 fallback (u2/u3 at other gs, or MS_GEMV_NOSPEC) has no v8 staging,
+        // so honoring a runtime v8=1 there makes Pass-2 read int8 that was never produced.
+        const bool nospec_v8 = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+        const bool v8_ok = !vpack && (((int)u == 4 && (int)gs <= 2)
+                         || (((int)u == 2 || (int)u == 3) && ((int)gs == 8 || (int)gs == 16) && !nospec_v8));
+        int v8 = v8_ok ? 1 : 0;
+        if (const char* e = getenv("MS_KV_V8")) v8 = (v8_ok && atoi(e) != 0) ? 1 : 0;
         // separated-scale K dot (u2/u3/u4): factor scales to block level, shared term per-group.
         int sepsc = ((int)u >= 2) ? 1 : 0;
         if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u >= 2 && atoi(e) != 0) ? 1 : 0;
@@ -2292,8 +2299,15 @@ torch::Tensor kv_decode_attention_batched_cuda(
     if (const char* e = getenv("MS_KV_VPACK")) vpack = ((int)u == 4 && atoi(e) != 0) ? 1 : 0;
     // v8: stage V reconstructed to int8 (up*2^u+sh, fits int8 since |up|<=q_max). u4/gs<=2 and
     // ALL u2/u3 (non-vpack) -> Pass-2 reads ONE int8/elem (full-sector, no funnel) like MXINT8.
-    int v8 = (!vpack && (((int)u == 4 && (int)gs <= 2) || ((int)u == 2 || (int)u == 3))) ? 1 : 0;
-    if (const char* e = getenv("MS_KV_V8")) v8 = (!vpack && atoi(e) != 0) ? 1 : 0;
+    // v8 int8-staged V is implemented ONLY in the u4 path and the (u,gs)-SPECIALIZED u2/u3
+    // instantiations (the `if constexpr(U_>0)` staging, dispatched for gs in {8,16}). The
+    // generic U_=-1 fallback (u2/u3 at other gs, or MS_GEMV_NOSPEC) has no v8 staging, so
+    // honoring a runtime v8=1 there makes Pass-2 read int8 that was never produced.
+    const bool nospec_v8 = getenv("MS_GEMV_NOSPEC") && atoi(getenv("MS_GEMV_NOSPEC")) != 0;
+    const bool v8_ok = !vpack && (((int)u == 4 && (int)gs <= 2)
+                     || (((int)u == 2 || (int)u == 3) && ((int)gs == 8 || (int)gs == 16) && !nospec_v8));
+    int v8 = v8_ok ? 1 : 0;
+    if (const char* e = getenv("MS_KV_V8")) v8 = (v8_ok && atoi(e) != 0) ? 1 : 0;
     int sepsc = ((int)u >= 2) ? 1 : 0;             // sepsc now also for u2/u3 (specialized K-dot)
     if (const char* e = getenv("MS_KV_SEPSC")) sepsc = ((int)u >= 2 && atoi(e) != 0) ? 1 : 0;
     int vt = v8 ? 1 : 0;
