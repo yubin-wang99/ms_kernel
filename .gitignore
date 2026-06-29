@@ -4,7 +4,8 @@ build/
 
 # virtualenv
 .venv/
-.venv-vllm/   # isolated vLLM env (torch 2.11/cu13) — kept separate from the MSAQ build env
+# isolated vLLM env (torch 2.11/cu13) — kept separate from the MSAQ build env
+.venv-vllm/
 
 # python / pytest caches
 __pycache__/
