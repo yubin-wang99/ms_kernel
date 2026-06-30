@@ -1,0 +1,26 @@
+# C2 microbench raw output (RTX PRO 4000 Blackwell sm_120, copy peak ~555 GB/s)
+## cudaEvent timing
+C2 microbench (coalesced): 4194304 keys, D=128, codebook 256x8 in smem; peak ~555 GB/s
+  fp4      4.250 b/elem | 0.5018 ms | 568.3 GB/s
+  fp4vq    5.250 b/elem | 0.6224 ms | 566.0 GB/s
+  iso      5.250 b/elem | 0.6285 ms | 560.6 GB/s
+
+## NCU per-kernel (skip 8, count 1)
+### kdot_fp4
+    dram__throughput.avg.pct_of_peak_sustained_elapsed           %        93.77
+    gpu__time_duration.avg                                      us       494.69
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum                   40,625
+    sm__throughput.avg.pct_of_peak_sustained_elapsed             %        56.43
+    sm__warps_active.avg.pct_of_peak_sustained_active            %        94.14
+### kdot_fp4vq
+    dram__throughput.avg.pct_of_peak_sustained_elapsed           %        92.62
+    gpu__time_duration.avg                                      us       618.75
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum                  307,942
+    sm__throughput.avg.pct_of_peak_sustained_elapsed             %        68.23
+    sm__warps_active.avg.pct_of_peak_sustained_active            %        94.77
+### kdot_iso
+    dram__throughput.avg.pct_of_peak_sustained_elapsed           %        91.52
+    gpu__time_duration.avg                                      us       627.87
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum                   36,556
+    sm__throughput.avg.pct_of_peak_sustained_elapsed             %        50.47
+    sm__warps_active.avg.pct_of_peak_sustained_active            %        94.69
