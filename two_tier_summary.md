@@ -26,8 +26,8 @@ Two knobs: **u** (shared bits), **gs** (group size). Smaller gs = finer = more a
 |---|--:|--:|:--:|---|
 | E2M1 native (FP4) | 4.25 | +3.46% | ✗ | even rotated, not alone |
 | **two-tier MX+ E2M1+u3 gs32** | **4.75** | **+2.71%** | **✓** | robust floor (uniform) |
-| **two-tier allocation (mix)** | **5.50** | **+1.30%** | ✓ | per-layer, beats uniform |
-| two-tier allocation (mix) | 5.125 | +1.98% | ✓ | +22% KV capacity |
+| **two-tier allocation (mix)** | **5.098** | **+1.30%** | ✓ | per-layer (4.406b rung), **+22.5% capacity** |
+| two-tier allocation (mix) | 4.867 | +1.65% | ✓ | +28% KV capacity |
 | two-tier MX+ E2M1+u3 gs2 | 6.156 | +1.85% | ✓ | |
 | E2M3 native (FP6) | 6.25 | +0.30% | ✓ | quality anchor |
 

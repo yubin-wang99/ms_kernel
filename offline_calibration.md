@@ -36,12 +36,19 @@ runtime hot path.
 Llama-3.1-8B, wikitext-2, BF16 PPL 5.6877, gate ≤3%. Two rungs: cheap = MX+ E2M1+u3 gs32 (4.75b),
 quality = E2M3 (6.25b).
 
-**KV (per-layer)** — allocation beats any uniform rung at matched bytes by ~0.6pp:
+**KV (per-layer)** — allocation beats any uniform rung at matched bytes by ~0.6pp. Using the minimal
+cheap rung (4.406b = E2M1+MX+, no residual) the curve shifts ~0.4b cheaper:
 
-| avg b/elem | allocation ΔPPL | best uniform @ bytes | capacity vs E2M3 |
-|--:|--:|--|--|
-| 5.50 | **+1.30%** | +1.88% | 0.88× bytes → **+14%** |
-| 5.125 | **+1.98%** | +2.56% | 0.82× → **+22%** |
+| avg b/elem | allocation ΔPPL | capacity vs E2M3 |
+|--:|--:|--|
+| 5.098 | **+1.30%** | 0.816× bytes → **+22.5%** |
+| 4.867 | +1.65% | 0.78× → **+28%** |
+
+A **3-rung hybrid** (adding an INT8-MSAQ mid rung between two-tier-low and E2M3-high, motivated by the
+regime-split where INT8 wins above ~5.3b) does NOT help: at matched bytes it ties or loses to the
+2-rung (e.g. 5.1b: 2-rung +1.30% vs 3-rung +1.57%). The allocation is **bimodal** — sensitive layers
+want full E2M3, tolerant layers want the cheap rung, nobody wants the middle (E2M3 at 6.25b already
+beats INT8 at 6.3b). So two-tier-low + E2M3-high is optimal; the design stays a clean 2-rung.
 
 **KV (head-wise)** beats per-layer by a further ~0.15pp at matched bytes (head 6,7 sensitive, 0,1
 tolerant — ~3× spread). Modest; needs per-head byte-offset packing.

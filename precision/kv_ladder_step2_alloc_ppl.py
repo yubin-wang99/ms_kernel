@@ -23,9 +23,10 @@ from two_tier_gs_sweep_ppl import quant, bits
 DEV = "cuda"; MAXLEN, STRIDE = 2048, 1024
 PROBE_WIN = int(os.environ.get("PROBE_WIN", "12"))         # ranking-only (fast)
 FULL_WIN = int(os.environ.get("FULL_WIN", "30"))           # final allocation evals
-CHEAP = (2, 1, 3, 32, True)                                # MX+ E2M1+u3 gs32 -> 4.75b
+_CU = int(os.environ.get("CHEAP_U", "3"))                  # cheap rung u (CHEAP_U=0 -> 4.406b, no residual)
+CHEAP = (2, 1, _CU, 32, True)                              # default MX+ E2M1+u3 gs32 -> 4.75b
 QUAL = (2, 3, 0, 32, False)                                # E2M3 -> 6.25b
-B_CHEAP, B_QUAL = bits(2, 1, 3, 32, True), bits(2, 3, 0, 32)
+B_CHEAP, B_QUAL = bits(2, 1, _CU, 32, True), bits(2, 3, 0, 32)
 
 
 def hadamard(n):

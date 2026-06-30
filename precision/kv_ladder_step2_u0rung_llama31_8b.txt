@@ -1,0 +1,20 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 5935.94it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tok | BF16 PPL = 5.6877 | NL=32 | cheap=4.406b E2M3=6.250b
+
+probe baseline (all E2M3, 12w) PPL=5.3131; per-layer cheap ΔPPL%:
+  rank(least->most sensitive): 11:-0.12 15:-0.07 19:-0.07 28:-0.06 8:-0.04 26:-0.02 9:-0.02 14:-0.01 21:-0.00 5:-0.00 25:-0.00 17:-0.00 27:+0.02 10:+0.02 13:+0.03 20:+0.03 22:+0.04 6:+0.05 24:+0.06 29:+0.06 18:+0.06 2:+0.07 0:+0.07 23:+0.07 30:+0.10 3:+0.11 31:+0.11 4:+0.12 7:+0.13 16:+0.14 1:+0.14 12:+0.14
+
+allocation curve (FULL 30w) — K cheap layers vs uniform:
+  K avg b/elem |       PPL    dPPL%
+  0      6.250 |    5.7049   +0.30%
+  4      6.020 |    5.7122   +0.43%
+  8      5.789 |    5.7181   +0.53%
+ 12      5.559 |    5.7358   +0.84%
+ 16      5.328 |    5.7467   +1.04%
+ 20      5.098 |    5.7618   +1.30%
+ 24      4.867 |    5.7816   +1.65%
+ 28      4.637 |    5.8012   +1.99%
+ 32      4.406 |    5.8235   +2.39%
