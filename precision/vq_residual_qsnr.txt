@@ -1,0 +1,174 @@
+# Full VQ residual — structure + recovery on Llama-3.1-8B weights
+
+
+## down_proj  shape=(4096, 14336)
+
+### FP4  (zero QSNR 18.58 dB)
+  structure (g=8): top-1/2/4 PC energy = 12.5% / 25.0% / 50.0%  (white ref top-1 = 12.5%); eff_rank/g = 1.00; adj-corr = +0.000
+  scalar VQ (per-elem): Δ@1b = +4.84 dB,  Δ@2b = +9.79 dB
+  vector VQ (storage b/elem -> ΔdB, g/K):
+    0.062 b ->  +0.19 dB  (g32/K4) ★
+    0.125 b ->  +0.38 dB  (g16/K4) ★
+    0.125 b ->  +0.46 dB  (g32/K16) ★
+    0.188 b ->  +0.77 dB  (g32/K64) ★
+    0.250 b ->  +0.81 dB  (g8/K4) ★
+    0.250 b ->  +0.96 dB  (g16/K16) ★
+    0.250 b ->  +1.09 dB  (g32/K256) ★
+    0.375 b ->  +1.58 dB  (g16/K64) ★
+    0.500 b ->  +1.87 dB  (g4/K4) ★
+    0.500 b ->  +2.07 dB  (g8/K16) ★
+    0.500 b ->  +2.26 dB  (g16/K256) ★
+    0.750 b ->  +3.49 dB  (g8/K64) ★
+    1.000 b ->  +4.79 dB  (g4/K16) ★
+    1.000 b ->  +4.93 dB  (g8/K256) ★
+    1.500 b ->  +7.37 dB  (g4/K64) ★
+    2.000 b -> +10.27 dB  (g4/K256) ★
+
+### INT4  (zero QSNR 16.36 dB)
+  structure (g=8): top-1/2/4 PC energy = 12.5% / 25.0% / 50.0%  (white ref top-1 = 12.5%); eff_rank/g = 1.00; adj-corr = -0.000
+  scalar VQ (per-elem): Δ@1b = +6.00 dB,  Δ@2b = +11.98 dB
+  vector VQ (storage b/elem -> ΔdB, g/K):
+    0.062 b ->  +0.20 dB  (g32/K4) ★
+    0.125 b ->  +0.43 dB  (g16/K4) ★
+    0.125 b ->  +0.48 dB  (g32/K16) ★
+    0.188 b ->  +0.82 dB  (g32/K64) ★
+    0.250 b ->  +0.89 dB  (g8/K4) ★
+    0.250 b ->  +1.04 dB  (g16/K16) ★
+    0.250 b ->  +1.18 dB  (g32/K256) ★
+    0.375 b ->  +1.78 dB  (g16/K64) ★
+    0.500 b ->  +2.13 dB  (g4/K4) ★
+    0.500 b ->  +2.34 dB  (g8/K16) ★
+    0.500 b ->  +2.59 dB  (g16/K256) ★
+    0.750 b ->  +4.15 dB  (g8/K64) ★
+    1.000 b ->  +5.82 dB  (g4/K16) ★
+    1.000 b ->  +5.95 dB  (g8/K256) ★
+    1.500 b ->  +8.90 dB  (g4/K64) ★
+    2.000 b -> +11.98 dB  (g4/K256) ★
+
+### FP6  (zero QSNR 30.90 dB)
+  structure (g=8): top-1/2/4 PC energy = 12.5% / 25.0% / 50.1%  (white ref top-1 = 12.5%); eff_rank/g = 1.00; adj-corr = -0.000
+  scalar VQ (per-elem): Δ@1b = +5.67 dB,  Δ@2b = +10.81 dB
+  vector VQ (storage b/elem -> ΔdB, g/K):
+    0.062 b ->  +0.19 dB  (g32/K4) ★
+    0.125 b ->  +0.41 dB  (g16/K4) ★
+    0.125 b ->  +0.48 dB  (g32/K16) ★
+    0.188 b ->  +0.81 dB  (g32/K64) ★
+    0.250 b ->  +0.90 dB  (g8/K4) ★
+    0.250 b ->  +1.02 dB  (g16/K16) ★
+    0.250 b ->  +1.16 dB  (g32/K256) ★
+    0.375 b ->  +1.73 dB  (g16/K64) ★
+    0.500 b ->  +2.08 dB  (g4/K4) ★
+    0.500 b ->  +2.29 dB  (g8/K16) ★
+    0.500 b ->  +2.51 dB  (g16/K256) ★
+    0.750 b ->  +3.98 dB  (g8/K64) ★
+    1.000 b ->  +5.54 dB  (g4/K16) ★
+    1.000 b ->  +5.65 dB  (g8/K256) ★
+    1.500 b ->  +8.50 dB  (g4/K64) ★
+    2.000 b -> +11.42 dB  (g4/K256) ★
+
+### INT6  (zero QSNR 29.53 dB)
+  structure (g=8): top-1/2/4 PC energy = 12.5% / 25.0% / 50.0%  (white ref top-1 = 12.5%); eff_rank/g = 1.00; adj-corr = -0.000
+  scalar VQ (per-elem): Δ@1b = +5.97 dB,  Δ@2b = +11.92 dB
+  vector VQ (storage b/elem -> ΔdB, g/K):
+    0.062 b ->  +0.20 dB  (g32/K4) ★
+    0.125 b ->  +0.41 dB  (g16/K4) ★
+    0.125 b ->  +0.48 dB  (g32/K16) ★
+    0.188 b ->  +0.82 dB  (g32/K64) ★
+    0.250 b ->  +0.89 dB  (g8/K4) ★
+    0.250 b ->  +1.05 dB  (g16/K16) ★
+    0.250 b ->  +1.19 dB  (g32/K256) ★
+    0.375 b ->  +1.77 dB  (g16/K64) ★
+    0.500 b ->  +2.16 dB  (g4/K4) ★
+    0.500 b ->  +2.33 dB  (g8/K16) ★
+    0.500 b ->  +2.59 dB  (g16/K256) ★
+    0.750 b ->  +4.17 dB  (g8/K64) ★
+    1.000 b ->  +5.85 dB  (g4/K16) ★
+    1.000 b ->  +5.93 dB  (g8/K256) ★
+    1.500 b ->  +8.85 dB  (g4/K64) ★
+    2.000 b -> +11.90 dB  (g4/K256) ★
+
+## q_proj  shape=(4096, 4096)
+
+### FP4  (zero QSNR 17.88 dB)
+  structure (g=8): top-1/2/4 PC energy = 12.8% / 25.5% / 50.6%  (white ref top-1 = 12.5%); eff_rank/g = 1.00; adj-corr = +0.000
+  scalar VQ (per-elem): Δ@1b = +4.39 dB,  Δ@2b = +9.31 dB
+  vector VQ (storage b/elem -> ΔdB, g/K):
+    0.062 b ->  +0.22 dB  (g32/K4) ★
+    0.125 b ->  +0.45 dB  (g16/K4) ★
+    0.125 b ->  +0.55 dB  (g32/K16) ★
+    0.188 b ->  +0.90 dB  (g32/K64) ★
+    0.250 b ->  +0.94 dB  (g8/K4) ★
+    0.250 b ->  +1.13 dB  (g16/K16) ★
+    0.250 b ->  +1.29 dB  (g32/K256) ★
+    0.375 b ->  +1.82 dB  (g16/K64) ★
+    0.500 b ->  +2.03 dB  (g4/K4) ★
+    0.500 b ->  +2.32 dB  (g8/K16) ★
+    0.500 b ->  +2.55 dB  (g16/K256) ★
+    0.750 b ->  +3.71 dB  (g8/K64) ★
+    1.000 b ->  +4.78 dB  (g4/K16) ★
+    1.000 b ->  +5.09 dB  (g8/K256) ★
+    1.500 b ->  +7.42 dB  (g4/K64) ★
+    2.000 b -> +10.23 dB  (g4/K256) ★
+
+### INT4  (zero QSNR 15.70 dB)
+  structure (g=8): top-1/2/4 PC energy = 12.9% / 25.8% / 50.8%  (white ref top-1 = 12.5%); eff_rank/g = 1.00; adj-corr = +0.001
+  scalar VQ (per-elem): Δ@1b = +3.84 dB,  Δ@2b = +10.60 dB
+  vector VQ (storage b/elem -> ΔdB, g/K):
+    0.062 b ->  +0.21 dB  (g32/K4) ★
+    0.125 b ->  +0.42 dB  (g16/K4) ★
+    0.125 b ->  +0.49 dB  (g32/K16) ★
+    0.188 b ->  +0.82 dB  (g32/K64) ★
+    0.250 b ->  +0.84 dB  (g8/K4) ★
+    0.250 b ->  +1.01 dB  (g16/K16) ★
+    0.250 b ->  +1.16 dB  (g32/K256) ★
+    0.375 b ->  +1.67 dB  (g16/K64) ★
+    0.500 b ->  +1.89 dB  (g4/K4) ★
+    0.500 b ->  +2.14 dB  (g8/K16) ★
+    0.500 b ->  +2.37 dB  (g16/K256) ★
+    0.750 b ->  +3.56 dB  (g8/K64) ★
+    1.000 b ->  +4.84 dB  (g4/K16) ★
+    1.000 b ->  +5.20 dB  (g8/K256) ★
+    1.500 b ->  +8.33 dB  (g4/K64) ★
+    2.000 b -> +11.44 dB  (g4/K256) ★
+
+### FP6  (zero QSNR 29.98 dB)
+  structure (g=8): top-1/2/4 PC energy = 12.6% / 25.2% / 50.2%  (white ref top-1 = 12.5%); eff_rank/g = 1.00; adj-corr = -0.000
+  scalar VQ (per-elem): Δ@1b = +5.49 dB,  Δ@2b = +11.30 dB
+  vector VQ (storage b/elem -> ΔdB, g/K):
+    0.062 b ->  +0.21 dB  (g32/K4) ★
+    0.125 b ->  +0.43 dB  (g16/K4) ★
+    0.125 b ->  +0.50 dB  (g32/K16) ★
+    0.188 b ->  +0.85 dB  (g32/K64) ★
+    0.250 b ->  +0.89 dB  (g8/K4) ★
+    0.250 b ->  +1.07 dB  (g16/K16) ★
+    0.250 b ->  +1.23 dB  (g32/K256) ★
+    0.375 b ->  +1.79 dB  (g16/K64) ★
+    0.500 b ->  +2.06 dB  (g4/K4) ★
+    0.500 b ->  +2.35 dB  (g8/K16) ★
+    0.500 b ->  +2.59 dB  (g16/K256) ★
+    0.750 b ->  +4.01 dB  (g8/K64) ★
+    1.000 b ->  +5.44 dB  (g4/K16) ★
+    1.000 b ->  +5.59 dB  (g8/K256) ★
+    1.500 b ->  +8.38 dB  (g4/K64) ★
+    2.000 b -> +11.30 dB  (g4/K256) ★
+
+### INT6  (zero QSNR 27.65 dB)
+  structure (g=8): top-1/2/4 PC energy = 12.7% / 25.3% / 50.4%  (white ref top-1 = 12.5%); eff_rank/g = 1.00; adj-corr = -0.000
+  scalar VQ (per-elem): Δ@1b = +4.96 dB,  Δ@2b = +11.20 dB
+  vector VQ (storage b/elem -> ΔdB, g/K):
+    0.062 b ->  +0.20 dB  (g32/K4) ★
+    0.125 b ->  +0.42 dB  (g16/K4) ★
+    0.125 b ->  +0.49 dB  (g32/K16) ★
+    0.188 b ->  +0.82 dB  (g32/K64) ★
+    0.250 b ->  +0.88 dB  (g8/K4) ★
+    0.250 b ->  +1.03 dB  (g16/K16) ★
+    0.250 b ->  +1.18 dB  (g32/K256) ★
+    0.375 b ->  +1.74 dB  (g16/K64) ★
+    0.500 b ->  +2.03 dB  (g4/K4) ★
+    0.500 b ->  +2.25 dB  (g8/K16) ★
+    0.500 b ->  +2.49 dB  (g16/K256) ★
+    0.750 b ->  +3.81 dB  (g8/K64) ★
+    1.000 b ->  +5.07 dB  (g4/K16) ★
+    1.000 b ->  +5.31 dB  (g8/K256) ★
+    1.500 b ->  +8.37 dB  (g4/K64) ★
+    2.000 b -> +11.37 dB  (g4/K256) ★
