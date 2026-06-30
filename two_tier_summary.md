@@ -48,8 +48,15 @@ remains correct for its native FP8 (eb≥3) regime. Detail: `precision/two_tier_
 
 | scope | robust (≤3%) floor | why |
 |---|---|---|
-| **KV** | **≈ 4.75 b/elem** (uniform); allocation gives **+1.3% at 5.5b** | no native E2M3 wall + KV is the most quant-tolerant scope → the fractional band lives |
-| weight | ≈ 6.0–6.25 b/elem | nothing usable below E2M3; the band is dominated |
+| **KV** | **≈ 4.53 b/elem** uniform (u2/mg32/E2M0-residual-scale, +2.51%); allocation gives **+1.3% at 5.5b** | no native E2M3 wall + KV is the most quant-tolerant scope → the fractional band lives |
+| weight | ≈ 5.3–5.5 b/elem (allocated); ~6.0–6.25b uniform | allocation makes sub-E2M3 usable; uniform is dominated by E2M3 |
+
+**Residual-scale bit-width** (`two_tier_bulkbw_kv_ppl.py`): the per-group shared scale need not be a
+full E8M0 — a tiny **E2M0** (2 exponent bits) is both cheaper AND more accurate (it regularizes the
+DC-residual scale, preventing overfit to noise). Sweeping (u, mg, bulk_bw), the lowest KV bits within
+3% is **4.531 b/elem** (u2/mg32/E2M0, +2.51%) — vs 4.75b for the E8M0 variant, i.e. **1.72b below
+E2M3 (6.25b) at usable accuracy → ~38% KV capacity**. Coarse mg + tiny scale wins (KV's headroom needs
+neither fine sharing nor wide scale range).
 
 **One line:** two-tier's robust KV accuracy starts at **~4.75 b/elem — about 1.5 bits below the native
 FP6 (E2M3) robust point (6.25b)**. It populates the ~4.75–5.5b gap between the hardware rungs {4,6,8},

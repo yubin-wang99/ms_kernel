@@ -22,6 +22,43 @@ other does not.* That single choice cascades into three consequences:
    per-element unpack). MXFP-MSAQ's shared, multiplied by each element's exponent, **cannot** be
    pulled out — it stays inside the per-element dequant (the sub-byte unpack bottleneck of §2).
 
+## The one root difference, made concrete — relative vs absolute correction
+
+Both store `base_i + shared_g · (scale)`. The ONLY difference is the scale the shared rides:
+
+```
+MXFP-MSAQ:  x̂_i = base_i + sh_g · 2^(e_i − m)     scale = each element's OWN exponent e_i
+two-tier :  x̂_i = base_i + sh_g · d_blk           scale = ONE per-block E8M0 d_blk
+```
+
+So MXFP-MSAQ's shared is a **relative** (per-element, magnitude-proportional) mantissa refinement;
+two-tier's is an **absolute** (single-scale, same for all) additive offset.
+
+**Worked example — an outlier block** `[16.0, 0.5, 0.4, 0.3]` (one outlier + a ~0.4 bulk), E2M1
+(narrow exponent range):
+1. the block E8M0 is set by the **max (16)** → the bulk (0.3–0.5) is ~2⁻⁵ of the max → its exponent
+   floors at e_min → the bulk is flushed toward 0.
+2. **MXFP-MSAQ correction:** the bulk elements' e_i is at the floor → their shared correction
+   `sh · 2^(e_min − m)` is ~0 → **the bulk cannot be lifted. Collapse** (the +3.7e7% row below).
+3. **two-tier correction:** residual `r = [0, 0.5, 0.4, 0.3]`; its own `d_blk` is set to the **bulk
+   scale (~0.4)**, independent of the block max → adds ~0.4 back to the bulk → **recovered**. The
+   outlier is already handled by base+MX+. **Survives.**
+
+A relative correction couples the whole block to its largest element (one outlier inflates the scale
+and starves the rest); an absolute offset carries its own scale and breaks that coupling.
+
+### The three consequences cascade from this one choice
+
+| | MXFP-MSAQ (relative) | two-tier (absolute) |
+|---|---|---|
+| **① reach (u)** | shares mantissa bits → **u ≤ mb** (no E2M1+u2…) | offset independent of base → **any u** (E2M1+u4) |
+| **② bit cost** | reuses the element's exponent → **no separate scale** | needs its own E8M0 → **+0.25 b/elem** |
+| **③ kernel split** | `Σ A_i·sh·2^(e_i−m)` — 2^(e_i) entangled with data → **cannot factor** → per-element unpack | `Σ A_i·(sh·d) = (Σ A_i)·sh·d = ĀR̄` → **1/32-FLOP correction GEMM**, native base, no unpack |
+
+③ is the decisive one: only a **uniform** shared scale lets `Σ A_i·const` collapse to `(Σ A_i)·const`.
+MXFP-MSAQ's per-element scale never collapses → it keeps the sub-byte unpack bottleneck two-tier
+exists to escape.
+
 ## Experiment — matched per-element E2M1, weight scope, Llama-3.1-8B (BF16 PPL 5.6877)
 
 two-tier = `quant(2,1,u,gs)` (additive, DC=recon-L2). MXFP-MSAQ = `msaq_mxfp8(u,gs,2,1+u)` (efb,

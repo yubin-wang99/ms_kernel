@@ -1,0 +1,64 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7185.75it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tok | BF16 PPL = 5.6877 | KV (rot+MX+), bulk_bw sweep
+
+ u  mg  bw |  b/elem |   dPPL%  <3%
+ 2  32   8 |   4.719 |  +3.07%     
+ 2  32   4 |   4.594 |  +2.76%   OK
+ 2  32   2 |   4.531 |  +2.51%   OK
+ 2  16   8 |   5.031 |  +2.51%   OK
+ 2  16   4 |   4.781 |  +2.72%   OK
+ 2  16   2 |   4.656 |  +2.47%   OK
+ 2   8   8 |   5.656 |  +2.77%   OK
+ 2   8   4 |   5.156 |  +2.70%   OK
+ 2   8   2 |   4.906 |  +2.39%   OK
+ 2   4   8 |   6.906 |  +2.33%   OK
+ 2   4   4 |   5.906 |  +2.37%   OK
+ 2   4   2 |   5.406 |  +2.40%   OK
+ 2   2   8 |   9.406 |  +1.75%   OK
+ 2   2   4 |   7.406 |  +1.59%   OK
+ 2   2   2 |   6.406 |  +1.90%   OK
+ 3  32   8 |   4.750 |  +2.71%   OK
+ 3  32   4 |   4.625 |  +2.87%   OK
+ 3  32   2 |   4.562 |  +2.45%   OK
+ 3  16   8 |   5.094 |  +2.94%   OK
+ 3  16   4 |   4.844 |  +2.59%   OK
+ 3  16   2 |   4.719 |  +2.39%   OK
+ 3   8   8 |   5.781 |  +2.68%   OK
+ 3   8   4 |   5.281 |  +2.85%   OK
+ 3   8   2 |   5.031 |  +2.52%   OK
+ 3   4   8 |   7.156 |  +2.24%   OK
+ 3   4   4 |   6.156 |  +2.36%   OK
+ 3   4   2 |   5.656 |  +2.27%   OK
+ 3   2   8 |   9.906 |  +1.80%   OK
+ 3   2   4 |   7.906 |  +1.63%   OK
+ 3   2   2 |   6.906 |  +1.61%   OK
+ 4  32   8 |   4.781 |  +2.65%   OK
+ 4  32   4 |   4.656 |  +2.79%   OK
+ 4  32   2 |   4.594 |  +2.45%   OK
+ 4  16   8 |   5.156 |  +2.42%   OK
+ 4  16   4 |   4.906 |  +2.76%   OK
+ 4  16   2 |   4.781 |  +2.39%   OK
+ 4   8   8 |   5.906 |  +2.81%   OK
+ 4   8   4 |   5.406 |  +2.70%   OK
+ 4   8   2 |   5.156 |  +2.52%   OK
+ 4   4   8 |   7.406 |  +2.24%   OK
+ 4   4   4 |   6.406 |  +2.18%   OK
+ 4   4   2 |   5.906 |  +2.36%   OK
+ 4   2   8 |  10.406 |  +1.45%   OK
+ 4   2   4 |   8.406 |  +1.67%   OK
+ 4   2   2 |   7.406 |  +1.84%   OK
+
+=== within 3%, sorted by bits (lowest first) ===
+  4.531 b/elem : u2/mg32/bw2  +2.51%
+  4.562 b/elem : u3/mg32/bw2  +2.45%
+  4.594 b/elem : u4/mg32/bw2  +2.45%
+  4.594 b/elem : u2/mg32/bw4  +2.76%
+  4.625 b/elem : u3/mg32/bw4  +2.87%
+  4.656 b/elem : u2/mg16/bw2  +2.47%
+  4.656 b/elem : u4/mg32/bw4  +2.79%
+  4.719 b/elem : u3/mg16/bw2  +2.39%
+
+LOWEST bits within 3%: 4.531 b/elem  (u2/mg32/bulk_bw2, +2.51%)
