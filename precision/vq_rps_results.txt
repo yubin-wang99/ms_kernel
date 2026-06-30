@@ -1,0 +1,65 @@
+# Capacity model — llama8b on rtxpro4000 (HBM 24GB x util 0.9 - workspace 2.0GB = 19.6GB usable)
+# KV = 2*layers*Hkv*head_dim = 65,536 elem/token; decode BW 0.56TB/s x eff 1.0; L_out=128
+# ⚠️ compare formats at ISO-ACCURACY (rows below seeded from this repo; edit to your matched budgets)
+
+            format  Wgt(GB)  KV B/tok | Bmax@1k Bmax@4k Bmax@16k Bmax@64k Bmax@128k
+              bf16     16.1    128.0K |      23       6       1       0       0
+     MXINT8 (W+KV)      8.3     66.0K |     145      40      10       2       1
+     native FP6 KV      8.3     50.0K |     191      53      13       3       1
+ mantissa-share KV      8.3     43.5K |     220      62      15       3       1
+    FP4+VQ KV 5.25      8.3     42.0K |     228      64      16       4       2
+    FP4+VQ KV 4.75      8.3     38.0K |     252      71      17       4       2
+     native FP4 KV      8.3     34.0K |     282      79      19       4       2
+
+## B_max ratio vs MXINT8 (>1 = fit more sequences at same accuracy & HBM)
+            format | 1k 4k 16k 64k 128k
+              bf16 | 0.16x 0.15x 0.10x 0.00x 0.00x
+     MXINT8 (W+KV) | 1.00x 1.00x 1.00x 1.00x 1.00x
+     native FP6 KV | 1.32x 1.32x 1.30x 1.50x 1.00x
+ mantissa-share KV | 1.52x 1.55x 1.50x 1.50x 1.00x
+    FP4+VQ KV 5.25 | 1.57x 1.60x 1.60x 2.00x 2.00x
+    FP4+VQ KV 4.75 | 1.74x 1.77x 1.70x 2.00x 2.00x
+     native FP4 KV | 1.94x 1.98x 1.90x 2.00x 2.00x
+#   'inf' = servable in this format while MXINT8 OOMs (BINARY capacity win, no ratio) —
+#   e.g. 70B on 1xH100: MXINT8 weights alone OOM, only W-quant fits. Frame on a FIXED GPU
+#   budget: weight-quant serves the model on FEWER GPUs; KV-quant then adds batch on top.
+
+## Projected decode throughput at B=B_max  (memory-bound roofline; tok/s | req/s)
+            format | 1k 4k 16k 64k 128k
+              bf16 |     1k|   5     0k|   1     0k|   0    OOM       OOM   
+     MXINT8 (W+KV) |     4k|  32     1k|   9     0k|   2     0k|   1     0k|   0
+     native FP6 KV |     5k|  43     2k|  12     0k|   3     0k|   1     0k|   0
+ mantissa-share KV |     6k|  49     2k|  14     0k|   3     0k|   1     0k|   0
+    FP4+VQ KV 5.25 |     7k|  51     2k|  14     0k|   4     0k|   1     0k|   0
+    FP4+VQ KV 4.75 |     7k|  56     2k|  16     0k|   4     0k|   1     0k|   0
+     native FP4 KV |     8k|  63     2k|  18     1k|   4     0k|   1     0k|   1
+
+## Throughput ratio vs MXINT8 (the paper headline — RPS gain from capacity)
+            format | 1k 4k 16k 64k 128k
+              bf16 | 0.16x 0.15x 0.11x 0.00x 0.00x
+     MXINT8 (W+KV) | 1.00x 1.00x 1.00x 1.00x 1.00x
+     native FP6 KV | 1.32x 1.32x 1.31x 1.40x 1.14x
+ mantissa-share KV | 1.52x 1.53x 1.51x 1.51x 1.21x
+    FP4+VQ KV 5.25 | 1.57x 1.58x 1.58x 1.75x 1.75x
+    FP4+VQ KV 4.75 | 1.74x 1.75x 1.72x 1.85x 1.85x
+     native FP4 KV | 1.94x 1.96x 1.92x 1.97x 1.97x
+
+## Max context length at fixed batch (how long a context fits in HBM)
+            format | B=8 B=32 B=128
+              bf16 |     3k     844     211
+     MXINT8 (W+KV) |    20k       5k       1k
+     native FP6 KV |    26k       6k       1k
+ mantissa-share KV |    31k       7k       1k
+    FP4+VQ KV 5.25 |    32k       8k       2k
+    FP4+VQ KV 4.75 |    35k       8k       2k
+     native FP4 KV |    39k       9k       2k
+
+# HOW TO READ (the honest framing):
+# - B_max RATIO is ~constant in L (B_max ∝ 1/(L·kv_bytes) -> L cancels): low-bit KV admits a
+#   ~fixed multiple MORE sequences -> ~fixed throughput multiple at the capacity frontier.
+# - But capacity only BINDS at LONG ctx / LARGE model: short ctx -> B_max is huge (1000s) so
+#   compute/scheduler caps you first (capacity moot); long ctx -> B_max is tiny (single digits)
+#   and IS the bottleneck -> the bit-ratio win becomes the real, decisive RPS win.
+# - So the paper plot to show: B_max (and throughput) vs context length, with the low-bit curve
+#   staying servable (B_max>=1) far past where MXINT8 OOMs. This is what fixed-batch latency hides.
+# - Pair with the accuracy-vs-bits Pareto (these bits MUST be iso-accuracy) to rebut 'just use INT4'.
