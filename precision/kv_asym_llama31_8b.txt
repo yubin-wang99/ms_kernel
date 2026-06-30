@@ -1,0 +1,27 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7002.22it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tok | BF16 PPL = 5.6877 | K/V asymmetric | L=4.406 M=5.344 H=6.250 b
+
+ K  V |  avg b |   dPPL%
+ L  L |  4.406 |  +2.39%
+ L  M |  4.875 |  +2.40%
+ L  H |  5.328 |  +1.48%
+ M  L |  4.875 |  +1.54%
+ M  M |  5.344 |  +1.41%
+ M  H |  5.797 |  +0.56%
+ H  L |  5.328 |  +1.31%
+ H  M |  5.797 |  +1.12%
+ H  H |  6.250 |  +0.30%
+
+=== sorted by avg bytes; * = on the Pareto frontier ===
+  4.406b   +2.39%  K=L(4.41) V=L(4.41) *
+  4.875b   +1.54%  K=M(5.34) V=L(4.41) *  <- ASYMMETRIC
+  4.875b   +2.40%  K=L(4.41) V=M(5.34) 
+  5.328b   +1.31%  K=H(6.25) V=L(4.41) *  <- ASYMMETRIC
+  5.328b   +1.48%  K=L(4.41) V=H(6.25) 
+  5.344b   +1.41%  K=M(5.34) V=M(5.34) 
+  5.797b   +0.56%  K=M(5.34) V=H(6.25) *  <- ASYMMETRIC
+  5.797b   +1.12%  K=H(6.25) V=M(5.34) 
+  6.250b   +0.30%  K=H(6.25) V=H(6.25) *

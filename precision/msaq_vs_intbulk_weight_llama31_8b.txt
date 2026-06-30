@@ -1,0 +1,86 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 3296.18it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tok | BF16 PPL = 5.6877 | INT base held | MXINT8-MSAQ vs INT+bulk
+
+--- MXINT8-MSAQ.efb ---
+  u2/mg2   7.250b  +0.53%
+  u2/mg4   6.750b  +0.65%
+  u2/mg8   6.500b  +0.82%
+  u2/mg16  6.375b  +0.81%
+  u2/mg32  6.312b  +0.85%
+  u3/mg2   6.750b  +1.97%
+  u3/mg4   6.000b  +2.70%
+  u3/mg8   5.625b  +3.01%
+  u3/mg16  5.438b  +3.37%
+  u3/mg32  5.344b  +3.49%
+  u4/mg2   6.250b  +6.87%
+  u4/mg4   5.250b  +8.86%
+  u4/mg8   4.750b +10.79%
+  u4/mg16  4.500b +12.20%
+  u4/mg32  4.375b +12.27%
+--- INT{n} + bulk residual ---
+  INT4 u2/mg8/bw2  4.750b +15.23%
+  INT4 u2/mg8/bw4  5.000b +15.32%
+  INT4 u2/mg16/bw2  4.500b +16.90%
+  INT4 u2/mg16/bw4  4.625b +16.31%
+  INT4 u2/mg32/bw2  4.375b +17.03%
+  INT4 u2/mg32/bw4  4.438b +16.43%
+  INT4 u3/mg8/bw2  4.875b +15.12%
+  INT4 u3/mg8/bw4  5.125b +15.02%
+  INT4 u3/mg16/bw2  4.562b +17.22%
+  INT4 u3/mg16/bw4  4.688b +16.19%
+  INT4 u3/mg32/bw2  4.406b +16.95%
+  INT4 u3/mg32/bw4  4.469b +16.61%
+  INT5 u2/mg8/bw2  5.750b  +3.43%
+  INT5 u2/mg8/bw4  6.000b  +3.21%
+  INT5 u2/mg16/bw2  5.500b  +3.68%
+  INT5 u2/mg16/bw4  5.625b  +3.59%
+  INT5 u2/mg32/bw2  5.375b  +3.90%
+  INT5 u2/mg32/bw4  5.438b  +3.46%
+  INT5 u3/mg8/bw2  5.875b  +3.37%
+  INT5 u3/mg8/bw4  6.125b  +3.26%
+  INT5 u3/mg16/bw2  5.562b  +3.72%
+  INT5 u3/mg16/bw4  5.688b  +3.64%
+  INT5 u3/mg32/bw2  5.406b  +3.82%
+  INT5 u3/mg32/bw4  5.469b  +3.51%
+  INT6 u2/mg8/bw2  6.750b  +0.71%
+  INT6 u2/mg8/bw4  7.000b  +0.70%
+  INT6 u2/mg16/bw2  6.500b  +0.80%
+  INT6 u2/mg16/bw4  6.625b  +0.81%
+  INT6 u2/mg32/bw2  6.375b  +0.77%
+  INT6 u2/mg32/bw4  6.438b  +0.77%
+  INT6 u3/mg8/bw2  6.875b  +0.68%
+  INT6 u3/mg8/bw4  7.125b  +0.67%
+  INT6 u3/mg16/bw2  6.562b  +0.83%
+  INT6 u3/mg16/bw4  6.688b  +0.77%
+  INT6 u3/mg32/bw2  6.406b  +0.72%
+  INT6 u3/mg32/bw4  6.469b  +0.72%
+
+=== Pareto frontier (lowest dPPL at each bit budget; scheme tagged) ===
+   4.375b  +12.27%   MXINT8-MSAQ  u4/mg32
+   4.500b  +12.20%   MXINT8-MSAQ  u4/mg16
+   4.750b  +10.79%   MXINT8-MSAQ  u4/mg8
+   5.250b   +8.86%   MXINT8-MSAQ  u4/mg4
+   5.344b   +3.49%   MXINT8-MSAQ  u3/mg32
+   5.438b   +3.37%   MXINT8-MSAQ  u3/mg16
+   5.625b   +3.01%   MXINT8-MSAQ  u3/mg8
+   6.000b   +2.70%   MXINT8-MSAQ  u3/mg4
+   6.312b   +0.85%   MXINT8-MSAQ  u2/mg32
+   6.375b   +0.77%     INT6+bulk  u2/mg32/bw2
+   6.406b   +0.72%     INT6+bulk  u3/mg32/bw2
+   6.750b   +0.65%   MXINT8-MSAQ  u2/mg4
+   7.250b   +0.53%   MXINT8-MSAQ  u2/mg2
+
+=== matched-bit verdict (1/8-bit bins where both compete) ===
+  ~4.375b | MXINT8-MSAQ:+12.27%  INT+bulk:+16.95%  -> MXINT8-MSAQ
+  ~4.500b | MXINT8-MSAQ:+12.20%  INT+bulk:+16.43%  -> MXINT8-MSAQ
+  ~4.750b | MXINT8-MSAQ:+10.79%  INT+bulk:+15.23%  -> MXINT8-MSAQ
+  ~5.375b | MXINT8-MSAQ:+3.49%  INT+bulk:+3.82%  -> MXINT8-MSAQ
+  ~5.500b | MXINT8-MSAQ:+3.37%  INT+bulk:+3.46%  -> MXINT8-MSAQ
+  ~5.625b | MXINT8-MSAQ:+3.01%  INT+bulk:+3.59%  -> MXINT8-MSAQ
+  ~6.000b | MXINT8-MSAQ:+2.70%  INT+bulk:+3.21%  -> MXINT8-MSAQ
+  ~6.375b | MXINT8-MSAQ:+0.81%  INT+bulk:+0.72%  -> INT+bulk
+  ~6.500b | MXINT8-MSAQ:+0.82%  INT+bulk:+0.72%  -> INT+bulk
+  ~6.750b | MXINT8-MSAQ:+0.65%  INT+bulk:+0.71%  -> MXINT8-MSAQ
