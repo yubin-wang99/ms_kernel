@@ -1,0 +1,10 @@
+
+FP4: rn std=0.2590 mean=-3.44e-05
+    tau K4: pop%=[30, 32, 16, 22]  |bucket-mean|=[0.0, 0.0001, 0.0002, 0.0002]  within-bucket std=[0.112, 0.318, 0.267, 0.301]
+   mant K4: pop%=[39, 17, 25, 18]  |bucket-mean|=[0.0001, 0.0001, 0.0001, 0.0003]  within-bucket std=[0.202, 0.296, 0.262, 0.319]
+   rank K4: pop%=[25, 25, 25, 25]  |bucket-mean|=[0.0, 0.0002, 0.0, 0.0002]  within-bucket std=[0.134, 0.29, 0.283, 0.295]
+
+INT4: rn std=0.2448 mean=1.68e-05
+    tau K4: pop%=[32, 20, 30, 19]  |bucket-mean|=[0.0, 0.0001, 0.0, 0.0]  within-bucket std=[0.055, 0.3, 0.295, 0.288]
+   mant K4: pop%=[56, 25, 13, 6]  |bucket-mean|=[0.0001, 0.0001, 0.0002, 0.0002]  within-bucket std=[0.199, 0.291, 0.295, 0.286]
+   rank K4: pop%=[25, 25, 25, 25]  |bucket-mean|=[0.0, 0.0002, 0.0001, 0.0]  within-bucket std=[0.07, 0.246, 0.301, 0.289]
