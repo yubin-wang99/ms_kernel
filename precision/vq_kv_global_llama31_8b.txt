@@ -1,0 +1,15 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 5259.76it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+wikitext-2 TEST: 288,937 tok | BF16 PPL = 5.6877 | 30w | FP4-base vector-VQ residual; codebook calib on TRAIN (8w)
+
+calibration collected: 128 (kv,layer,g) buffers, ~40000 groups each
+
+        config  b/elem |           indist         perlayer           global
+                       |       PPL  dPPL%       PPL  dPPL%       PPL  dPPL%
+ FP4+VQ g8/K16   4.750 |    5.8203 +2.33%    5.8251 +2.42%    5.8365 +2.62%
+FP4+VQ g8/K256   5.250 |    5.7839 +1.69%    5.7824 +1.66%    5.7904 +1.81%
+FP4+VQ g4/K256   6.250 |    5.7101 +0.39%    5.7048 +0.30%    5.7085 +0.37%
