@@ -1,0 +1,19 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7102.12it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/yubin/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Sat Jun 27 00:15:53 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (288937 > 131072). Running this sequence through the model will result in indexing errors
+wikitext-2: 288,937 tok | BF16 PPL = 5.6877 | 30w | scope=KV (INT-base vector-VQ residual)
+
+            config  b/elem |       PPL    dPPL%  gate(<=3%)
+        FP4 native   4.250 |    5.8845   +3.46%  
+         INT4 zero   4.250 |    6.1759   +8.58%  
+    INT4+VQ g8/K16   4.750 |    6.1856   +8.75%  
+   INT4+VQ g8/K256   5.250 |    6.0596   +6.54%  
+   INT4+VQ g4/K256   6.250 |    5.7466   +1.04%  PASS
+     FP4+VQ g8/K16   4.750 |    5.8264   +2.44%  PASS
+    FP4+VQ g8/K256   5.250 |    5.7894   +1.79%  PASS
+    FP4+VQ g4/K256   6.250 |    5.7187   +0.55%  PASS
+        FP6 native   6.250 |    5.7049   +0.30%  PASS
+         INT6 zero   6.250 |    5.7184   +0.54%  PASS
+   INT6+VQ g8/K256   7.250 |    5.7040   +0.29%  PASS
+     FP6+VQ g8/K16   6.750 |    5.6988   +0.19%  PASS
