@@ -44,6 +44,19 @@ Two knobs: **u** (shared bits), **gs** (group size). Smaller gs = finer = more a
 exponent-tied shared collapses on real eb=2 outlier blocks (one config diverged to +3.7e7%). MXFP-MSAQ
 remains correct for its native FP8 (eb≥3) regime. Detail: `precision/two_tier_vs_msaq_results.md`.
 
+**What actually drives the win (honest, controlled).** A base-controlled comparison
+(`msaq_vs_intbulk_weight_ppl.py`) shows that with the base format held INT, the **deployed
+MXINT8-MSAQ (shared-low-bits) BEATS our bulk-scaled residual at essentially every bit budget** — the
+bulk residual scheme is the WEAKER part. two-tier's KV advantage comes from the **MXFP4 native base**
+(hardware-native low bits + GEMM-decomposable; INT4 collapses) plus **MX+ + rotation + allocation**,
+NOT from the residual (on KV, u0/no-residual was already best). Frame the contribution as the native
+low-bit base and the allocation, not the residual scale.
+
+**K/V asymmetric allocation** (`kv_asym_ppl.py`): K is far more sensitive than V (K errors amplify
+through QKᵀ→softmax; V averages out — confirms KVQuant/KIVI). Asymmetric (K-rich, V-cheap) is
+Pareto-optimal: K=E2M3 + V=cheap (5.328b, +1.31%) dominates symmetric M/M (5.344b, +1.41%). Allocate
+K and V separately — V to the cheap 4.406b rung, K richer.
+
 ## 3. Where robust accuracy appears
 
 | scope | robust (≤3%) floor | why |
