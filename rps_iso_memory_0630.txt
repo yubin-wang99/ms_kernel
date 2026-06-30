@@ -1,0 +1,30 @@
+# NVIDIA RTX PRO 4000 Blackwell | Llama-3.1-8B | L_in=1024 L_out=128 L_seq=1152 | 32 layers
+# M_avail = 0.86 x 24.0GB = 20.64GB (nominal); device total 25.15GB
+# RPS = B_max / (O x t_step). Two channels reported separately.
+
+# BF16 reference (shared): B_max=30  t_step=51.46ms  RPS=4.55
+
+## Case: Weight
+  format    b_w   b_kv  Wgt(GB)   KV/req  B_max  fit? t_step(ms)    tok/s     RPS  RPS/BF16 B_max/BF16
+    BF16  16.00  16.00    16.06    151MB     30    ok      51.46      583    4.55     1.00x      1.00x
+  MXINT8   8.25  16.00     8.28    151MB     81    ok     105.09      771    6.02     1.32x      2.70x
+    MSAQ   5.44  16.00     5.46    151MB    100    ok     123.92      807    6.30     1.38x      3.33x
+   vs MXINT8 -> RPS 1.05x = B_max ch 1.23x  x  t_step ch 0.85x   (t_step 105.1->123.9 ms)
+
+## Case: KV
+  format    b_w   b_kv  Wgt(GB)   KV/req  B_max  fit? t_step(ms)    tok/s     RPS  RPS/BF16 B_max/BF16
+    BF16  16.00  16.00    16.06    151MB     30    ok      51.46      583    4.55     1.00x      1.00x
+  MXINT8  16.00   8.25    16.06     78MB     58    ok      61.96      936    7.31     1.61x      1.93x
+    MSAQ  16.00   5.44    16.06     51MB     89    ok      58.37     1525   11.91     2.62x      2.97x
+   vs MXINT8 -> RPS 1.63x = B_max ch 1.53x  x  t_step ch 1.06x   (t_step 62.0->58.4 ms)
+
+## Case: Weight+KV
+  format    b_w   b_kv  Wgt(GB)   KV/req  B_max  fit? t_step(ms)    tok/s     RPS  RPS/BF16 B_max/BF16
+    BF16  16.00  16.00    16.06    151MB     30    ok      51.46      583    4.55     1.00x      1.00x
+  MXINT8   8.25   8.25     8.28     78MB    158    ok     135.97     1162    9.08     1.99x      5.27x
+    MSAQ   6.50   6.50     6.52     61MB    230    ok     126.71     1815   14.18     3.11x      7.67x
+   vs MXINT8 -> RPS 1.56x = B_max ch 1.46x  x  t_step ch 1.07x   (t_step 136.0->126.7 ms)
+
+# wrote rps_iso_memory_results.jsonl
+# READ: B_max channel = capacity headroom (MSAQ wins unconditionally, pure arithmetic).
+#       t_step channel = step latency (ridge/plateau-bound at L_seq=1152; the KV-decode paradox).

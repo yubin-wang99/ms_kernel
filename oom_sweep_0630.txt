@@ -1,0 +1,14 @@
+# NVIDIA RTX PRO 4000 Blackwell | total 25.15GB | M_avail(operational)=20.64GB | L_seq=1152
+# empirical = raw-device hard OOM (no 0.9 cap); analytical = operational (M_avail)
+
+      case   format   b_w  b_kv | analytic B_max empirical B_max  decode@emp
+        KV     BF16 16.00 16.00 |             30              58         n/a
+        KV   MXINT8 16.00  8.25 |             58             113          ok
+        KV     MSAQ 16.00  5.44 |             89             172          ok
+ Weight+KV     BF16 16.00 16.00 |             30              58         n/a
+ Weight+KV   MXINT8  8.25  8.25 |            158             213          ok
+ Weight+KV     MSAQ  6.50  6.50 |            230             299          ok
+
+# empirical B_max ratios (MSAQ vs MXINT8) — does max batch really rise?
+          KV: MSAQ 172 / MXINT8 113 = 1.52x   (vs BF16 58 = 2.97x)
+   Weight+KV: MSAQ 299 / MXINT8 213 = 1.40x   (vs BF16 58 = 5.16x)
