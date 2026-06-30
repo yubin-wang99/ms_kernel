@@ -116,22 +116,27 @@ def main():
     bf = ppl()
     print(f"wikitext-2: {ids.size(1):,} tok | BF16 PPL = {bf:.4f} | KV (rot+MX+), bulk_bw sweep\n", flush=True)
     rows = []
-    print(f"{'u':>2} {'mg':>3} {'bw':>3} | {'b/elem':>7} | {'dPPL%':>7} {'<3%':>4}", flush=True)
-    for u in (2, 3, 4):
-        for mg in (32, 16, 8, 4, 2):
-            for bw in (8, 4, 2):
-                cfg = (2, 1, u, mg, bw, True)
-                _C.update(on=True, cfg=cfg); p = ppl(); _C["on"] = False
-                d = (p / bf - 1) * 100; b = bits(*cfg)
-                rows.append((b, d, u, mg, bw))
-                print(f"{u:>2} {mg:>3} {bw:>3} | {b:>7.3f} | {d:>+6.2f}% {'OK' if d <= 3 else '':>4}", flush=True)
+    # extended grid: u1 added, MX+ on/off (push below 4.5b)
+    UU = [int(x) for x in os.environ.get("US", "1,2,3,4").split(",")]
+    MGS = [int(x) for x in os.environ.get("MGS", "32,16,8").split(",")]
+    BWS = [int(x) for x in os.environ.get("BWS", "2,4").split(",")]
+    print(f"{'mx+':>3} {'u':>2} {'mg':>3} {'bw':>3} | {'b/elem':>7} | {'dPPL%':>7} {'<3%':>4}", flush=True)
+    for mxp in (True, False):
+        for u in UU:
+            for mg in MGS:
+                for bw in BWS:
+                    cfg = (2, 1, u, mg, bw, mxp)
+                    _C.update(on=True, cfg=cfg); p = ppl(); _C["on"] = False
+                    d = (p / bf - 1) * 100; b = bits(*cfg)
+                    rows.append((b, d, u, mg, bw, mxp))
+                    print(f"{('Y' if mxp else 'n'):>3} {u:>2} {mg:>3} {bw:>3} | {b:>7.3f} | {d:>+6.2f}% {'OK' if d <= 3 else '':>4}", flush=True)
     ok = sorted([r for r in rows if r[1] <= 3.0])
     print("\n=== within 3%, sorted by bits (lowest first) ===", flush=True)
-    for b, d, u, mg, bw in ok[:8]:
-        print(f"  {b:.3f} b/elem : u{u}/mg{mg}/bw{bw}  {d:+.2f}%", flush=True)
+    for b, d, u, mg, bw, mxp in ok[:10]:
+        print(f"  {b:.3f} b/elem : u{u}/mg{mg}/bw{bw}/{'MX+' if mxp else 'noMX+'}  {d:+.2f}%", flush=True)
     if ok:
-        b, d, u, mg, bw = ok[0]
-        print(f"\nLOWEST bits within 3%: {b:.3f} b/elem  (u{u}/mg{mg}/bulk_bw{bw}, {d:+.2f}%)", flush=True)
+        b, d, u, mg, bw, mxp = ok[0]
+        print(f"\nLOWEST bits within 3%: {b:.3f} b/elem  (u{u}/mg{mg}/bulk_bw{bw}/{'MX+' if mxp else 'noMX+'}, {d:+.2f}%)", flush=True)
 
 
 if __name__ == "__main__":
