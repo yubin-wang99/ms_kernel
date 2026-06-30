@@ -23,8 +23,9 @@ from two_tier_mxplus_ppl import _mxplus_snap
 DEV = "cuda"; MAXLEN, STRIDE, MAX_WINDOWS = 2048, 1024, 30
 
 
-def quant_bw(x, eb, mb, u, mg, bulk_bw, mxplus=True, efb_iters=2):
-    """two-tier with a per-group E{bulk_bw}M0 residual scale (DC residual). x=[...,K], block=32 / mg."""
+def quant_bw(x, eb, mb, u, mg, bulk_bw, mxplus=True, Hblk=None, efb_iters=2):
+    """two-tier with a per-group E{bulk_bw}M0 residual scale. x=[...,K], block=32 / mg.
+    Hblk=[G,32,32] -> A-weighted (§4) per-group optimum (uses gs x gs diagonal sub-blocks); None -> DC."""
     *lead, K = x.shape
     assert K % BLOCK == 0 and BLOCK % mg == 0
     G = K // BLOCK; nsg = BLOCK // mg
@@ -41,11 +42,16 @@ def quant_bw(x, eb, mb, u, mg, bulk_bw, mxplus=True, efb_iters=2):
 
     base = snap(y)
     if u > 0:
+        if Hblk is not None:
+            H = Hblk.to(torch.float32).reshape(G, nsg, mg, nsg, mg)
+            i = torch.arange(nsg, device=x.device)
+            Hd = H[:, i, :, i, :].permute(1, 0, 2, 3).contiguous()    # [G,nsg,mg,mg]
+            denom = Hd.sum((-1, -2)).clamp(min=1e-30); Hsum = Hd.sum(-2)
         qmax = (1 << (u - 1)) - 1
         k_top = float(maxexp); k_lo = k_top - float((1 << bulk_bw) - 1)
         for it in range(max(1, efb_iters + 1)):
             r = (y - base).reshape(-1, G, nsg, mg)
-            r_cont = r.mean(-1)                                       # [.,G,nsg] DC
+            r_cont = r.mean(-1) if Hblk is None else torch.einsum("gpk,bgpk->bgp", Hsum, r) / denom
             kstar = torch.floor(torch.log2((r_cont.abs() / max(qmax, 1)).clamp(min=1e-30)))
             d = torch.exp2(kstar.clamp(k_lo, k_top))                 # E{bulk_bw}M0
             si = torch.round(r_cont / d).clamp(-qmax - 1, qmax)
